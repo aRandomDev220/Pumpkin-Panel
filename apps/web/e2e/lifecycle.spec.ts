@@ -6,6 +6,8 @@ import {
   api,
   chownLeaf,
   dumpContainerLogs,
+  removeContainer,
+  removeScratchDir,
   startBackend,
   stopBackend,
   waitForReadiness,
@@ -20,7 +22,7 @@ const GAME_PORT = 26565;
 const IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
 const CONTAINER = "pumpkin-e2e-journey";
 
-let backend: BackendHandle;
+let backend: BackendHandle | undefined;
 let token = "";
 let serverId = "";
 
@@ -28,6 +30,17 @@ async function readToken(page: Page): Promise<string> {
   const value = await page.evaluate(() => window.localStorage.getItem("pm_token"));
   expect(typeof value).toBe("string");
   return value as string;
+}
+
+// Re-run `fn`; on failure append the test container's logs so a task or
+// readiness timeout carries the server-side reason.
+async function withContainerLogs<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    const logs = await dumpContainerLogs(CONTAINER);
+    throw new Error(`${err}\n--- docker logs ${CONTAINER} ---\n${logs}`);
+  }
 }
 
 // Each test gets a fresh browser context, so seed the stored token before
@@ -46,7 +59,14 @@ test.describe.serial("full user journey", () => {
   });
 
   test.afterAll(async () => {
-    await stopBackend(backend);
+    // Teardown is best-effort and order-independent of which test failed:
+    // force-remove the container (frees the game port even if (f) never
+    // ran), stop the backend, then remove the scratch dirs.
+    console.log(await removeContainer(CONTAINER));
+    if (backend !== undefined) {
+      await stopBackend(backend);
+      await removeScratchDir(backend.scratchDir);
+    }
   });
 
   test("(a) fresh DB redirects / to /setup; setup creates owner", async ({
@@ -139,14 +159,11 @@ test.describe.serial("full user journey", () => {
     expect(startResp.status()).toBe(202);
     const startBody = (await startResp.json()) as { task_id: string };
     expect(typeof startBody.task_id).toBe("string");
-    try {
+    await withContainerLogs(async () => {
       await waitForTaskOk(E2E_BASE_URL, startBody.task_id, token, 120_000);
-    } catch (err) {
-      const logs = await dumpContainerLogs(CONTAINER);
-      throw new Error(`${err}\n--- docker logs ${CONTAINER} ---\n${logs}`);
-    }
-    const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "online", 60_000);
-    expect(status.readiness?.state).toBe("online");
+      const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "online", 60_000);
+      expect(status.readiness?.state).toBe("online");
+    });
     await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
   });
 
@@ -164,14 +181,11 @@ test.describe.serial("full user journey", () => {
     expect(stopResp.status()).toBe(202);
     const stopBody = (await stopResp.json()) as { task_id: string };
     expect(typeof stopBody.task_id).toBe("string");
-    try {
+    await withContainerLogs(async () => {
       await waitForTaskOk(E2E_BASE_URL, stopBody.task_id, token, 120_000);
-    } catch (err) {
-      const logs = await dumpContainerLogs(CONTAINER);
-      throw new Error(`${err}\n--- docker logs ${CONTAINER} ---\n${logs}`);
-    }
-    const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "stopped", 60_000);
-    expect(status.readiness?.state).toBe("stopped");
+      const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "stopped", 60_000);
+      expect(status.readiness?.state).toBe("stopped");
+    });
     await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
   });
 

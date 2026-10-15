@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,8 @@ const REPO_ROOT = join(
 export interface BackendHandle {
   proc: ChildProcess;
   baseUrl: string;
+  /** mkdtemp scratch root holding dataDir, backups and the sqlite file. */
+  scratchDir: string;
   dataDir: string;
   dbFile: string;
 }
@@ -56,6 +59,7 @@ export async function startBackend(): Promise<BackendHandle> {
   let lastErr = "no attempt yet";
   for (;;) {
     if (proc.exitCode !== null) {
+      await removeScratchDir(scratch);
       throw new Error(
         `backend exited early (code ${proc.exitCode}): ${earlyExit.slice(-2000)}`,
       );
@@ -68,36 +72,80 @@ export async function startBackend(): Promise<BackendHandle> {
       lastErr = err instanceof Error ? err.message : String(err);
     }
     if (Date.now() > deadline) {
-      proc.kill("SIGKILL");
+      killGroup(proc);
+      await removeScratchDir(scratch);
       throw new Error(
         `backend never became live on ${E2E_BASE_URL}: ${lastErr}\nstderr tail: ${earlyExit.slice(-2000)}`,
       );
     }
     await sleep(1000);
   }
-  return { proc, baseUrl: E2E_BASE_URL, dataDir, dbFile };
+  return { proc, baseUrl: E2E_BASE_URL, scratchDir: scratch, dataDir, dbFile };
+}
+
+function killGroup(proc: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
+  if (proc.pid === undefined) return;
+  try {
+    process.kill(-proc.pid, signal);
+  } catch {
+    /* already gone */
+  }
 }
 
 export async function stopBackend(handle: BackendHandle): Promise<void> {
-  const pid = handle.proc.pid;
-  if (pid === undefined) return;
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    return;
-  }
+  killGroup(handle.proc, "SIGTERM");
   const deadline = Date.now() + 10_000;
   while (handle.proc.exitCode === null && handle.proc.signalCode === null) {
     if (Date.now() > deadline) break;
     await sleep(250);
   }
   if (handle.proc.exitCode === null && handle.proc.signalCode === null) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
+    killGroup(handle.proc, "SIGKILL");
   }
+}
+
+/**
+ * Best-effort removal of the mkdtemp scratch dir. Never throws.
+ * Files Pumpkin wrote are owned by UID 2613 (see chownLeaf), which the
+ * manager user cannot unlink — so wipe the contents as root inside a
+ * disposable alpine container first, then remove the (now empty) dir.
+ */
+export async function removeScratchDir(dir: string): Promise<void> {
+  await new Promise<void>((resolve) => {
+    execFile(
+      "docker",
+      ["run", "--rm", "-v", `${dir}:/s`, "alpine", "rm", "-rf", "/s"],
+      { timeout: 60_000 },
+      () => resolve(),
+    );
+  });
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch {
+    /* best-effort teardown */
+  }
+}
+
+/**
+ * Best-effort `docker rm -f` of a test container. Never throws; returns a
+ * short outcome line for teardown logging.
+ */
+export function removeContainer(name: string): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(
+      "docker",
+      ["rm", "-f", name],
+      { timeout: 30_000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          const detail = (stderr || err.message).trim().split("\n").pop() ?? "";
+          resolve(`removeContainer(${name}): skipped (${detail})`);
+        } else {
+          resolve(`removeContainer(${name}): ${(stdout || "").trim() || "removed"}`);
+        }
+      },
+    );
+  });
 }
 
 /** Minimal JSON API client against the backend. `token` adds a Bearer header. */
