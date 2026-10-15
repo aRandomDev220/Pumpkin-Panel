@@ -37,3 +37,6 @@ backups/
 logs/
 *.log
 npm-debug.log*
+
+# harness-local
+.opencode/
