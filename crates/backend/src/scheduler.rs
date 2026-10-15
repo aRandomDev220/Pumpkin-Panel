@@ -12,26 +12,18 @@
 //! everything is interpreted as UTC, and non-UTC values get
 //! `timezone_note: "interpreted as UTC"` in responses.
 //!
-//! Task 1 / Task 2 integration note: at the time of writing both
-//! `backup_service.rs` (`cron_is_valid`, `select_for_deletion`) and
-//! `routes_backup.rs` (`enqueue_backup`) are still BASE stubs, so this module
-//! intentionally carries local implementations with the exact briefed
-//! semantics instead of importing them (importing stubs would not compile).
-//! The local `cron_is_valid` accepts 5-field standard cron (shimmed to the
-//! 6-field form the `cron` crate parses) and `select_for_deletion` keeps the
-//! retention floor (never deletes the last verified backup, never touches
-//! protected or in-progress rows). `tick_once` performs the scheduled backup
-//! inline (tar.gz + sha256, daemonless) with the same argument shape as the
-//! briefed `enqueue_backup(pool, adapter, server_id, requested_by,
-//! consistency)`; when Task 2 lands the controller can swap the call site to
-//! `routes_backup::enqueue_backup` without changing scheduling semantics.
+//! Canonical entry points: cron validation and retention decisions come from
+//! `backup_service`; scheduled runs go through `routes_backup::enqueue_backup`
+//! (same args the brief froze). Its worker owns stop/resume consistency, the
+//! backup semaphore, op-locks, space pre-checks, cancel, task lifecycle, and
+//! post-backup prune/audit — this module only schedules.
 
 // Task 2 (routes) / controller wiring consumes this module's entry points;
 // nothing in the crate wires it up yet, so dead-code is expected until then
 // (remove once wired).
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use axum::{
@@ -46,6 +38,8 @@ use sqlx::SqlitePool;
 
 use crate::audit;
 use crate::auth::AuthUser;
+use crate::backup_service::{cron_is_valid, select_for_deletion, RetentionInput};
+use crate::routes_backup::{enqueue_backup, BackupError};
 use crate::runtime::DockerAdapter;
 use crate::AppState;
 
@@ -79,12 +73,12 @@ async fn ensure_tables(pool: &SqlitePool) {
 }
 
 // ---------------------------------------------------------------------------
-// Cron helpers (mirror the Task 1 contract: 5-field standard cron)
+// Cron helpers (validation is canonical `backup_service::cron_is_valid`)
 // ---------------------------------------------------------------------------
 
-/// Parse a cron expression. The `cron` crate parses 6-field (seconds first)
-/// or 7-field (with year) schedules, so a 5-field standard expression is
-/// shimmed with a `0` seconds field. Anything else must parse as-is.
+/// Parse a cron expression for next-run arithmetic only. The `cron` crate
+/// parses 6-field (seconds first) or 7-field (with year) schedules, so a
+/// 5-field standard expression is shimmed with a `0` seconds field.
 fn parse_schedule(expr: &str) -> Option<cron::Schedule> {
     let expr = expr.trim();
     if expr.is_empty() {
@@ -101,12 +95,6 @@ fn parse_schedule(expr: &str) -> Option<cron::Schedule> {
         return None;
     };
     cron::Schedule::from_str(effective).ok()
-}
-
-/// Task 1 contract: true for valid 5-field standard cron (`"0 2 * * *"`),
-/// false for garbage (`"sometimes"`).
-pub fn cron_is_valid(expr: &str) -> bool {
-    parse_schedule(expr).is_some()
 }
 
 /// Next occurrence strictly after `from`, interpreted as UTC.
@@ -131,84 +119,6 @@ fn timezone_note(timezone: &str) -> Option<&'static str> {
     } else {
         Some(TIMEZONE_NOTE_UTC)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Retention decision fn (mirrors the Task 1 contract)
-// ---------------------------------------------------------------------------
-
-/// One backup row, newest first. Mirrors Task 1's `RetentionInput` verbatim.
-#[derive(Debug, Clone)]
-pub struct RetentionInput {
-    pub id: String,
-    pub completed_at: Option<String>,
-    pub verified: bool,
-    pub protected: bool,
-    pub in_progress: bool,
-}
-
-/// Pure retention decision: ids to delete, newest-first input assumed.
-///
-/// - In-progress and protected rows are never listed.
-/// - Count rule: only the newest `keep_count` candidates are kept.
-/// - Age rule: candidates older than `max_age_days` are listed (`0` disables
-///   age expiry).
-/// - Floor: the last verified backup is never listed; when the floor would
-///   be hit the newest verified candidate is spared (empty result when the
-///   floor is all that remains).
-pub fn select_for_deletion(
-    backups_newest_first: &[RetentionInput],
-    keep_count: usize,
-    max_age_days: u64,
-    now_unix: u64,
-) -> Vec<String> {
-    let candidates: Vec<&RetentionInput> = backups_newest_first
-        .iter()
-        .filter(|b| !b.in_progress && !b.protected)
-        .collect();
-
-    let mut delete: Vec<String> = Vec::new();
-    // Count rule: everything past the newest `keep_count` candidates.
-    for (i, b) in candidates.iter().enumerate() {
-        if i >= keep_count {
-            delete.push(b.id.clone());
-        }
-    }
-    // Age rule: candidates older than the horizon, regardless of count.
-    if max_age_days > 0 {
-        let horizon = max_age_days.saturating_mul(86_400);
-        let cutoff = now_unix.saturating_sub(horizon);
-        for b in &candidates {
-            let completed_unix = b
-                .completed_at
-                .as_deref()
-                .and_then(parse_time)
-                .map(|t| t.timestamp().max(0) as u64);
-            if let Some(ts) = completed_unix {
-                if ts < cutoff && !delete.contains(&b.id) {
-                    delete.push(b.id.clone());
-                }
-            }
-        }
-    }
-
-    // Floor: keep at least one verified backup overall.
-    if !delete.is_empty() {
-        let verified_survives = backups_newest_first
-            .iter()
-            .any(|b| b.verified && !delete.contains(&b.id));
-        if !verified_survives {
-            // Spare the newest verified candidate in the delete set.
-            if let Some(spare) = candidates
-                .iter()
-                .find(|b| b.verified && delete.contains(&b.id))
-            {
-                let spare_id = spare.id.clone();
-                delete.retain(|id| *id != spare_id);
-            }
-        }
-    }
-    delete
 }
 
 // ---------------------------------------------------------------------------
@@ -607,16 +517,9 @@ pub async fn delete_policy(
 // Retention preview (dry-run)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct CompletedBackup {
-    id: String,
-    completed_at: Option<String>,
-    created_at: String,
-    checksum: String,
-    protected: bool,
-}
-
-async fn load_completed(pool: &SqlitePool, server_id: &str) -> Vec<CompletedBackup> {
+/// Completed backups as canonical Task 1 retention inputs (newest first),
+/// plus the protected count for the preview response.
+async fn load_completed_inputs(pool: &SqlitePool, server_id: &str) -> (Vec<RetentionInput>, usize) {
     let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i64)>(
         "SELECT id, completed_at, created_at, checksum, protected FROM backups
          WHERE server_id = ? AND state = 'completed'
@@ -626,39 +529,27 @@ async fn load_completed(pool: &SqlitePool, server_id: &str) -> Vec<CompletedBack
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    rows.into_iter()
+    let protected_kept = rows.iter().filter(|r| r.4 != 0).count();
+    let inputs = rows
+        .into_iter()
         .map(
-            |(id, completed_at, created_at, checksum, protected)| CompletedBackup {
+            |(id, completed_at, created_at, checksum, protected)| RetentionInput {
                 id,
-                completed_at,
-                created_at,
-                checksum,
+                completed_at: completed_at.or(Some(created_at)),
+                verified: !checksum.is_empty(),
                 protected: protected != 0,
+                in_progress: false,
             },
         )
-        .collect()
+        .collect();
+    (inputs, protected_kept)
 }
 
-fn to_retention_input(b: &CompletedBackup) -> RetentionInput {
-    RetentionInput {
-        id: b.id.clone(),
-        completed_at: b
-            .completed_at
-            .clone()
-            .or_else(|| Some(b.created_at.clone())),
-        verified: !b.checksum.is_empty(),
-        protected: b.protected,
-        in_progress: false,
-    }
-}
-
-/// Union of per-policy deletion sets over the server's completed backups.
-/// Pure read path shared by the preview handler and the post-backup prune.
-async fn compute_would_delete(
-    pool: &SqlitePool,
-    server_id: &str,
-) -> (Vec<String>, Vec<CompletedBackup>) {
-    let completed = load_completed(pool, server_id).await;
+/// Union of per-policy deletion sets over the server's completed backups
+/// using the canonical Task 1 decision fn. Pure read path for the preview
+/// handler (post-backup prune/audit is owned by Task 2's worker).
+async fn compute_would_delete(pool: &SqlitePool, server_id: &str) -> (Vec<String>, usize, usize) {
+    let (inputs, protected_kept) = load_completed_inputs(pool, server_id).await;
     let policies = sqlx::query_as::<_, (i64, i64)>(
         "SELECT retention_count, max_age_days FROM backup_policies
          WHERE server_id = ? AND enabled != 0 ORDER BY created_at ASC",
@@ -673,7 +564,6 @@ async fn compute_would_delete(
     } else {
         policies
     };
-    let inputs: Vec<RetentionInput> = completed.iter().map(to_retention_input).collect();
     let now_unix = Utc::now().timestamp().max(0) as u64;
     let mut union: Vec<String> = Vec::new();
     for (keep, age) in policies {
@@ -685,7 +575,8 @@ async fn compute_would_delete(
             }
         }
     }
-    (union, completed)
+    let retained = inputs.len().saturating_sub(union.len());
+    (union, retained, protected_kept)
 }
 
 /// `POST /servers/:id/backup-policies/preview`
@@ -699,9 +590,8 @@ pub async fn retention_preview(
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
-    let (would_delete, completed) = compute_would_delete(&state.pool, &server_id).await;
-    let protected_kept = completed.iter().filter(|b| b.protected).count();
-    let retained = completed.len().saturating_sub(would_delete.len());
+    let (would_delete, retained, protected_kept) =
+        compute_would_delete(&state.pool, &server_id).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -714,277 +604,21 @@ pub async fn retention_preview(
 }
 
 // ---------------------------------------------------------------------------
-// Scheduled backup execution (daemonless; mirrors Task 2's `enqueue_backup`
-// argument shape: pool, adapter, server_id, requested_by, consistency)
-// ---------------------------------------------------------------------------
-
-struct BackupOutcome {
-    files: u64,
-    size_bytes: u64,
-    checksum_sha256: String,
-}
-
-/// Tar-gzip the full data dir (relative names, symlinks skipped, deterministic
-/// order), then verify by re-hashing and re-listing. Blocking I/O only.
-fn tar_gz_and_verify(data_dir: &Path, dest: &Path) -> Result<BackupOutcome, String> {
-    // Collect entries deterministically.
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut stack = vec![data_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("BACKUP_FAILED: cannot read data dir: {e}"))?;
-        let mut batch: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("BACKUP_FAILED: dir entry: {e}"))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|e| format!("BACKUP_FAILED: file type: {e}"))?;
-            // Never follow symlinks out of the data dir.
-            if file_type.is_symlink() {
-                continue;
-            }
-            batch.push(entry.path());
-        }
-        batch.sort();
-        for path in batch {
-            if path.is_dir() {
-                dirs.push(path.clone());
-                stack.push(path);
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    dirs.sort();
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("BACKUP_FAILED: cannot create backup dir: {e}"))?;
-    }
-    let out = std::fs::File::create(dest)
-        .map_err(|e| format!("BACKUP_FAILED: cannot create archive: {e}"))?;
-    let enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
-    let mut builder = tar::Builder::new(enc);
-    for dir in &dirs {
-        let rel = dir
-            .strip_prefix(data_dir)
-            .map_err(|e| format!("BACKUP_FAILED: relative path: {e}"))?;
-        builder
-            .append_dir(rel, dir)
-            .map_err(|e| format!("BACKUP_FAILED: archive dir: {e}"))?;
-    }
-    for path in &files {
-        let rel = path
-            .strip_prefix(data_dir)
-            .map_err(|e| format!("BACKUP_FAILED: relative path: {e}"))?;
-        builder
-            .append_path_with_name(path, rel)
-            .map_err(|e| format!("BACKUP_FAILED: archive file: {e}"))?;
-    }
-    let enc = builder
-        .into_inner()
-        .map_err(|e| format!("BACKUP_FAILED: finalize tar: {e}"))?;
-    enc.finish()
-        .map_err(|e| format!("BACKUP_FAILED: finalize gzip: {e}"))?;
-
-    // Verify: re-hash the finished file and re-list its entries.
-    let bytes =
-        std::fs::read(dest).map_err(|e| format!("BACKUP_FAILED: read back archive: {e}"))?;
-    let checksum_sha256 = {
-        use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&bytes);
-        hex_encode(&hasher.finalize())
-    };
-    let size_bytes = bytes.len() as u64;
-    {
-        use std::io::Read as _;
-        let gz = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut archive = tar::Archive::new(gz);
-        let entries = archive
-            .entries()
-            .map_err(|e| format!("BACKUP_CORRUPT: cannot re-list archive: {e}"))?;
-        for entry in entries {
-            let mut entry = entry.map_err(|e| format!("BACKUP_CORRUPT: bad archive entry: {e}"))?;
-            let mut sink = Vec::new();
-            let _ = entry.read_to_end(&mut sink);
-        }
-    }
-    Ok(BackupOutcome {
-        files: files.len() as u64,
-        size_bytes,
-        checksum_sha256,
-    })
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push((b"0123456789abcdef"[(b >> 4) as usize]) as char);
-        out.push((b"0123456789abcdef"[(b & 0x0f) as usize]) as char);
-    }
-    out
-}
-
-/// Run one scheduled backup synchronously and record the `backups` row.
-/// Returns the backup id on success, or an honest error string on failure
-/// (a `failed` row is recorded in that case too).
-async fn run_scheduled_backup(
-    pool: &SqlitePool,
-    server_id: &str,
-    backup_root: &Path,
-    requested_by: Option<&str>,
-    consistency: &str,
-) -> Result<String, String> {
-    let row = sqlx::query_as::<_, (String,)>(
-        "SELECT data_path FROM servers WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(server_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("BACKUP_FAILED: server lookup: {e}"))?;
-    let Some((data_path,)) = row else {
-        return Err("SERVER_DELETED: server no longer exists".to_string());
-    };
-    if data_path.trim().is_empty() {
-        return Err("BACKUP_FAILED: server has no data directory".to_string());
-    }
-    let data_dir = PathBuf::from(&data_path);
-    // A missing data dir backs up as an empty snapshot rather than failing;
-    // daemonless plain-file backup needs no Docker.
-    if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        return Err(format!("BACKUP_FAILED: cannot access data dir: {e}"));
-    }
-
-    let backup_id = uuid::Uuid::new_v4().to_string();
-    let dest = backup_root
-        .join(server_id)
-        .join(format!("{backup_id}.tar.gz"));
-    let data_dir_clone = data_dir.clone();
-    let dest_clone = dest.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || tar_gz_and_verify(&data_dir_clone, &dest_clone))
-            .await
-            .map_err(|e| format!("BACKUP_FAILED: backup task panicked: {e}"))?;
-
-    let now_str = now_rfc3339();
-    match outcome {
-        Ok(o) => {
-            let dest_str = dest.to_string_lossy().into_owned();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO backups
-                    (id, server_id, type, state, storage_path, size_bytes,
-                     checksum_algorithm, checksum, consistency_method,
-                     created_at, completed_at, created_by, protected)
-                 VALUES (?, ?, 'full', 'completed', ?, ?, 'sha256', ?, ?, ?, ?, ?, 0)",
-            )
-            .bind(&backup_id)
-            .bind(server_id)
-            .bind(&dest_str)
-            .bind(o.size_bytes as i64)
-            .bind(&o.checksum_sha256)
-            .bind(consistency)
-            .bind(&now_str)
-            .bind(&now_str)
-            .bind(requested_by)
-            .execute(pool)
-            .await
-            {
-                return Err(format!("BACKUP_FAILED: record backup row: {e}"));
-            }
-            tracing::info!(backup_id = %backup_id, files = o.files, "scheduled backup completed");
-            Ok(backup_id)
-        }
-        Err(summary) => {
-            let code = summary.split(':').next().unwrap_or("BACKUP_FAILED");
-            let short: String = summary.chars().take(500).collect();
-            let _ = sqlx::query(
-                "INSERT INTO backups
-                    (id, server_id, type, state, storage_path, size_bytes,
-                     checksum_algorithm, checksum, consistency_method,
-                     created_at, created_by, error_summary, protected)
-                 VALUES (?, ?, 'full', 'failed', '', 0, 'sha256', '', ?, ?, ?, ?, 0)",
-            )
-            .bind(&backup_id)
-            .bind(server_id)
-            .bind(consistency)
-            .bind(&now_str)
-            .bind(requested_by)
-            .bind(format!("{code}: {short}"))
-            .execute(pool)
-            .await;
-            let _ = std::fs::remove_file(&dest);
-            Err(short)
-        }
-    }
-}
-
-/// Delete the given completed backup ids (files + rows), auditing each.
-/// Never touches in-progress rows: callers only pass completed ids.
-async fn prune_backups(
-    pool: &SqlitePool,
-    server_id: &str,
-    ids: &[String],
-    actor: Option<&str>,
-) -> Vec<String> {
-    let mut deleted = Vec::new();
-    for id in ids {
-        let path: Option<(String,)> = sqlx::query_as::<_, (String,)>(
-            "SELECT storage_path FROM backups
-                 WHERE id = ? AND server_id = ? AND state = 'completed'",
-        )
-        .bind(id)
-        .bind(server_id)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
-        let Some((storage_path,)) = path else {
-            continue;
-        };
-        if !storage_path.is_empty() {
-            // Best effort: a missing file still releases the row.
-            let _ = std::fs::remove_file(&storage_path);
-        }
-        let res = sqlx::query("DELETE FROM backups WHERE id = ? AND state = 'completed'")
-            .bind(id)
-            .execute(pool)
-            .await;
-        if res.is_ok() {
-            deleted.push(id.clone());
-            audit::record(
-                pool,
-                actor,
-                "backup.retention.prune",
-                "backup",
-                id,
-                "ok",
-                &audit::request_id(),
-                serde_json::json!({ "server_id": server_id }),
-            )
-            .await;
-        }
-    }
-    deleted
-}
-
-// ---------------------------------------------------------------------------
 // Scheduler tick
 // ---------------------------------------------------------------------------
 
 /// One scheduler pass. The controller calls this every 60s.
 ///
-/// For each enabled policy with `next_run_at <= now` (or `NULL`):
-/// single catch-up run when overdue (audited), `next_run_at` recomputed from
-/// cron, skipped with reason when disabled mid-flight / server deleted /
-/// another task for the server is active (`SERVER_BUSY`). Never starts two
-/// backups for one server concurrently: any `queued`/`running`/
-/// `cancel_requested` task for the server blocks the tick.
+/// For each enabled policy with `next_run_at <= now` (or `NULL`): trigger one
+/// backup via Task 2's `enqueue_backup` (single catch-up when overdue,
+/// audited), recompute `next_run_at` from cron, and skip with reason when
+/// disabled mid-flight / server deleted / the worker reports `SERVER_BUSY`.
+/// Concurrency, stop/resume consistency, prune, and worker audit are owned by
+/// Task 2's worker — the tick never runs backups itself.
 pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backup_root: &Path) {
-    // Plain-file scheduled backups need no daemon; the handle is accepted for
-    // signature compatibility with Task 2's `enqueue_backup`.
-    let _ = adapter;
+    // Archive storage paths are owned by Task 2's worker (`backup_root_for`);
+    // the parameter stays for the briefed controller signature.
+    let _ = backup_root;
     ensure_tables(pool).await;
     let now = Utc::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -1037,33 +671,9 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
             .await;
             continue;
         }
-        // Never two concurrent backups per server: any active task blocks.
-        let active: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tasks
-             WHERE server_id = ? AND state IN ('queued', 'running', 'cancel_requested')",
-        )
-        .bind(&fresh.server_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-        if active > 0 {
-            push_next_run(pool, &fresh, &now).await;
-            audit::record(
-                pool,
-                fresh.created_by.as_deref(),
-                "backup.schedule.skipped",
-                "backup_policy",
-                &fresh.id,
-                "skipped",
-                &audit::request_id(),
-                serde_json::json!({ "server_id": fresh.server_id, "reason": "SERVER_BUSY" }),
-            )
-            .await;
-            continue;
-        }
 
-        // Single catch-up: run once no matter how overdue, then schedule the
-        // next run strictly after now (never chain multiple runs per tick).
+        // Single catch-up: trigger once no matter how overdue, then schedule
+        // the next run strictly after now (never chain multiple runs).
         let catch_up = fresh
             .next_run_at
             .as_deref()
@@ -1071,16 +681,16 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
             .is_some_and(|t| (now - t).num_seconds() > 120);
 
         let requested_by = fresh.created_by.clone();
-        match run_scheduled_backup(
+        match enqueue_backup(
             pool,
+            adapter,
             &fresh.server_id,
-            backup_root,
             requested_by.as_deref(),
             "stopped",
         )
         .await
         {
-            Ok(backup_id) => {
+            Ok((task_id, backup_id)) => {
                 let _ = sqlx::query("UPDATE backup_policies SET last_run_at = ? WHERE id = ?")
                     .bind(&now_str)
                     .bind(&fresh.id)
@@ -1098,26 +708,42 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                     serde_json::json!({
                         "server_id": fresh.server_id,
                         "policy_id": fresh.id,
+                        "task_id": task_id,
                         "catch_up": catch_up,
                     }),
                 )
                 .await;
-                // Retention prune for this policy (completed rows only).
-                let inputs: Vec<RetentionInput> = load_completed(pool, &fresh.server_id)
-                    .await
-                    .iter()
-                    .map(to_retention_input)
-                    .collect();
-                let now_unix = now.timestamp().max(0) as u64;
-                let ids = select_for_deletion(
-                    &inputs,
-                    fresh.retention_count.max(0) as usize,
-                    fresh.max_age_days.max(0) as u64,
-                    now_unix,
-                );
-                prune_backups(pool, &fresh.server_id, &ids, requested_by.as_deref()).await;
             }
-            Err(summary) => {
+            Err(BackupError::ServerBusy) => {
+                push_next_run(pool, &fresh, &now).await;
+                audit::record(
+                    pool,
+                    requested_by.as_deref(),
+                    "backup.schedule.skipped",
+                    "backup_policy",
+                    &fresh.id,
+                    "skipped",
+                    &audit::request_id(),
+                    serde_json::json!({ "server_id": fresh.server_id, "reason": "SERVER_BUSY" }),
+                )
+                .await;
+            }
+            Err(BackupError::ServerNotFound) => {
+                // Lost a race with server deletion after the pre-check.
+                push_next_run(pool, &fresh, &now).await;
+                audit::record(
+                    pool,
+                    requested_by.as_deref(),
+                    "backup.schedule.skipped",
+                    "backup_policy",
+                    &fresh.id,
+                    "skipped",
+                    &audit::request_id(),
+                    serde_json::json!({ "server_id": fresh.server_id, "reason": "SERVER_DELETED" }),
+                )
+                .await;
+            }
+            Err(e) => {
                 let _ = sqlx::query("UPDATE backup_policies SET last_run_at = ? WHERE id = ?")
                     .bind(&now_str)
                     .bind(&fresh.id)
@@ -1135,7 +761,8 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                     serde_json::json!({
                         "server_id": fresh.server_id,
                         "catch_up": catch_up,
-                        "error": summary.chars().take(300).collect::<String>(),
+                        "error_code": e.code(),
+                        "error": e.to_string().chars().take(300).collect::<String>(),
                     }),
                 )
                 .await;
@@ -1171,6 +798,7 @@ mod tests {
     use axum::routing::{delete, get, patch, post};
     use axum_test::TestServer;
     use serde_json::{json, Value};
+    use std::path::PathBuf;
 
     async fn test_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -1359,6 +987,25 @@ mod tests {
         assert_eq!(doomed, vec!["1".to_string(), "2".to_string()]);
     }
 
+    #[test]
+    fn retention_protected_consumes_keep_slot() {
+        // Canonical Task 1 semantics: keep_count ranks among non-in-progress
+        // rows, so a protected newest row consumes the keep slot and BOTH
+        // unprotected rows go (floor still holds: protected P survives).
+        let mk = |id: &str, protected: bool| RetentionInput {
+            id: id.to_string(),
+            completed_at: Some("2026-01-0%dT00:00:00.000Z".replace("%d", id)),
+            verified: true,
+            protected,
+            in_progress: false,
+        };
+        let rows = vec![mk("P", true), mk("B", false), mk("C", false)];
+        assert_eq!(
+            select_for_deletion(&rows, 1, 0, 9_999_999_999),
+            vec!["B".to_string(), "C".to_string()]
+        );
+    }
+
     // -- handler tests ------------------------------------------------------
 
     #[tokio::test]
@@ -1450,7 +1097,84 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    async fn poll_backup_task(pool: &SqlitePool, server_id: &str) -> (String, Option<String>) {
+        for _ in 0..150 {
+            let row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT state, error_code FROM tasks
+                 WHERE server_id = ? AND type = 'backup' ORDER BY rowid DESC LIMIT 1",
+            )
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some((state, code)) = row {
+                if matches!(state.as_str(), "succeeded" | "failed" | "cancelled") {
+                    return (state, code);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("backup task did not reach a terminal state");
+    }
+
+    async fn insert_due_policy(pool: &SqlitePool, server_id: &str) -> String {
+        let past = (Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let policy_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO backup_policies
+                (id, server_id, name, schedule, timezone, retention_count,
+                 max_age_days, enabled, next_run_at, created_at, updated_at)
+             VALUES (?, ?, 'nightly', '0 2 * * *', 'UTC', 7, 30, 1, ?, ?, ?)",
+        )
+        .bind(&policy_id)
+        .bind(server_id)
+        .bind(&past)
+        .bind(&past)
+        .bind(&past)
+        .execute(pool)
+        .await
+        .unwrap();
+        policy_id
+    }
+
     // -- tick tests ---------------------------------------------------------
+
+    /// SWAP 3 pin: a scheduled run with `consistency="stopped"` on a
+    /// container-backed server WITHOUT a runtime must fail honestly
+    /// (`RUNTIME_UNAVAILABLE`), never record a silent "success".
+    #[tokio::test]
+    async fn scheduled_run_without_runtime_fails_honest() {
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "tick-noruntime", 25571).await;
+        let data_dir = data_path_of(&pool, &id).await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("level.dat"), b"data").unwrap();
+        // Container-backed: a daemon would have to stop this first.
+        sqlx::query("UPDATE servers SET container_id = ? WHERE id = ?")
+            .bind("cid-without-daemon")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_due_policy(&pool, &id).await;
+
+        tick_once(&pool, None, &backup_root).await;
+        let (state, code) = poll_backup_task(&pool, &id).await;
+        assert_eq!(state, "failed");
+        assert_eq!(code.as_deref(), Some("RUNTIME_UNAVAILABLE"));
+
+        // No completed backup row may exist for the dishonest run.
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backups WHERE server_id = ? AND state = 'completed'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, 0);
+    }
 
     #[tokio::test]
     async fn tick_runs_due_policy() {
@@ -1461,36 +1185,21 @@ mod tests {
         let data_dir = data_path_of(&pool, &id).await;
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(data_dir.join("level.dat"), b"hello-minecraft").unwrap();
-
-        // Due policy (next_run_at in the past).
-        let past = (Utc::now() - chrono::Duration::hours(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        sqlx::query(
-            "INSERT INTO backup_policies
-                (id, server_id, name, schedule, timezone, retention_count,
-                 max_age_days, enabled, next_run_at, created_at, updated_at)
-             VALUES (?, ?, 'nightly', '0 2 * * *', 'UTC', 7, 30, 1, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&id)
-        .bind(&past)
-        .bind(&past)
-        .bind(&past)
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_due_policy(&pool, &id).await;
 
         tick_once(&pool, None, &backup_root).await;
 
-        // Daemonless backup of plain files must SUCCEED: completed row exists.
+        // The tick only enqueues; Task 2's worker completes the backup.
+        let (state, code) = poll_backup_task(&pool, &id).await;
+        assert_eq!(state, "succeeded", "code: {code:?}");
         let row: Option<(String, String, i64)> =
             sqlx::query_as("SELECT state, checksum, size_bytes FROM backups WHERE server_id = ?")
                 .bind(&id)
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-        let (state, checksum, size) = row.expect("scheduled backup row missing");
-        assert_eq!(state, "completed");
+        let (bstate, checksum, size) = row.expect("scheduled backup row missing");
+        assert_eq!(bstate, "completed");
         assert!(!checksum.is_empty());
         assert!(size > 0);
         // next_run_at pushed into the future (single catch-up, no chaining).
@@ -1514,24 +1223,7 @@ mod tests {
         let data_dir = data_path_of(&pool, &id).await;
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(data_dir.join("a.txt"), b"x").unwrap();
-
-        let past = (Utc::now() - chrono::Duration::hours(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let policy_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO backup_policies
-                (id, server_id, name, schedule, timezone, retention_count,
-                 max_age_days, enabled, next_run_at, created_at, updated_at)
-             VALUES (?, ?, 'nightly', '0 2 * * *', 'UTC', 7, 30, 1, ?, ?, ?)",
-        )
-        .bind(&policy_id)
-        .bind(&id)
-        .bind(&past)
-        .bind(&past)
-        .bind(&past)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let policy_id = insert_due_policy(&pool, &id).await;
 
         // A queued backup task claims the server.
         sqlx::query(
@@ -1545,13 +1237,22 @@ mod tests {
 
         tick_once(&pool, None, &backup_root).await;
 
-        // No new backup row, next_run pushed, busy skip audited.
+        // `enqueue_backup` rejects before creating any row: no new backup,
+        // no new task, next_run pushed, busy skip audited.
         let backups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups WHERE server_id = ?")
             .bind(&id)
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(backups, 0);
+        let tasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'backup'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tasks, 1);
         let next: String =
             sqlx::query_scalar("SELECT next_run_at FROM backup_policies WHERE id = ?")
                 .bind(&policy_id)
