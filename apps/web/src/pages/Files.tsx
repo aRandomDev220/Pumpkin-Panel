@@ -148,7 +148,7 @@ export default function Files() {
     setUploading(true);
     setError(null);
     try {
-      await uploadFile(serverId, joinRelative(path, file.name), file);
+      await uploadFile(serverId, path, file);
       setNotice(`Uploaded ${file.name}.`);
       invalidate();
     } catch (err) {

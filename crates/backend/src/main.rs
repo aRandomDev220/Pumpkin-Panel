@@ -250,6 +250,12 @@ pub fn build_router(state: AppState) -> Router {
     // Uploads bypass the 5 MiB default body cap with their own 1 GiB limit
     // (enforced again as a running total inside the handler). Auth layer is
     // identical; the routers merge below.
+    //
+    // `DefaultBodyLimit::disable` is required here: axum 0.7's `Multipart`
+    // extractor wraps the body in its own 2 MiB `Limited` unless this
+    // extension is present, which would 400 every upload past 2 MiB no matter
+    // what the tower layer allows. The tower 1 GiB layer + the handler's
+    // running cap remain the real enforcement (streamed, never buffered).
     let protected_uploads = Router::new()
         .route(
             "/api/v1/servers/:id/files/upload",
@@ -264,6 +270,7 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024));
 
     // Readiness reflects boot-time checks; Docker loss at runtime degrades

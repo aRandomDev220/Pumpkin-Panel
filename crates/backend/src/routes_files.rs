@@ -623,6 +623,12 @@ pub async fn import_archive(
             "import target is not a directory",
         );
     }
+    // The destination may be a never-created subdir (resolve already gated
+    // it inside the root, so no new traversal surface): create it before
+    // staging tempfiles into it.
+    if let Err(e) = std::fs::create_dir_all(&dest_full) {
+        return file_error(FileError::Io(e.to_string()));
+    }
     let staged =
         match stage_upload_parts(multipart, &dest_full, file_service::MAX_UPLOAD_BYTES).await {
             Ok(v) => v,
@@ -1181,6 +1187,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn directory_entry_lists_as_dir() {
+        // Pins the frozen server contract (`file_service::Entry.entry_type`):
+        // directories list as `type: "dir"`, files as `type: "file"`.
+        let (server, _) = test_server().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "files-dtype", 25565).await;
+
+        let mkdir = server
+            .post(&format!("/api/v1/servers/{id}/files/directory"))
+            .authorization_bearer(&t)
+            .json(&json!({"path": "sub"}))
+            .await;
+        assert_eq!(mkdir.status_code(), 201, "body: {}", mkdir.text());
+        let up = server
+            .post(&format!("/api/v1/servers/{id}/files/upload?path="))
+            .authorization_bearer(&t)
+            .multipart(upload_form("top.txt", b"top".to_vec()))
+            .await;
+        assert_eq!(up.status_code(), 201, "body: {}", up.text());
+
+        let list = server
+            .get(&format!("/api/v1/servers/{id}/files?path="))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(list.status_code(), 200, "body: {}", list.text());
+        let entries = list.json::<Value>()["entries"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        let dir = entries.iter().find(|e| e["name"] == json!("sub")).unwrap();
+        assert_eq!(dir["type"], json!("dir"), "dir entry: {dir}");
+        let file = entries
+            .iter()
+            .find(|e| e["name"] == json!("top.txt"))
+            .unwrap();
+        assert_eq!(file["type"], json!("file"), "file entry: {file}");
+    }
+
+    #[tokio::test]
+    async fn import_into_new_subdir_succeeds() {
+        // Regression pin for C3: importing into a never-created subdir must
+        // 200 (destination created before staging), not 500.
+        let (server, _) = test_server().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "files-newdir", 25565).await;
+
+        let archive = make_tar_gz(&[("hello.txt", b"hi")]);
+        let res = server
+            .post(&format!(
+                "/api/v1/servers/{id}/files/import?path=new/sub/dir"
+            ))
+            .authorization_bearer(&t)
+            .multipart(upload_form("backup.tar.gz", archive))
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        assert_eq!(res.json::<Value>()["files"], json!(1));
+
+        let dl = server
+            .get(&format!(
+                "/api/v1/servers/{id}/files/download?path=new/sub/dir/hello.txt"
+            ))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(dl.status_code(), 200, "body: {}", dl.text());
+        assert_eq!(dl.as_bytes().as_ref(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn upload_8mib_route_succeeds() {
+        // Route-level oversize evidence (I2): 8 MiB exceeds the 5 MiB default
+        // body cap but must succeed end-to-end through the upload route,
+        // proving the per-route 1 GiB bypass + streaming staging. The
+        // running-cap 413 itself stays pinned at unit level by
+        // `oversize_rejected`.
+        let (server, _) = test_server().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "files-big", 25565).await;
+
+        let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/files/upload?path="))
+            .authorization_bearer(&t)
+            .multipart(upload_form("big8.bin", payload.clone()))
+            .await;
+        assert_eq!(res.status_code(), 201, "body: {}", res.text());
+        assert_eq!(res.json::<Value>()["files"], json!(["big8.bin"]));
+
+        let list = server
+            .get(&format!("/api/v1/servers/{id}/files?path="))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(list.status_code(), 200, "body: {}", list.text());
+        assert_eq!(
+            list.json::<Value>()["entries"][0]["size"],
+            json!(8 * 1024 * 1024)
+        );
+
+        let dl = server
+            .get(&format!(
+                "/api/v1/servers/{id}/files/download?path=big8.bin"
+            ))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(dl.status_code(), 200, "body: {}", dl.text());
+        assert_eq!(dl.as_bytes().as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
     async fn malicious_archive_rejected_before_write() {
         // The `tar` crate refuses to *build* archives with `..`/absolute
         // names, so craft the malicious tar byte-by-byte (raw 512-byte
@@ -1233,10 +1345,11 @@ mod tests {
             .authorization_bearer(&t)
             .multipart(upload_form("evil.tar.gz", archive))
             .await;
-        assert!(
-            res.status_code() == 400 || res.status_code() == 500,
-            "body: {}",
-            res.text()
+        assert_eq!(res.status_code(), 400, "body: {}", res.text());
+        assert_eq!(
+            res.json::<Value>()["error_code"],
+            json!("PATH_OUTSIDE_SERVER_ROOT"),
+            "malicious input must be 400, never 500"
         );
 
         // Nothing was written — not even the valid entry before the bad one.

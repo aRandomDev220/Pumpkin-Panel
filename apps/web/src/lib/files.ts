@@ -1,6 +1,6 @@
 import { authFetch } from "./auth";
 
-export type FileEntryType = "file" | "directory";
+export type FileEntryType = "file" | "dir";
 
 export interface FileEntry {
   name: string;
@@ -35,7 +35,7 @@ function withPath(url: string, path: string): string {
 }
 
 export function isDirectory(entry: FileEntry): boolean {
-  return entry.type === "directory";
+  return entry.type === "dir";
 }
 
 export function joinRelative(parent: string, name: string): string {

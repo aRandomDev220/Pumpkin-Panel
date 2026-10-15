@@ -14,7 +14,7 @@ export interface GuidedConfig {
   view_distance?: number;
   simulation_distance?: number;
   online_mode?: boolean;
-  [key: string]: string | number | boolean | undefined;
+  [key: string]: string | number | boolean | undefined | null;
 }
 
 export interface ConfigProfile {
@@ -28,6 +28,10 @@ export interface ServerConfig {
   content: string;
   guided: GuidedConfig;
   profile: ConfigProfile;
+  diverged?: boolean;
+  diverged_reason?: string;
+  valid?: boolean;
+  errors?: ConfigErrorItem[];
 }
 
 export interface SaveConfigResult {

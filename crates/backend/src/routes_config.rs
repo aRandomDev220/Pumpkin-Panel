@@ -220,15 +220,36 @@ pub async fn get_config(
     let guided = match parse_and_validate(&content) {
         Ok(doc) => guided_from_doc(&doc),
         Err(errors) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error_code": "INVALID_CONFIGURATION",
-                    "message": errors.join("; "),
-                    "errors": errors,
-                })),
-            )
-                .into_response();
+            // Repair shape: the on-disk TOML is invalid (e.g. broken via a
+            // file-manager edit). Return 200 with the raw `content` plus the
+            // validation `errors` (`valid: false`) so the editor stays
+            // loadable; `guided` is best-effort (all nulls when the file does
+            // not even parse). PUT still rejects garbage with 422.
+            let guided = content
+                .parse::<toml_edit::DocumentMut>()
+                .map(|doc| guided_from_doc(&doc))
+                .unwrap_or_default();
+            let mut body = serde_json::json!({
+                "revision": revision,
+                "hash": hash,
+                "content": content,
+                "guided": guided,
+                "profile": profile,
+                "diverged": diverged,
+                "valid": false,
+                "errors": errors,
+            });
+            if diverged {
+                body["diverged_reason"] = serde_json::json!(format!(
+                    "pumpkin.toml on disk (hash {}) does not match revision {} baseline (hash {}); \
+                     edited outside the config API or left behind by an interrupted save — \
+                     review and re-save to reconcile",
+                    short_hash(&hash),
+                    revision,
+                    short_hash(baseline.as_deref().unwrap_or("unknown")),
+                ));
+            }
+            return Json(body).into_response();
         }
     };
     let mut body = serde_json::json!({
@@ -238,6 +259,8 @@ pub async fn get_config(
         "guided": guided,
         "profile": profile,
         "diverged": diverged,
+        "valid": true,
+        "errors": [],
     });
     if diverged {
         body["diverged_reason"] = serde_json::json!(format!(
@@ -1209,5 +1232,63 @@ mod tests {
             .json::<Value>();
         assert_eq!(page["revisions"][0]["revision"], json!(104));
         assert_eq!(page["revisions"][1]["revision"], json!(103));
+    }
+
+    /// I1: GET on an invalid on-disk TOML returns the 200 repair shape
+    /// (`content` + `errors`, `valid: false`) instead of a bare 422, so the
+    /// editor stays loadable; PUT garbage still 422s. Also pins the valid
+    /// shape (`valid: true`, `errors: []`).
+    #[tokio::test]
+    async fn get_invalid_toml_returns_repair_shape() {
+        let (server, _pool) = test_server().await;
+        let token = setup_owner(&server).await;
+        let created = make_server(&server, &token, "cfg-repair", 26111).await;
+        let id = created["server"]["id"].as_str().unwrap().to_string();
+        let data_path = created["server"]["data_path"].as_str().unwrap().to_string();
+        write_pumpkin_toml(&data_path, V1);
+
+        // Valid shape first.
+        let clean = server
+            .get(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .await;
+        assert_eq!(clean.status_code(), 200, "body: {}", clean.text());
+        let clean_body = clean.json::<Value>();
+        assert_eq!(clean_body["valid"], json!(true));
+        assert_eq!(clean_body["errors"], json!([]));
+
+        // Break the file out-of-band (e.g. via a file-manager edit).
+        write_pumpkin_toml(&data_path, GARBAGE);
+        let rev = revision_of(&server, &token, &id).await;
+
+        let res = server
+            .get(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(body["content"], json!(GARBAGE));
+        assert_eq!(body["valid"], json!(false));
+        assert!(
+            body["errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "expected validation errors, got: {body}"
+        );
+        assert_eq!(body["revision"], json!(rev));
+        assert!(body["hash"].is_string(), "got: {body}");
+        assert!(body["profile"].is_object(), "got: {body}");
+        assert!(body["guided"].is_object(), "got: {body}");
+
+        // PUT garbage still rejects with 422 + leaves the file untouched.
+        let put = server
+            .put(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .json(&json!({"revision": rev, "content": GARBAGE}))
+            .await;
+        assert_eq!(put.status_code(), 422, "body: {}", put.text());
+        assert_eq!(
+            put.json::<Value>()["error_code"],
+            json!("INVALID_CONFIGURATION")
+        );
+        assert_eq!(read_pumpkin_toml(&data_path), GARBAGE);
     }
 }

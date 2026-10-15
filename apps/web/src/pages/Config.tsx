@@ -126,7 +126,7 @@ function patchGuidedField(
 
 function guidedValue(g: GuidedConfig, key: string): string {
   const v = g[key];
-  if (v === undefined) return "";
+  if (v === undefined || v === null) return "";
   return String(v);
 }
 
@@ -267,6 +267,22 @@ export default function Config() {
           Unknown server profile (pumpkin_version: {data.profile.pumpkin_version || "unknown"}).
           Guided fields may not match this version — prefer raw TOML and validate before saving.
         </p>
+      )}
+
+      {data?.valid === false && (
+        <div className="err" role="alert">
+          <p>
+            The on-disk <code>pumpkin.toml</code> is invalid — fix it below and Save
+            (save still validates via PUT).
+          </p>
+          {data.errors && data.errors.length > 0 && (
+            <ul>
+              {normalizeErrors(data.errors).map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
 
       {conflict && (
