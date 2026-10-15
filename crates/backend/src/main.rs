@@ -1,13 +1,17 @@
 mod audit;
 mod auth;
 mod config;
+mod config_profile;
 mod db;
 mod error;
+mod file_service;
 mod health;
 mod metrics;
 mod readiness;
 mod routes_admin;
 mod routes_auth;
+mod routes_config;
+mod routes_files;
 mod routes_servers;
 mod runtime;
 mod task_runner;

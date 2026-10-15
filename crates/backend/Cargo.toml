@@ -28,6 +28,9 @@ sha2.workspace = true
 bollard.workspace = true
 futures-util.workspace = true
 sysinfo.workspace = true
+toml_edit.workspace = true
+tar.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 axum-test = "16"
