@@ -182,6 +182,12 @@ export default function ServerDetail() {
       </p>
       <h2>{s.name}</h2>
 
+      <nav className="row" aria-label="Server sections">
+        <span className="badge badge-ok">Overview</span>
+        <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Config</Link>
+        <Link to={`/servers/${encodeURIComponent(s.id)}/files`}>Files</Link>
+      </nav>
+
       <div className="row" role="group" aria-label="Lifecycle controls">
         {(["start", "stop", "restart"] as const).map((op) => (
           <button

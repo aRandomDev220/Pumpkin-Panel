@@ -6,6 +6,8 @@ import Setup from "./pages/Setup";
 import Overview from "./pages/Overview";
 import Servers from "./pages/Servers";
 import ServerDetail from "./pages/ServerDetail";
+import Config from "./pages/Config";
+import Files from "./pages/Files";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { token, isLoading, needsSetupLoading, needsSetup } = useAuth();
@@ -34,6 +36,22 @@ export default function AppRoutes() {
         element={
           <RequireAuth>
             <ServerDetail />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/servers/:id/config"
+        element={
+          <RequireAuth>
+            <Config />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/servers/:id/files"
+        element={
+          <RequireAuth>
+            <Files />
           </RequireAuth>
         }
       />
