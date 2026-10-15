@@ -36,3 +36,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f deploy/Dockerfile -t pumpkin-manager:ci .
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [backend, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: docker pull ghcr.io/pumpkin-mc/pumpkin:master
+      - run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+      - run: npm ci
+        working-directory: apps/web
+      - run: npm run build
+        working-directory: apps/web
+      - run: npx playwright test --config playwright.config.ts
+        working-directory: apps/web
