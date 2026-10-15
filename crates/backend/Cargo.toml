@@ -8,7 +8,7 @@ name = "pumpkin-manager"
 path = "src/main.rs"
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
