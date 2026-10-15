@@ -1,4 +1,5 @@
 mod audit;
+mod backup_service;
 mod auth;
 mod config;
 mod config_profile;
@@ -8,8 +9,10 @@ mod file_service;
 mod health;
 mod metrics;
 mod readiness;
+mod scheduler;
 mod routes_admin;
 mod routes_auth;
+mod routes_backup;
 mod routes_config;
 mod routes_files;
 mod routes_servers;
