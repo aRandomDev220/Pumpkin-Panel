@@ -1,0 +1,19 @@
+services:
+  pumpkin-dev:
+    image: ghcr.io/pumpkin-mc/pumpkin:master
+    container_name: pumpkin-dev-recon
+    ports:
+      - "25565:25565"
+      - "19132:19132/udp"
+    volumes:
+      - pumpkin-dev-data:/pumpkin
+    stdin_open: true
+    tty: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  pumpkin-dev-data:

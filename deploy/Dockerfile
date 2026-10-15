@@ -1,0 +1,36 @@
+# Single-image manager: Rust API serves Vite build + /api/v1.
+# Phase 1 scaffold. Child Pumpkin containers are created at runtime via /var/run/docker.sock.
+
+FROM node:24-alpine AS webbuild
+WORKDIR /web
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN npm ci
+COPY apps/web/ ./
+RUN npm run build
+
+FROM rust:1.90-alpine AS apibuild
+RUN apk add --no-cache musl-dev sqlite-dev pkgconfig
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY migrations/ ./migrations/
+RUN cargo build --release -p pumpkin-manager-backend
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates sqlite-libs \
+ && addgroup -S app && adduser -S app -G app
+WORKDIR /app
+COPY --from=apibuild /app/target/release/pumpkin-manager /usr/local/bin/pumpkin-manager
+COPY --from=webbuild /web/dist /app/web
+RUN chown -R app:app /app
+# NOTE: /var/run/docker.sock mount makes this container privileged-equivalent.
+# Backend only — never expose the socket to the browser.
+USER app
+ENV PUMPKIN_MANAGER_HTTP_PORT=8080 \
+    PUMPKIN_MANAGER_DATA_DIR=/data/servers \
+    PUMPKIN_MANAGER_BACKUP_DIR=/data/backups \
+    PUMPKIN_MANAGER_LOG_LEVEL=info
+EXPOSE 8080
+VOLUME ["/data"]
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8080/api/v1/health/live || exit 1
+ENTRYPOINT ["pumpkin-manager"]

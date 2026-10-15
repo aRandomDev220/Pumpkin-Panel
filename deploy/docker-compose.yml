@@ -1,0 +1,35 @@
+services:
+  pumpkin-manager:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: pumpkin-manager:0.1.0
+    container_name: pumpkin-manager
+    ports:
+      - "${PUMPKIN_MANAGER_HTTP_PORT:-8080}:8080"
+    volumes:
+      # Manager state (SQLite, server data roots, backups).
+      - manager-data:/data
+      # Privileged boundary: backend-only Docker control. See docs/security.md.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    env_file:
+      - .env
+    environment:
+      PUMPKIN_MANAGER_HTTP_PORT: "8080"
+      PUMPKIN_MANAGER_DATA_DIR: /data/servers
+      PUMPKIN_MANAGER_BACKUP_DIR: /data/backups
+      PUMPKIN_MANAGER_LOG_LEVEL: ${PUMPKIN_MANAGER_LOG_LEVEL:-info}
+      PUMPKIN_MANAGER_DATABASE_URL: sqlite:/data/pumpkin-manager.db?mode=rwc
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # Pumpkins are NOT statically listed here in production — the manager
+  # creates one container per server via the Docker API (see README).
+  # This dev override runs a single disposable Pumpkin for recon testing:
+  #   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up
+
+volumes:
+  manager-data:

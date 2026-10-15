@@ -1,0 +1,39 @@
+# Rust
+/target/
+/crates/*/target/
+**/*.rs.bk
+
+# Node / Vite
+node_modules/
+apps/web/dist/
+apps/web/dist-ssr/
+*.local
+
+# Env / secrets — never commit real values
+.env
+.env.local
+deploy/.env
+
+# SQLite dev DBs
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+data/
+backups/
+
+# Docker
+.docker/
+
+# OS / editor
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
