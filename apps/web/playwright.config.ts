@@ -12,9 +12,9 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:5193",
   },
   webServer: {
-    // Build once so preview serves the current UI; preview proxies /api to
-    // the E2E backend on :18091 (see preview.proxy in vite.config.ts).
-    command: "npm run build && npm run preview -- --port 5193",
+    // Serves the prebuilt UI (CI and `test:e2e` build first); preview
+    // proxies /api to the E2E backend on :18091 (see preview.proxy).
+    command: "npm run preview -- --port 5193",
     url: "http://127.0.0.1:5193",
     reuseExistingServer: !CI,
     timeout: 180_000,
