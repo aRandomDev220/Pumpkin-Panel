@@ -14,6 +14,7 @@ import {
   postLifecycle,
 } from "../lib/servers";
 import type { LifecycleOp, TaskStatus } from "../lib/servers";
+import BackupsSection from "./Backups";
 
 const LOG_TAIL_OPTIONS = [50, 200, 500];
 
@@ -186,6 +187,7 @@ export default function ServerDetail() {
         <span className="badge badge-ok">Overview</span>
         <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Config</Link>
         <Link to={`/servers/${encodeURIComponent(s.id)}/files`}>Files</Link>
+        <a href="#backups">Backups</a>
       </nav>
 
       <div className="row" role="group" aria-label="Lifecycle controls">
@@ -404,6 +406,9 @@ export default function ServerDetail() {
           )}
         </dl>
       )}
+      <div id="backups">
+        <BackupsSection serverId={s.id} observedState={s.observed_state} />
+      </div>
     </section>
   );
 }
