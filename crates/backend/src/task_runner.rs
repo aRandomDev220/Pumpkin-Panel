@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::runtime::{DockerAdapter, RuntimeAdapter, RuntimeError};
+use crate::runtime::{DockerAdapter, RuntimeError};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -255,6 +255,17 @@ pub async fn mark_failed(
     Ok(())
 }
 
+/// Mark a task `cancelled` (sets `finished_at`). Only valid pre-dispatch.
+pub async fn mark_cancelled(pool: &sqlx::SqlitePool, task_id: &str) -> Result<(), TaskError> {
+    sqlx::query(
+        "UPDATE tasks SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Crash recovery: fail every task left `queued` or `running` by a previous
 /// process with `TASK_INTERRUPTED`. Call once on boot, before
 /// [`spawn_runner`]. Returns the number of rows failed.
@@ -314,15 +325,25 @@ async fn container_for_server(
 /// Handles runtime ops (`start`/`stop`/`restart`/`remove`); anything else is
 /// failed with `UNKNOWN_TASK_TYPE` so new task kinds fail loudly instead of
 /// silently no-opping. (The backup workstream extends this match.)
-pub async fn dispatch_task(
+///
+/// Generic over [`RuntimeAdapter`] so cancellation paths are unit-testable
+/// without a daemon.
+pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
     pool: &sqlx::SqlitePool,
-    adapter: &DockerAdapter,
+    adapter: &A,
     task_id: &str,
 ) -> Result<(), TaskError> {
     let Some(task) = get(pool, task_id).await? else {
         warn!(task_id, "dispatch for unknown task");
         return Err(TaskError::NotFound(task_id.to_string()));
     };
+    // Cooperative cancellation is decided before any runtime call: a task
+    // cancelled while queued never touches Docker.
+    if matches!(task.state, TaskState::CancelRequested) {
+        info!(task_id, "task cancelled before dispatch");
+        mark_cancelled(pool, task_id).await?;
+        return Ok(());
+    }
     // Only claim queued (or previously interrupted) work; never stomp a
     // terminal state or another worker's running task.
     if !matches!(task.state, TaskState::Queued) {
@@ -391,6 +412,23 @@ pub async fn dispatch_task(
                 Ok(msg) => {
                     info!(task_id, task_type = %task.task_type, "task succeeded");
                     mark_succeeded(pool, task_id, &msg).await?;
+                    // Eager observed-state sync: status reads stay truthful
+                    // even before the next inspect pass.
+                    let observed = match task.task_type.as_str() {
+                        "start" | "restart" => Some("running"),
+                        "stop" => Some("exited"),
+                        "remove" => Some("missing"),
+                        _ => None,
+                    };
+                    if let Some(observed) = observed {
+                        let _ = sqlx::query(
+                            "UPDATE servers SET observed_state = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                        )
+                        .bind(observed)
+                        .bind(&server_id)
+                        .execute(pool)
+                        .await;
+                    }
                 }
                 Err(e) => {
                     error!(task_id, error = %e, "task failed");
@@ -457,7 +495,7 @@ pub fn spawn_runner(
             let semaphore = semaphore.clone();
             tokio::spawn(async move {
                 let _permit = semaphore.acquire_owned().await;
-                if let Err(e) = dispatch_task(&pool, &adapter, &task_id).await {
+                if let Err(e) = dispatch_task(&pool, adapter.as_ref(), &task_id).await {
                     error!(%task_id, error = %e, "dispatch failed");
                 }
             });

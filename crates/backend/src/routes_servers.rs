@@ -207,7 +207,9 @@ fn runtime_error(e: RuntimeError) -> Response {
     let code = e.code();
     let (status, msg) = match &e {
         RuntimeError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        RuntimeError::PortUnavailable(_) => (StatusCode::CONFLICT, e.to_string()),
+        RuntimeError::PortUnavailable(_) | RuntimeError::NameConflict(_) => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
         _ => (StatusCode::BAD_GATEWAY, e.to_string()),
     };
     // Never leak raw daemon internals beyond the display string, which the
@@ -670,9 +672,9 @@ async fn lifecycle_inner(
     }
 }
 
-/// GET /api/v1/servers/:id/status — DB desired state + live observed state.
-/// Inspects the container when attached and syncs `observed_state`
-/// best-effort. A stopped server reports `stopped`, never `unhealthy`.
+/// GET /api/v1/servers/:id/status — desired state, live observed state,
+/// and game readiness from a protocol ping (never container existence
+/// alone). A stopped server reports `stopped`, never `unhealthy`.
 pub async fn server_status(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -684,6 +686,7 @@ pub async fn server_status(
     let mut observed = server.observed_state.clone();
     let mut container: serde_json::Value = serde_json::Value::Null;
     let mut docker_available = state.adapter.is_some();
+    let mut exit_code: Option<i64> = None;
     if let Some(adapter) = &state.adapter {
         if server.container_id.is_empty() {
             observed = "missing".to_string();
@@ -691,6 +694,7 @@ pub async fn server_status(
             match adapter.inspect(&server.container_id).await {
                 Ok(snap) => {
                     observed = map_container_status(&snap.status);
+                    exit_code = snap.exit_code;
                     container = serde_json::json!({
                         "container_id": snap.container_id,
                         "status": snap.status,
@@ -715,14 +719,83 @@ pub async fn server_status(
             }
         }
     }
+    // Game readiness: ping the Java port when the container claims to run.
+    // `bind_address` may be a LAN IP unreachable from here, so ping
+    // localhost — the published port answers there for 0.0.0.0 bindings.
+    let mut ping_json = serde_json::Value::Null;
+    if observed == "running" {
+        match crate::readiness::ping_java(
+            "127.0.0.1",
+            server.game_port as u16,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        {
+            Ok(ping) => {
+                ping_json = serde_json::json!({
+                    "players_online": ping.players_online,
+                    "players_max": ping.players_max,
+                    "version": ping.version_name,
+                    "motd": ping.motd_text,
+                    "latency_ms": ping.latency_ms,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(server_id = %server.id, error = ?e, "readiness ping failed");
+            }
+        }
+    }
+    let ping_ok = !ping_json.is_null();
+    let (readiness_state, reason) =
+        readiness_for(&server.desired_state, &observed, exit_code, ping_ok);
     Json(serde_json::json!({
         "id": server.id,
         "desired_state": server.desired_state,
         "observed_state": observed,
+        "readiness": {
+            "state": readiness_state,
+            "reason": reason,
+            "ping": ping_json,
+        },
         "docker_available": docker_available,
         "container": container,
     }))
     .into_response()
+}
+
+/// Derive game readiness from desired/observed container state.
+/// `online` is only reachable with a live ping (set by the caller).
+fn readiness_for(
+    desired: &str,
+    observed: &str,
+    exit_code: Option<i64>,
+    ping_ok: bool,
+) -> (&'static str, String) {
+    if observed == "running" && ping_ok {
+        return ("online", "game port answered status ping".to_string());
+    }
+    match (desired, observed) {
+        (_, "running") => (
+            "starting",
+            "container running, awaiting game ping".to_string(),
+        ),
+        ("stopped", _) => ("stopped", "server is stopped".to_string()),
+        (_, "created") => ("starting", "container created, not started yet".to_string()),
+        (_, "exited") => (
+            "unhealthy",
+            format!(
+                "process exited while running was requested{}",
+                exit_code
+                    .map(|c| format!(" (exit {c})"))
+                    .unwrap_or_default()
+            ),
+        ),
+        (_, "missing") => (
+            "unknown",
+            "no container materialised for this server".to_string(),
+        ),
+        _ => ("unknown", format!("observed state {observed}")),
+    }
 }
 
 fn map_container_status(docker_status: &str) -> String {
@@ -736,6 +809,70 @@ fn map_container_status(docker_status: &str) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+/// GET /api/v1/servers/:id/tasks — task history for one server:
+/// failures and activity for the detail view. Newest first, capped.
+pub async fn server_tasks(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(id): Path<String>,
+    Query(pager): Query<Pagination>,
+) -> Response {
+    if fetch_server(&state.pool, &id)
+        .await
+        .unwrap_or(None)
+        .is_none()
+    {
+        return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
+    }
+    let limit = pager.limit.clamp(1, 100);
+    let offset = pager.offset.max(0);
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE server_id = ?")
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let rows = sqlx::query(
+        "SELECT id, type, state, server_id, requested_by, progress_percent,
+                message, error_code, error_summary
+         FROM tasks WHERE server_id = ?
+         ORDER BY created_at DESC LIMIT ? OFFSET ?",
+    )
+    .bind(&id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            use sqlx::Row as _;
+            let tasks: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.get::<String, _>("id"),
+                        "kind": r.get::<String, _>("type"),
+                        "type": r.get::<String, _>("type"),
+                        "state": r.get::<String, _>("state"),
+                        "server_id": r.get::<Option<String>, _>("server_id"),
+                        "requested_by": r.get::<Option<String>, _>("requested_by"),
+                        "progress_percent": r.get::<i64, _>("progress_percent"),
+                        "message": r.get::<String, _>("message"),
+                        "error": r.get::<Option<String>, _>("error_summary"),
+                        "error_code": r.get::<Option<String>, _>("error_code"),
+                        "error_summary": r.get::<Option<String>, _>("error_summary"),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "tasks": tasks, "total": total })).into_response()
+        }
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to list tasks",
+        ),
+    }
 }
 
 /// GET /api/v1/servers/:id/logs?tail= — Docker log tail (read-only).

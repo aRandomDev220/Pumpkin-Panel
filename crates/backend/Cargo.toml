@@ -27,6 +27,7 @@ rand.workspace = true
 sha2.workspace = true
 bollard.workspace = true
 futures-util.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 axum-test = "16"

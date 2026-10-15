@@ -8,3 +8,14 @@ nav a { color: #7dd8a8; text-decoration: none; margin-right: 12px; }
 .badge-err { border: 1px solid #8a2f2f; }
 .muted { color: #93a399; }
 .err { color: #f0a3a3; }
+.warn { color: #e8c87a; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 12px 0; }
+.card { background: #141c19; border: 1px solid #22332b; border-radius: 8px; padding: 12px 16px; }
+.card-num { font-size: 20px; font-weight: 600; color: #7dd8a8; }
+.table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+.table th, .table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #22332b; }
+.table th { color: #93a399; font-weight: 600; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+.log { background: #0a0f0d; border: 1px solid #22332b; border-radius: 8px; padding: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
+button, select { font: inherit; }
+button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid #7dd8a8; outline-offset: 2px; }

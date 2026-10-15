@@ -4,6 +4,8 @@ mod config;
 mod db;
 mod error;
 mod health;
+mod metrics;
+mod readiness;
 mod routes_admin;
 mod routes_auth;
 mod routes_servers;
@@ -11,6 +13,8 @@ mod runtime;
 mod task_runner;
 #[cfg(test)]
 mod tests_phase2;
+#[cfg(test)]
+mod tests_phase3;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -103,6 +107,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/servers/:id/logs",
             get(routes_servers::server_logs).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/tasks",
+            get(routes_servers::server_tasks).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/metrics/summary",
+            get(metrics::metrics_summary).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )

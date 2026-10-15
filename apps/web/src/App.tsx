@@ -30,6 +30,7 @@ export default function App() {
             <header>
               <h1>Pumpkin Manager</h1>
               <nav>
+                <Link to="/">Overview</Link>
                 <Link to="/servers">Servers</Link>
               </nav>
               <HealthBadge />

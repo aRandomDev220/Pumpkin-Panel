@@ -114,3 +114,163 @@ export function validateCreateServer(input: CreateServerInput): string | null {
   if (!input.image_reference.trim()) return "image_reference is required.";
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: dashboard + lifecycle contracts.
+// Key names below match the frozen backend contracts exactly. `readiness` is
+// optional: older backends omit it, in which case callers fall back to
+// desired/observed state.
+// ---------------------------------------------------------------------------
+
+export type ReadinessState =
+  | "online"
+  | "starting"
+  | "stopped"
+  | "unhealthy"
+  | "unknown";
+
+export interface ServerStatusPing {
+  players_online: number;
+  players_max: number;
+  version: string;
+  motd: string;
+  latency_ms: number;
+}
+
+export interface ReadinessInfo {
+  state: ReadinessState;
+  reason: string;
+  ping: ServerStatusPing | null;
+}
+
+export interface ServerContainerView {
+  container_id?: string | null;
+  status?: string | null;
+  exit_code?: number | null;
+  health?: string | null;
+}
+
+export interface ServerStatus {
+  id: string;
+  desired_state: string;
+  observed_state: string;
+  readiness?: ReadinessInfo | null;
+  docker_available: boolean;
+  container: ServerContainerView | null;
+}
+
+export interface ServerTask {
+  id: string;
+  kind: string;
+  type: string;
+  state: string;
+  server_id: string | null;
+  progress_percent: number | null;
+  message: string | null;
+  error: string | null;
+  error_code: string | null;
+}
+
+export interface ServerTasksResponse {
+  tasks: ServerTask[];
+  total: number;
+}
+
+export interface HostStats {
+  cpu_percent: number;
+  memory_total_bytes: number;
+  memory_used_bytes: number;
+  disk_total_bytes: number;
+  disk_free_bytes: number;
+}
+
+export interface ServerMetric {
+  server_id: string;
+  name: string;
+  cpu_percent: number | null;
+  memory_bytes: number | null;
+  memory_limit: number | null;
+  state: string;
+}
+
+export interface MetricsSummary {
+  host: HostStats;
+  servers: ServerMetric[];
+}
+
+export interface ServerLogsResponse {
+  logs: string[];
+}
+
+export type LifecycleOp = "start" | "stop" | "restart";
+
+export interface LifecycleAccepted {
+  task_id: string;
+}
+
+export interface LifecycleAlready {
+  status: "already";
+  desired_state: string;
+}
+
+export type LifecycleResult = LifecycleAccepted | LifecycleAlready;
+
+export function isLifecycleAccepted(
+  result: LifecycleResult,
+): result is LifecycleAccepted {
+  return "task_id" in result;
+}
+
+const TERMINAL_TASK_STATES: ReadonlySet<string> = new Set([
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+
+export function isTerminalTaskState(state: string): boolean {
+  return TERMINAL_TASK_STATES.has(state);
+}
+
+export async function fetchStatus(id: string): Promise<ServerStatus> {
+  const res = await authFetch(`/api/v1/servers/${encodeURIComponent(id)}/status`);
+  return parseJson<ServerStatus>(res, "get server status");
+}
+
+export async function fetchServerTasks(
+  id: string,
+  limit = 10,
+  offset = 0,
+): Promise<ServerTasksResponse> {
+  const qs = `?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`;
+  const res = await authFetch(
+    `/api/v1/servers/${encodeURIComponent(id)}/tasks${qs}`,
+  );
+  return parseJson<ServerTasksResponse>(res, "list server tasks");
+}
+
+export async function fetchMetricsSummary(): Promise<MetricsSummary> {
+  const res = await authFetch("/api/v1/metrics/summary");
+  return parseJson<MetricsSummary>(res, "get metrics summary");
+}
+
+export async function fetchServerLogs(
+  id: string,
+  tail = 200,
+): Promise<ServerLogsResponse> {
+  const qs = `?tail=${encodeURIComponent(String(tail))}`;
+  const res = await authFetch(
+    `/api/v1/servers/${encodeURIComponent(id)}/logs${qs}`,
+  );
+  return parseJson<ServerLogsResponse>(res, "get server logs");
+}
+
+export async function postLifecycle(
+  id: string,
+  op: LifecycleOp,
+): Promise<LifecycleResult> {
+  const res = await authFetch(
+    `/api/v1/servers/${encodeURIComponent(id)}/${op}`,
+    { method: "POST" },
+  );
+  return parseJson<LifecycleResult>(res, `${op} server`);
+}

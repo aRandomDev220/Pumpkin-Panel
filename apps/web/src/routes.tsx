@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { useAuth } from "./lib/auth";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
+import Overview from "./pages/Overview";
 import Servers from "./pages/Servers";
 import ServerDetail from "./pages/ServerDetail";
 
@@ -36,7 +37,14 @@ export default function AppRoutes() {
           </RequireAuth>
         }
       />
-      <Route path="/" element={<Navigate to="/servers" replace />} />
+      <Route
+        path="/"
+        element={
+          <RequireAuth>
+            <Overview />
+          </RequireAuth>
+        }
+      />
       <Route path="*" element={<p className="err">Not found.</p>} />
     </Routes>
   );

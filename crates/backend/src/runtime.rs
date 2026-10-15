@@ -427,6 +427,10 @@ pub enum RuntimeError {
     /// Container does not exist (anymore).
     #[error("container not found: {0}")]
     NotFound(String),
+    /// A container with the manager's `pumpkin-<slug>` name already exists
+    /// (stale container, out-of-band create). Remove or rename it first.
+    #[error("container name already in use: {0}")]
+    NameConflict(String),
     /// Spec / config problem surfaced at runtime.
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
@@ -447,6 +451,7 @@ impl RuntimeError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::PortUnavailable(_) => SpecErrorCode::PortUnavailable.code(),
+            Self::NameConflict(_) => "CONTAINER_NAME_CONFLICT",
             Self::InvalidConfiguration(_) => SpecErrorCode::InvalidConfiguration.code(),
             Self::CapabilityUnavailable(_) => SpecErrorCode::CapabilityUnavailable.code(),
             Self::Database(_) | Self::Io(_) => "RUNTIME_ERROR",
@@ -460,6 +465,8 @@ impl RuntimeError {
         let msg = err.to_string();
         if msg.contains("port is already allocated") {
             Self::PortUnavailable(msg)
+        } else if msg.contains("is already in use") {
+            Self::NameConflict(msg)
         } else if msg.contains("No such container") {
             Self::NotFound(msg)
         } else {
@@ -1037,6 +1044,18 @@ mod tests {
         let spec = validate_spec(input(), &root()).expect("valid spec");
         assert_eq!(spec.game_port, 25565);
         assert_eq!(spec.bedrock_port, 25566);
+    }
+
+    #[test]
+    fn container_name_conflict_maps_to_stable_code() {
+        // Exact daemon text observed live (Phase 3 E2E): a stale
+        // `pumpkin-live` container collided with a fresh create.
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "Conflict. The container name \"/pumpkin-live\" is already in use by container \"e20e3297\". You have to remove (or rename) that container to be able to reuse that name.".to_string(),
+        };
+        let mapped = RuntimeError::from_bollard(err);
+        assert_eq!(mapped.code(), "CONTAINER_NAME_CONFLICT");
     }
 
     #[test]
