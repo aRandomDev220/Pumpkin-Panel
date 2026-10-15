@@ -20,12 +20,108 @@ function formatTomlValue(value: string | number | boolean): string {
   return `"${escaped}"`;
 }
 
-function patchTomlKey(content: string, key: string, value: string | number | boolean): string {
-  const line = `${key} = ${formatTomlValue(value)}`;
-  const re = new RegExp(`^${key}\\s*=.*$`, "m");
-  if (re.test(content)) return content.replace(re, line);
-  const trimmed = content.endsWith("\n") || content === "" ? content : `${content}\n`;
-  return `${trimmed}${line}\n`;
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface GuidedTarget {
+  scope: "top" | "nested";
+  key: string;
+}
+
+// Exact TOML paths from `crates/backend/src/config_profile.rs`: top-level
+// keys patch the document preamble (before the first `[section]`); nested
+// keys are dual-written to BOTH `[networking.java]` and `[networking.bedrock]`
+// (server reads java-first, falls back to bedrock).
+const GUIDED_TARGETS: Record<string, GuidedTarget> = {
+  seed: { scope: "top", key: "seed" },
+  default_difficulty: { scope: "top", key: "default_difficulty" },
+  default_gamemode: { scope: "top", key: "default_gamemode" },
+  default_level_name: { scope: "top", key: "default_level_name" },
+  hardcore: { scope: "top", key: "hardcore" },
+  white_list: { scope: "top", key: "white_list" },
+  enforce_whitelist: { scope: "top", key: "enforce_whitelist" },
+  tps: { scope: "top", key: "tps" },
+  motd: { scope: "nested", key: "motd" },
+  max_players: { scope: "nested", key: "max_players" },
+  view_distance: { scope: "nested", key: "view_distance" },
+  simulation_distance: { scope: "nested", key: "simulation_distance" },
+  online_mode: { scope: "nested", key: "online_mode" },
+};
+
+function isSectionHeader(line: string): boolean {
+  return /^\s*\[[^\]]+\]\s*$/.test(line);
+}
+
+function keyLine(key: string, value: string | number | boolean): string {
+  return `${key} = ${formatTomlValue(value)}`;
+}
+
+function patchTopLevel(content: string, key: string, value: string | number | boolean): string {
+  if (content === "") return keyLine(key, value);
+  const lines = content.split("\n");
+  let firstHeader = lines.findIndex(isSectionHeader);
+  if (firstHeader < 0) firstHeader = lines.length;
+  const re = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`);
+  for (let i = 0; i < firstHeader; i++) {
+    if (re.test(lines[i])) {
+      lines[i] = keyLine(key, value);
+      return lines.join("\n");
+    }
+  }
+  lines.splice(firstHeader, 0, keyLine(key, value));
+  return lines.join("\n");
+}
+
+function patchSection(
+  lines: string[],
+  header: string,
+  key: string,
+  value: string | number | boolean,
+): string[] {
+  const out = [...lines];
+  const headerIdx = out.findIndex((l) => l.trim() === header);
+  const re = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`);
+  if (headerIdx < 0) {
+    if (out.length > 0 && out[out.length - 1] !== "") out.push("");
+    out.push(header, keyLine(key, value));
+    return out;
+  }
+  let end = out.length;
+  for (let i = headerIdx + 1; i < out.length; i++) {
+    if (isSectionHeader(out[i])) {
+      end = i;
+      break;
+    }
+  }
+  for (let i = headerIdx + 1; i < end; i++) {
+    if (re.test(out[i])) {
+      out[i] = keyLine(key, value);
+      return out;
+    }
+  }
+  out.splice(headerIdx + 1, 0, keyLine(key, value));
+  return out;
+}
+
+function patchNested(content: string, key: string, value: string | number | boolean): string {
+  let lines = content.split("\n");
+  for (const side of ["java", "bedrock"] as const) {
+    lines = patchSection(lines, `[networking.${side}]`, key, value);
+  }
+  return lines.join("\n");
+}
+
+function patchGuidedField(
+  content: string,
+  field: string,
+  value: string | number | boolean,
+): string {
+  const target = GUIDED_TARGETS[field];
+  if (!target) return patchTopLevel(content, field, value);
+  return target.scope === "nested"
+    ? patchNested(content, target.key, value)
+    : patchTopLevel(content, target.key, value);
 }
 
 function guidedValue(g: GuidedConfig, key: string): string {
@@ -134,18 +230,18 @@ export default function Config() {
 
   function updateGuidedText(key: string, raw: string) {
     setGuided((g) => ({ ...g, [key]: raw }));
-    setContent((c) => patchTomlKey(c, key, raw));
+    setContent((c) => patchGuidedField(c, key, raw));
   }
 
   function updateGuidedNumber(key: string, raw: string) {
     const parsed = parseNumberOr(raw, typeof guided[key] === "number" ? (guided[key] as number) : undefined);
     setGuided((g) => ({ ...g, [key]: parsed === "" ? undefined : parsed }));
-    if (typeof parsed === "number") setContent((c) => patchTomlKey(c, key, parsed));
+    if (typeof parsed === "number") setContent((c) => patchGuidedField(c, key, parsed));
   }
 
   function updateGuidedBool(key: string, checked: boolean) {
     setGuided((g) => ({ ...g, [key]: checked }));
-    setContent((c) => patchTomlKey(c, key, checked));
+    setContent((c) => patchGuidedField(c, key, checked));
   }
 
   const data = configQuery.data;
@@ -212,8 +308,10 @@ export default function Config() {
 
           <h3>Guided settings</h3>
           <p className="muted">
-            Editing a guided field patches the matching <code>key = value</code> line in the raw
-            TOML below (appended if absent).
+            Editing a guided field patches the raw TOML below. Top-level fields edit the
+            document preamble; fields marked “Java + Bedrock” are written to both{" "}
+            <code>[networking.java]</code> and <code>[networking.bedrock]</code> together —
+            use raw TOML for per-edition control.
           </p>
           <div className="row">
             <label>
@@ -227,24 +325,24 @@ export default function Config() {
             <label>
               Difficulty{" "}
               <input
-                value={guidedValue(guided, "difficulty")}
-                onChange={(e) => updateGuidedText("difficulty", e.target.value)}
+                value={guidedValue(guided, "default_difficulty")}
+                onChange={(e) => updateGuidedText("default_difficulty", e.target.value)}
                 placeholder="peaceful / easy / normal / hard"
               />
             </label>
             <label>
               Gamemode{" "}
               <input
-                value={guidedValue(guided, "gamemode")}
-                onChange={(e) => updateGuidedText("gamemode", e.target.value)}
+                value={guidedValue(guided, "default_gamemode")}
+                onChange={(e) => updateGuidedText("default_gamemode", e.target.value)}
                 placeholder="survival / creative / adventure / spectator"
               />
             </label>
             <label>
               Level name{" "}
               <input
-                value={guidedValue(guided, "level_name")}
-                onChange={(e) => updateGuidedText("level_name", e.target.value)}
+                value={guidedValue(guided, "default_level_name")}
+                onChange={(e) => updateGuidedText("default_level_name", e.target.value)}
                 placeholder="world"
               />
             </label>
@@ -261,16 +359,16 @@ export default function Config() {
             <label>
               <input
                 type="checkbox"
-                checked={guidedChecked(guided, "whitelist_enabled")}
-                onChange={(e) => updateGuidedBool("whitelist_enabled", e.target.checked)}
+                checked={guidedChecked(guided, "white_list")}
+                onChange={(e) => updateGuidedBool("white_list", e.target.checked)}
               />{" "}
               Whitelist enabled
             </label>
             <label>
               <input
                 type="checkbox"
-                checked={guidedChecked(guided, "whitelist_enforce")}
-                onChange={(e) => updateGuidedBool("whitelist_enforce", e.target.checked)}
+                checked={guidedChecked(guided, "enforce_whitelist")}
+                onChange={(e) => updateGuidedBool("enforce_whitelist", e.target.checked)}
               />{" "}
               Whitelist enforce
             </label>
@@ -280,7 +378,7 @@ export default function Config() {
                 checked={guidedChecked(guided, "online_mode")}
                 onChange={(e) => updateGuidedBool("online_mode", e.target.checked)}
               />{" "}
-              Online mode
+              Online mode (Java + Bedrock)
             </label>
           </div>
           <div className="row">
@@ -294,7 +392,7 @@ export default function Config() {
               />
             </label>
             <label>
-              MOTD{" "}
+              MOTD (Java + Bedrock){" "}
               <input
                 value={guidedValue(guided, "motd")}
                 onChange={(e) => updateGuidedText("motd", e.target.value)}
@@ -302,7 +400,7 @@ export default function Config() {
               />
             </label>
             <label>
-              Max players{" "}
+              Max players (Java + Bedrock){" "}
               <input
                 type="number"
                 value={guidedValue(guided, "max_players")}
@@ -311,7 +409,7 @@ export default function Config() {
               />
             </label>
             <label>
-              View distance{" "}
+              View distance (Java + Bedrock){" "}
               <input
                 type="number"
                 value={guidedValue(guided, "view_distance")}
@@ -320,7 +418,7 @@ export default function Config() {
               />
             </label>
             <label>
-              Simulation distance{" "}
+              Simulation distance (Java + Bedrock){" "}
               <input
                 type="number"
                 value={guidedValue(guided, "simulation_distance")}
@@ -403,7 +501,7 @@ export default function Config() {
                       revision {r.revision}
                     </button>{" "}
                     <span className="muted">
-                      {r.hash} · {r.created_at} · {r.created_by}
+                      {r.hash} · {r.created_at} · {r.created_by ?? "—"}
                     </span>{" "}
                     <button
                       type="button"
@@ -417,14 +515,15 @@ export default function Config() {
                       Revert
                     </button>
                     {expanded === r.revision && (
-                      <pre className="log" tabIndex={0}>
-                        revision: {r.revision}
-                        {"\n"}hash: {r.hash}
-                        {"\n"}created_at: {r.created_at}
-                        {"\n"}created_by: {r.created_by}
-                        {"\n\n"}(Full content preview is unavailable from the revisions
-                        endpoint; reload the config after revert to inspect.)
-                      </pre>
+                      <>
+                        <p className="muted">
+                          revision {r.revision} · {r.hash} · {r.created_at} ·{" "}
+                          {r.created_by ?? "—"}
+                        </p>
+                        <pre className="log" tabIndex={0}>
+                          {r.content || "(empty)"}
+                        </pre>
+                      </>
                     )}
                   </li>
                 ))}

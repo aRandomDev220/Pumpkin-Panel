@@ -2,12 +2,12 @@ import { authFetch } from "./auth";
 
 export interface GuidedConfig {
   seed?: string;
-  difficulty?: string;
-  gamemode?: string;
-  level_name?: string;
+  default_difficulty?: string;
+  default_gamemode?: string;
+  default_level_name?: string;
   hardcore?: boolean;
-  whitelist_enabled?: boolean;
-  whitelist_enforce?: boolean;
+  white_list?: boolean;
+  enforce_whitelist?: boolean;
   tps?: number;
   motd?: string;
   max_players?: number;
@@ -59,8 +59,9 @@ export interface ValidateConfigResult {
 export interface ConfigRevision {
   revision: number;
   hash: string;
+  content: string;
   created_at: string;
-  created_by: string;
+  created_by: string | null;
 }
 
 export interface ConfigRevisionList {
