@@ -20,7 +20,7 @@
 //! execution under a process-wide single-permit semaphore.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use axum::{
@@ -258,46 +258,50 @@ fn backup_json(b: &BackupRow) -> serde_json::Value {
 // Roots, hashing, space
 // ---------------------------------------------------------------------------
 
-/// Backup directory for a server root: `<server_root>/../backups`
-/// (lexically normalised). Overridable with `PUMPKIN_MANAGER_BACKUP_DIR`,
-/// which the test harness uses to isolate each test.
-pub fn backup_root_for(server_root: &Path) -> PathBuf {
-    if let Ok(dir) = std::env::var("PUMPKIN_MANAGER_BACKUP_DIR") {
-        let dir = dir.trim().to_string();
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
+/// Best-effort boot cleanup: remove `.tmp-*` staging entries predating this
+/// boot from the backup root, plus `.tmp-*`/`.recovery-*` crash leftovers
+/// beside every live server's data dir (restore stages `.tmp-restore-<id>`
+/// and parks `.recovery-<ts>` in the server root). In-progress backup *rows*
+/// are left alone (`requeue_interrupted` already fails their tasks; the rows
+/// stay as evidence).
+pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
+    clean_staging_dir(backup_root, false);
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT data_path FROM servers WHERE deleted_at IS NULL")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let mut parents = HashSet::new();
+    for (data_path,) in rows {
+        if let Some(parent) = parent_of(&data_path) {
+            parents.insert(parent);
         }
     }
-    let mut out = PathBuf::new();
-    for comp in server_root.join("../backups").components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            _ => out.push(comp.as_os_str()),
-        }
+    for parent in parents {
+        clean_staging_dir(&parent, true);
     }
-    out
 }
 
-/// Best-effort boot cleanup: remove `.tmp-*` staging entries predating this
-/// boot. In-progress backup *rows* are left alone (`requeue_interrupted`
-/// already fails their tasks; the rows stay as evidence).
-pub async fn startup_cleanup(_pool: &SqlitePool, backup_root: &Path) {
+/// Remove stale staging entries from `dir`: always `.tmp-*`, plus
+/// `.recovery-*` when `with_recovery` (server data-dir parents only). An
+/// entry counts as stale when its mtime predates this boot (`<= now` at
+/// cleanup time); live data files never match either prefix.
+fn clean_staging_dir(dir: &Path, with_recovery: bool) {
     let now = std::time::SystemTime::now();
-    let entries = match std::fs::read_dir(backup_root) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
-            tracing::warn!(path = %backup_root.display(), error = %e,
-                "backup cleanup: cannot list backup dir");
+            tracing::warn!(path = %dir.display(), error = %e,
+                "backup cleanup: cannot list dir");
             return;
         }
     };
     let mut removed = 0u32;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(".tmp-") {
+        let staging = name.starts_with(".tmp-");
+        let recovery = with_recovery && name.starts_with(".recovery-");
+        if !staging && !recovery {
             continue;
         }
         let stale = entry
@@ -320,7 +324,7 @@ pub async fn startup_cleanup(_pool: &SqlitePool, backup_root: &Path) {
         }
     }
     if removed > 0 {
-        tracing::info!(removed, path = %backup_root.display(),
+        tracing::info!(removed, path = %dir.display(),
             "backup cleanup removed stale staging entries");
     }
 }
@@ -535,6 +539,7 @@ struct BackupOutcome {
 async fn run_backup_capture(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     backup_id: &str,
     server: &ServerRow,
     consistency: &str,
@@ -543,7 +548,8 @@ async fn run_backup_capture(
 ) -> Result<(BackupOutcome, Option<String>), BackupError> {
     let server_root = parent_of(&server.data_path)
         .ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
-    let backup_root = backup_root_for(&server_root);
+    // Single source of truth: the configured dir, threaded from `AppState`.
+    let backup_root = backup_dir.to_path_buf();
     ensure_writable_dir(&backup_root)
         .await
         .map_err(BackupError::Storage)?;
@@ -689,11 +695,12 @@ async fn run_backup_capture(
 // Backup worker
 // ---------------------------------------------------------------------------
 
-/// The server's retention rule for the worker prune: the most recently
-/// updated ENABLED `backup_policies` row, else the table defaults
-/// (`retention_count=7, max_age_days=30`). Same rule family the retention
-/// preview evaluates, so the worker never deletes what a policy retains.
-async fn retention_rule(pool: &SqlitePool, server_id: &str) -> (usize, u64) {
+/// The server's retention rule, shared by the worker prune and the
+/// retention preview (scheduler): the most recently updated ENABLED
+/// `backup_policies` row, else the table defaults
+/// (`retention_count=7, max_age_days=30`). One query, one rule — preview can
+/// never promise deletions the worker would not perform.
+pub(crate) async fn retention_rule(pool: &SqlitePool, server_id: &str) -> (usize, u64) {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT retention_count, max_age_days FROM backup_policies
          WHERE server_id = ? AND enabled != 0
@@ -776,6 +783,7 @@ async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>
 async fn execute_backup(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     task_id: &str,
     backup_id: &str,
     server_id: &str,
@@ -795,6 +803,7 @@ async fn execute_backup(
     let outcome = execute_backup_inner(
         pool,
         adapter,
+        backup_dir,
         task_id,
         backup_id,
         server_id,
@@ -842,10 +851,8 @@ async fn execute_backup(
             let _ = task_runner::mark_succeeded(pool, task_id, "backup completed").await;
         }
         Err(BackupError::Cancelled) => {
-            let part = backup_part_path(pool, backup_id).await;
-            if let Some(p) = part {
-                let _ = tokio::fs::remove_file(&p).await;
-            }
+            let part = backup_part_path(backup_dir, backup_id);
+            let _ = tokio::fs::remove_file(&part).await;
             fail_backup_row(pool, backup_id, "cancelled by user").await;
             let _ = task_runner::mark_cancelled(pool, task_id).await;
             audit::record(
@@ -883,17 +890,15 @@ async fn execute_backup(
     }
 }
 
-async fn backup_part_path(pool: &SqlitePool, backup_id: &str) -> Option<PathBuf> {
-    let backup = fetch_backup(pool, backup_id).await.ok()??;
-    let server = fetch_server(pool, &backup.server_id).await.ok()??;
-    let server_root = parent_of(&server.data_path)?;
-    Some(backup_root_for(&server_root).join(format!("{backup_id}.tar.gz.part")))
+fn backup_part_path(backup_dir: &Path, backup_id: &str) -> PathBuf {
+    backup_dir.join(format!("{backup_id}.tar.gz.part"))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_backup_inner(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     task_id: &str,
     backup_id: &str,
     server_id: &str,
@@ -906,6 +911,7 @@ async fn execute_backup_inner(
     let (outcome, resume) = run_backup_capture(
         pool,
         adapter,
+        backup_dir,
         backup_id,
         &server,
         consistency,
@@ -968,6 +974,7 @@ async fn verify_backup_file(backup: &BackupRow) -> Result<(), BackupError> {
 async fn execute_restore(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     task_id: &str,
     backup_id: &str,
     pre_restore_backup: bool,
@@ -988,8 +995,16 @@ async fn execute_restore(
             return;
         }
     };
-    let result =
-        execute_restore_inner(pool, adapter, task_id, &backup, pre_restore_backup, actor).await;
+    let result = execute_restore_inner(
+        pool,
+        adapter,
+        backup_dir,
+        task_id,
+        &backup,
+        pre_restore_backup,
+        actor,
+    )
+    .await;
 
     match result {
         Ok(msg) => {
@@ -1030,6 +1045,7 @@ async fn execute_restore(
 async fn execute_restore_inner(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     task_id: &str,
     backup: &BackupRow,
     pre_restore_backup: bool,
@@ -1100,7 +1116,11 @@ async fn execute_restore_inner(
             serde_json::json!({ "server_id": server.id, "restore_backup_id": backup.id }),
         )
         .await;
-        match run_backup_capture(pool, adapter, &id, &server, "stopped", task_id, actor).await {
+        match run_backup_capture(
+            pool, adapter, backup_dir, &id, &server, "stopped", task_id, actor,
+        )
+        .await
+        {
             Ok(_) => {
                 audit::record(
                     pool,
@@ -1253,6 +1273,7 @@ async fn execute_restore_inner(
 pub async fn enqueue_backup(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     server_id: &str,
     requested_by: Option<&str>,
     consistency: &str,
@@ -1267,11 +1288,12 @@ pub async fn enqueue_backup(
         return Err(BackupError::ServerBusy);
     }
     // Fail fast on unwritable storage, before any row exists.
-    let server_root = parent_of(&server.data_path)
-        .ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
-    ensure_writable_dir(&backup_root_for(&server_root))
+    ensure_writable_dir(backup_dir)
         .await
         .map_err(BackupError::Storage)?;
+    if parent_of(&server.data_path).is_none() {
+        return Err(BackupError::Failed("server has no data path".into()));
+    }
 
     let task = task_runner::enqueue(pool, TASK_TYPE_BACKUP, Some(server_id), requested_by).await?;
     let backup_id = uuid::Uuid::new_v4().to_string();
@@ -1289,6 +1311,7 @@ pub async fn enqueue_backup(
 
     let pool_owned = pool.clone();
     let adapter_owned = adapter.cloned();
+    let backup_dir_owned = backup_dir.to_path_buf();
     let server_owned = server_id.to_string();
     let task_owned = task.id.clone();
     let backup_owned = backup_id.clone();
@@ -1309,6 +1332,7 @@ pub async fn enqueue_backup(
         execute_backup(
             &pool_owned,
             adapter_owned.as_ref(),
+            &backup_dir_owned,
             &task_owned,
             &backup_owned,
             &server_owned,
@@ -1327,6 +1351,7 @@ pub async fn enqueue_backup(
 pub async fn enqueue_restore(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
+    backup_dir: &Path,
     backup_id: &str,
     requested_by: Option<&str>,
     pre_restore_backup: bool,
@@ -1346,17 +1371,19 @@ pub async fn enqueue_restore(
     // Synchronous guards: corrupt archives and unwritable storage fail here,
     // before any task exists and before live data is touched.
     verify_backup_file(&backup).await?;
-    let server_root = parent_of(&server.data_path)
-        .ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
-    ensure_writable_dir(&backup_root_for(&server_root))
+    ensure_writable_dir(backup_dir)
         .await
         .map_err(BackupError::Storage)?;
+    if parent_of(&server.data_path).is_none() {
+        return Err(BackupError::Failed("server has no data path".into()));
+    }
 
     let task =
         task_runner::enqueue(pool, TASK_TYPE_RESTORE, Some(&server.id), requested_by).await?;
 
     let pool_owned = pool.clone();
     let adapter_owned = adapter.cloned();
+    let backup_dir_owned = backup_dir.to_path_buf();
     let task_owned = task.id.clone();
     let backup_owned = backup_id.to_string();
     let actor_owned = requested_by.map(str::to_string);
@@ -1374,6 +1401,7 @@ pub async fn enqueue_restore(
         execute_restore(
             &pool_owned,
             adapter_owned.as_ref(),
+            &backup_dir_owned,
             &task_owned,
             &backup_owned,
             pre_restore_backup,
@@ -1421,6 +1449,7 @@ pub async fn create_backup(
     let outcome = enqueue_backup(
         &state.pool,
         state.adapter.as_deref(),
+        &state.backup_dir,
         &id,
         Some(&user.id),
         &consistency,
@@ -1706,6 +1735,7 @@ pub async fn restore_backup(
     let outcome = enqueue_restore(
         &state.pool,
         state.adapter.as_deref(),
+        &state.backup_dir,
         &id,
         Some(&user.id),
         body.pre_restore_backup,
@@ -1892,8 +1922,10 @@ mod tests {
         std::fs::create_dir_all(&server_root).unwrap();
         let backup_dir = std::env::temp_dir().join(format!("pm-bak-dir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&backup_dir).unwrap();
-        std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", &backup_dir);
-        let state = AppState::for_tests(pool.clone(), server_root.clone());
+        // Single source of truth: the configured dir travels in state, never
+        // via the `PUMPKIN_MANAGER_BACKUP_DIR` env heuristic (deleted with I1).
+        let mut state = AppState::for_tests(pool.clone(), server_root.clone());
+        state.backup_dir = backup_dir.clone();
         let server = TestServer::new(test_router(state.clone())).unwrap();
         let res = server
             .post("/api/v1/auth/setup")
@@ -1913,7 +1945,6 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
             let _ = std::fs::remove_dir_all(&self.server_root);
             let _ = std::fs::remove_dir_all(&self.backup_dir);
         }
@@ -2288,14 +2319,16 @@ mod tests {
         std::fs::write(dir.join("keep.txt"), b"precious").unwrap();
         let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
 
-        // Break the backup dir deterministically: point it at a regular file
-        // so even the storage probe fails (works as any user, root or not).
+        // Break backup storage deterministically: a router whose configured
+        // `backup_dir` is a regular file, so even the storage probe fails
+        // (works as any user, root or not).
         let blocker = fx.backup_dir.join("blocker");
         std::fs::write(&blocker, b"not a dir").unwrap();
-        std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", &blocker);
+        let mut bad = fx.state.clone();
+        bad.backup_dir = blocker;
+        let bad_server = TestServer::new(test_router(bad)).unwrap();
 
-        let res = fx
-            .server
+        let res = bad_server
             .post(&format!("/api/v1/backups/{backup_id}/restore"))
             .authorization_bearer(&fx.token)
             .json(&json!({}))
@@ -2526,18 +2559,34 @@ mod tests {
         assert_eq!(task["state"], json!("succeeded"), "restore failed: {task}");
     }
 
-    #[test]
-    fn backup_root_defaults_and_overrides() {
-        let _guard = TEST_LOCK.blocking_lock();
+    #[tokio::test]
+    async fn backup_storage_honors_configured_backup_dir() {
+        // I1: `AppState::backup_dir` is the single source of truth. With no
+        // env override present, the archive must land in the configured dir,
+        // not the `<server_root>/../backups` sibling heuristic.
+        let _guard = test_guard().await;
         std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-dir-truth").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+
+        let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
+
+        let storage: (String,) = sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
         assert_eq!(
-            backup_root_for(Path::new("/data/servers")),
-            PathBuf::from("/data/backups")
+            storage.0,
+            fx.backup_dir
+                .join(format!("{backup_id}.tar.gz"))
+                .to_string_lossy()
+                .into_owned(),
+            "archive must live in the configured backup dir"
         );
-        let custom = std::env::temp_dir().join("pm-bak-custom");
-        std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", &custom);
-        assert_eq!(backup_root_for(Path::new("/data/servers")), custom);
-        std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
+        assert!(Path::new(&storage.0).is_file());
     }
 
     #[tokio::test]
@@ -2552,5 +2601,28 @@ mod tests {
         assert!(!dir.join(".tmp-stale-1").exists());
         assert!(dir.join("real-backup.tar.gz").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_cleans_server_staging_and_recovery() {
+        // I4: crashed restores leave `.tmp-restore-*` staging and
+        // `.recovery-*` dirs beside the server data dir. Boot cleanup must
+        // remove them (older than boot) while leaving live data alone.
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-cleanup").await;
+        let dir = data_dir(&fx, &id).await;
+        let parent = dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(parent.join(".tmp-restore-stale")).unwrap();
+        std::fs::write(parent.join(".tmp-restore-stale/chunk"), b"x").unwrap();
+        std::fs::create_dir_all(parent.join(".recovery-12345")).unwrap();
+        std::fs::write(parent.join(".recovery-12345/saved"), b"y").unwrap();
+        std::fs::write(dir.join("live.txt"), b"live").unwrap();
+
+        startup_cleanup(&fx.pool, &fx.backup_dir).await;
+
+        assert!(!parent.join(".tmp-restore-stale").exists());
+        assert!(!parent.join(".recovery-12345").exists());
+        assert_eq!(std::fs::read(dir.join("live.txt")).unwrap(), b"live");
     }
 }

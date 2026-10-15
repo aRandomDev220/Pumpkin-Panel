@@ -544,59 +544,85 @@ async fn load_completed_inputs(pool: &SqlitePool, server_id: &str) -> (Vec<Reten
     (inputs, protected_kept)
 }
 
-/// Union of per-policy deletion sets over the server's completed backups
-/// using the canonical Task 1 decision fn. Pure read path for the preview
-/// handler (post-backup prune/audit is owned by Task 2's worker).
-async fn compute_would_delete(pool: &SqlitePool, server_id: &str) -> (Vec<String>, usize, usize) {
+/// Evaluate one retention rule over the server's completed backups with the
+/// canonical Task 1 decision fn. Pure read path for the preview handler
+/// (post-backup prune/audit is owned by Task 2's worker).
+async fn preview_for(
+    pool: &SqlitePool,
+    server_id: &str,
+    keep: usize,
+    max_age_days: u64,
+) -> (Vec<String>, usize, usize) {
     let (inputs, protected_kept) = load_completed_inputs(pool, server_id).await;
-    let policies = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT retention_count, max_age_days FROM backup_policies
-         WHERE server_id = ? AND enabled != 0 ORDER BY created_at ASC",
-    )
-    .bind(server_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    // No enabled policy → fall back to the column defaults (keep 7 / 30d).
-    let policies: Vec<(i64, i64)> = if policies.is_empty() {
-        vec![(7, 30)]
-    } else {
-        policies
-    };
     let now_unix = Utc::now().timestamp().max(0) as u64;
-    let mut union: Vec<String> = Vec::new();
-    for (keep, age) in policies {
-        let keep = keep.max(0) as usize;
-        let age = age.max(0) as u64;
-        for id in select_for_deletion(&inputs, keep, age, now_unix) {
-            if !union.contains(&id) {
-                union.push(id);
-            }
-        }
-    }
-    let retained = inputs.len().saturating_sub(union.len());
-    (union, retained, protected_kept)
+    let would_delete = select_for_deletion(&inputs, keep, max_age_days, now_unix);
+    let retained = inputs.len().saturating_sub(would_delete.len());
+    (would_delete, retained, protected_kept)
+}
+
+/// Optional draft retention posted by the UI's "Preview retention" button.
+/// The frontend posts its unsaved form values; when `retention_count` and/or
+/// `max_age_days` is present, the draft is evaluated INSTEAD of the stored
+/// policies (still a dry-run: nothing is written). `schedule` is accepted
+/// and ignored — retention, not scheduling, is what preview scores.
+#[derive(Debug, Deserialize, Default)]
+pub struct PreviewDraft {
+    #[serde(default)]
+    pub retention_count: Option<i64>,
+    #[serde(default)]
+    pub max_age_days: Option<i64>,
+    // Accepted and ignored: the frontend posts its full draft form, but
+    // preview scores retention only, never the schedule.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub schedule: Option<String>,
 }
 
 /// `POST /servers/:id/backup-policies/preview`
-/// → `{would_delete, retained, protected_kept}`. Dry-run: writes nothing.
+/// → `{would_delete, retained, protected_kept, evaluated, retention_count,
+/// max_age_days}`. Dry-run: writes nothing. `evaluated` is `"draft"` when a
+/// draft body was scored, `"stored"` when the worker's rule was used.
 pub async fn retention_preview(
     State(state): State<AppState>,
     _user: AuthUser,
     HttpPath(server_id): HttpPath<String>,
+    body: Option<Json<PreviewDraft>>,
 ) -> Response {
     ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
+    // The worker's rule is the default: preview and prune share
+    // `routes_backup::retention_rule`, so preview can never promise deletions
+    // the worker would not perform.
+    let (worker_keep, worker_age) =
+        crate::routes_backup::retention_rule(&state.pool, &server_id).await;
+    let (keep, max_age_days, evaluated) = match body.map(|b| b.0) {
+        Some(draft) if draft.retention_count.is_some() || draft.max_age_days.is_some() => {
+            let keep = draft.retention_count.unwrap_or(worker_keep as i64);
+            let age = draft.max_age_days.unwrap_or(worker_age as i64);
+            if keep < 0 || age < 0 {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "INVALID_RETENTION",
+                    "retention_count and max_age_days must be >= 0",
+                );
+            }
+            (keep as usize, age as u64, "draft")
+        }
+        _ => (worker_keep, worker_age, "stored"),
+    };
     let (would_delete, retained, protected_kept) =
-        compute_would_delete(&state.pool, &server_id).await;
+        preview_for(&state.pool, &server_id, keep, max_age_days).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "would_delete": would_delete,
             "retained": retained,
             "protected_kept": protected_kept,
+            "evaluated": evaluated,
+            "retention_count": keep,
+            "max_age_days": max_age_days,
         })),
     )
         .into_response()
@@ -615,9 +641,8 @@ pub async fn retention_preview(
 /// Concurrency, stop/resume consistency, prune, and worker audit are owned by
 /// Task 2's worker — the tick never runs backups itself.
 pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backup_root: &Path) {
-    // Archive storage paths are owned by Task 2's worker (`backup_root_for`);
-    // the parameter stays for the briefed controller signature.
-    let _ = backup_root;
+    // Archive storage is the configured backup dir, threaded into Task 2's
+    // worker via `enqueue_backup` (single source of truth: `AppState::backup_dir`).
     ensure_tables(pool).await;
     let now = Utc::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -683,6 +708,7 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
         match enqueue_backup(
             pool,
             adapter,
+            backup_root,
             &fresh.server_id,
             requested_by.as_deref(),
             "stopped",
@@ -1056,6 +1082,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn preview_honors_draft_retention() {
+        // I2: the preview POST body may carry draft `{retention_count,
+        // max_age_days}`. When present, the draft is evaluated INSTEAD of the
+        // stored policy (still a dry-run: nothing is written).
+        let (server, pool, _root, _backups) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "prev-draft", 25572).await;
+        for day in ["01", "02", "03", "04"] {
+            seed_completed_backup(&pool, &id, &format!("2026-01-{day}T00:00:00.000Z"), false).await;
+        }
+        // Stored policy keeps 1.
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/backup-policies"))
+            .authorization_bearer(&t)
+            .json(&json!({
+                "name": "keep1", "schedule": "0 2 * * *",
+                "timezone": "UTC", "retention_count": 1,
+                "max_age_days": 0, "enabled": true,
+            }))
+            .await;
+        assert_eq!(res.status_code(), 201, "body: {}", res.text());
+
+        // Stored path (no body): 3 of 4 would go.
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/backup-policies/preview"))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(body["would_delete"].as_array().unwrap().len(), 3);
+        assert_eq!(body["evaluated"], json!("stored"));
+
+        // Draft path (keep 3): only the oldest would go.
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/backup-policies/preview"))
+            .authorization_bearer(&t)
+            .json(&json!({
+                "schedule": "0 2 * * *",
+                "retention_count": 3,
+                "max_age_days": 0,
+            }))
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(body["would_delete"].as_array().unwrap().len(), 1);
+        assert_eq!(body["retained"], json!(3));
+        assert_eq!(body["evaluated"], json!("draft"));
+
+        // Negative drafts are rejected like stored policies.
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/backup-policies/preview"))
+            .authorization_bearer(&t)
+            .json(&json!({ "retention_count": -1 }))
+            .await;
+        assert_eq!(res.status_code(), 422, "body: {}", res.text());
+
+        // Dry-run: all 4 rows still present.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups WHERE server_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 4);
+    }
+
+    async fn insert_policy_at(
+        pool: &SqlitePool,
+        server_id: &str,
+        keep: i64,
+        max_age: i64,
+        updated_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO backup_policies
+                (id, server_id, name, schedule, timezone, retention_count,
+                 max_age_days, enabled, created_at, updated_at)
+              VALUES (?, ?, 'p', '0 2 * * *', 'UTC', ?, ?, 1, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(server_id)
+        .bind(keep)
+        .bind(max_age)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_uses_worker_retention_rule() {
+        // I3: preview must evaluate exactly the worker's rule (most recently
+        // updated ENABLED policy), not the union over all policies. keep=1
+        // (older) + keep=4 (newer) over 5 completed backups: the worker keeps
+        // 4 and deletes only the oldest; the old union preview listed 4.
+        let (server, pool, _root, _backups) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "prev-rule", 25573).await;
+        let mut seeds = Vec::new();
+        for day in ["01", "02", "03", "04", "05"] {
+            seeds.push(
+                seed_completed_backup(&pool, &id, &format!("2026-01-{day}T00:00:00.000Z"), false)
+                    .await,
+            );
+        }
+        insert_policy_at(&pool, &id, 1, 0, "2026-01-01T00:00:00.000Z").await;
+        insert_policy_at(&pool, &id, 4, 0, "2026-06-01T00:00:00.000Z").await;
+
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/backup-policies/preview"))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(
+            body["would_delete"],
+            json!([seeds[0]]),
+            "preview must match the worker rule (keep=4), not the union"
+        );
+        assert_eq!(body["retained"], json!(4));
     }
 
     async fn poll_backup_task(pool: &SqlitePool, server_id: &str) -> (String, Option<String>) {

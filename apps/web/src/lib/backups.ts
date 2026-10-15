@@ -81,6 +81,27 @@ export interface BackupPreviewResponse {
   protected_kept: number;
 }
 
+// The backend wraps single-policy payloads as `{policy: {...}}` on create
+// and update. Unwrap the envelope client-side (no contract change); a bare
+// policy still passes through so older responses keep working.
+export interface BackupPolicyEnvelope {
+  policy: BackupPolicy;
+}
+
+export function unwrapPolicyEnvelope(
+  raw: BackupPolicy | BackupPolicyEnvelope,
+  label: string,
+): BackupPolicy {
+  if (raw && typeof raw === "object" && "policy" in raw) {
+    const policy = (raw as BackupPolicyEnvelope).policy;
+    if (policy && typeof policy === "object" && typeof policy.id === "string") {
+      return policy;
+    }
+    throw new BackupApiError(`${label} failed: malformed policy envelope`, 0);
+  }
+  return raw as BackupPolicy;
+}
+
 export class BackupApiError extends Error {
   readonly status: number;
   constructor(message: string, status: number) {
@@ -243,7 +264,10 @@ export async function createPolicy(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
-  return parseJson<BackupPolicy>(res, "create backup policy");
+  return unwrapPolicyEnvelope(
+    await parseJson<BackupPolicy | BackupPolicyEnvelope>(res, "create backup policy"),
+    "create backup policy",
+  );
 }
 
 export async function updatePolicy(
@@ -258,7 +282,10 @@ export async function updatePolicy(
       body: JSON.stringify(patch),
     },
   );
-  return parseJson<BackupPolicy>(res, "update backup policy");
+  return unwrapPolicyEnvelope(
+    await parseJson<BackupPolicy | BackupPolicyEnvelope>(res, "update backup policy"),
+    "update backup policy",
+  );
 }
 
 export async function deletePolicy(id: string): Promise<void> {

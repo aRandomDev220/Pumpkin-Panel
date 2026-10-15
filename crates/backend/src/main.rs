@@ -52,6 +52,10 @@ pub struct AppState {
     pub adapter: Option<Arc<DockerAdapter>>,
     pub runner: Option<RunnerHandle>,
     pub server_root: PathBuf,
+    /// Single source of truth for backup archive storage (from
+    /// `settings.backup_dir`, which itself honors `PUMPKIN_MANAGER_BACKUP_DIR`).
+    /// All backup routes/workers must use this, never a derived heuristic.
+    pub backup_dir: PathBuf,
     pub op_locks: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -61,7 +65,8 @@ impl AppState {
             pool,
             adapter: None,
             runner: None,
-            server_root,
+            server_root: server_root.clone(),
+            backup_dir: server_root.join("backups"),
             op_locks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -445,9 +450,10 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     let server_root = settings.data_dir.clone();
-    // Backup storage shares the derivation routes use (`backup_root_for`),
-    // so boot cleanup and the scheduler tick see the same directory.
-    let backup_root = routes_backup::backup_root_for(&server_root);
+    // Backup storage has one source of truth: `settings.backup_dir` (env
+    // `PUMPKIN_MANAGER_BACKUP_DIR` feeds `Settings`, never the routes).
+    // Boot cleanup, the scheduler tick, and `AppState` all share it.
+    let backup_root = settings.backup_dir.clone();
     if let Err(e) = std::fs::create_dir_all(&backup_root) {
         tracing::warn!(path = %backup_root.display(), error = %e, "cannot create backup dir");
     }
@@ -457,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let pool = pool.clone();
         let adapter = adapter.clone();
+        let backup_root = backup_root.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -470,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         adapter,
         runner,
         server_root,
+        backup_dir: backup_root,
         op_locks: Arc::new(Mutex::new(HashSet::new())),
     };
     let docker_ok = state.adapter.is_some();
