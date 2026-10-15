@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use sqlx::SqlitePool;
@@ -172,7 +172,99 @@ pub fn build_router(state: AppState) -> Router {
                 auth::require_permission(Permission::SettingsManage),
             )),
         )
-        .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware));
+        .route(
+            "/api/v1/servers/:id/config",
+            get(routes_config::get_config).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/config",
+            put(routes_config::put_config).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/config/validate",
+            post(routes_config::validate_config).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/config/revisions",
+            get(routes_config::list_revisions).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/config/revert",
+            post(routes_config::revert_config).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files",
+            get(routes_files::list_files).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files/download",
+            get(routes_files::download_file).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files/directory",
+            post(routes_files::create_directory).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files/rename",
+            post(routes_files::rename_entry).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files",
+            delete(routes_files::delete_entry).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files/export",
+            get(routes_files::export_archive).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesRead),
+            )),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            pool.clone(),
+            auth::auth_middleware,
+        ))
+        // Default 5 MiB cap for all non-upload routes (upload router below
+        // carries its own 1 GiB limit; public auth routes keep axum's
+        // 2 MiB default, ample for login JSON).
+        .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024));
+
+    // Uploads bypass the 5 MiB default body cap with their own 1 GiB limit
+    // (enforced again as a running total inside the handler). Auth layer is
+    // identical; the routers merge below.
+    let protected_uploads = Router::new()
+        .route(
+            "/api/v1/servers/:id/files/upload",
+            post(routes_files::upload_files).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesWrite),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/files/import",
+            post(routes_files::import_archive).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerFilesWrite),
+            )),
+        )
+        .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024));
 
     // Readiness reflects boot-time checks; Docker loss at runtime degrades
     // per-endpoint (503), never the process liveness probe.
@@ -190,7 +282,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/setup", post(routes_auth::setup))
         .route("/api/v1/auth/login", post(routes_auth::login))
         .merge(protected)
-        .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024))
+        .merge(protected_uploads)
         .layer(TraceLayer::new_for_http())
         .fallback(static_handler)
         .with_state(state)

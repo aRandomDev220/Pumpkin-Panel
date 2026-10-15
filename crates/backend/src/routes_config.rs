@@ -17,7 +17,6 @@
 //!
 //! Dead-code lints are silenced until the controller wires these handlers
 //! into `main.rs` (same transient state as the other Phase 4 task modules).
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -634,7 +633,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::*;
-    use crate::{auth, build_router, AppState};
+    use crate::{build_router, AppState};
 
     async fn test_pool() -> SqlitePool {
         // Single connection: in-memory SQLite is per-connection.
@@ -676,48 +675,10 @@ mod tests {
         }
     }
 
-    /// Test app: full production router (auth endpoints) + the config
-    /// routes wired exactly as the controller will wire them (permission
-    /// gates outside, auth middleware outermost).
+    /// Test app: the full production router (config routes are wired in
+    /// `build_router` by the controller with the same permission gates).
     fn test_app(state: AppState) -> axum::Router {
-        use axum::{middleware, routing::post};
-
-        use crate::auth::Permission;
-        let pool = state.pool.clone();
-        let config = axum::Router::new()
-            .route(
-                "/api/v1/servers/:id/config",
-                axum::routing::get(get_config).route_layer(middleware::from_fn(
-                    auth::require_permission(Permission::ServerConfigRead),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/config",
-                axum::routing::put(put_config).route_layer(middleware::from_fn(
-                    auth::require_permission(Permission::ServerConfigWrite),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/config/validate",
-                post(validate_config).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerConfigRead,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/config/revisions",
-                axum::routing::get(list_revisions).route_layer(middleware::from_fn(
-                    auth::require_permission(Permission::ServerConfigRead),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/config/revert",
-                post(revert_config).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerConfigWrite,
-                ))),
-            )
-            .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware))
-            .with_state(state.clone());
-        build_router(state).merge(config)
+        build_router(state)
     }
 
     async fn test_server() -> (TestServer, SqlitePool) {

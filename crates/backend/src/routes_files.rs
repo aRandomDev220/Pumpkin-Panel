@@ -19,7 +19,6 @@
 // The controller wires these handlers into `main.rs` after all Phase 4 tasks
 // land; until then they are reachable only from tests, which reads as
 // dead code to the binary build.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -204,6 +203,8 @@ impl Drop for TempGuard {
     }
 }
 
+// `Response` is axum's standard error vehicle; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 fn account(total: &mut u64, n: u64, limit: u64) -> Result<(), Response> {
     *total = total.checked_add(n).unwrap_or(u64::MAX);
     if *total > limit {
@@ -752,66 +753,10 @@ mod tests {
         pool
     }
 
-    /// Test-only wiring mirroring the controller's future routes + the
-    /// `ServerFilesRead`/`ServerFilesWrite` permission layers from the plan.
+    /// Test app: the full production router (file routes are wired in
+    /// `build_router` by the controller with the same permission gates).
     fn files_routes(state: AppState) -> axum::Router {
-        use crate::auth::{self, Permission};
-        use axum::{
-            middleware,
-            routing::{delete, get, post},
-        };
-        let pool = state.pool.clone();
-        axum::Router::new()
-            .route(
-                "/api/v1/servers/:id/files",
-                get(list_files).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesRead,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files",
-                delete(delete_entry).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesWrite,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/download",
-                get(download_file).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesRead,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/upload",
-                post(upload_files).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesWrite,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/directory",
-                post(create_directory).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesWrite,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/rename",
-                post(rename_entry).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesWrite,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/import",
-                post(import_archive).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesWrite,
-                ))),
-            )
-            .route(
-                "/api/v1/servers/:id/files/export",
-                get(export_archive).route_layer(middleware::from_fn(auth::require_permission(
-                    Permission::ServerFilesRead,
-                ))),
-            )
-            .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware))
-            .with_state(state)
+        crate::build_router(state)
     }
 
     async fn test_server() -> (TestServer, SqlitePool) {
@@ -819,7 +764,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pm-files-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::for_tests(pool.clone(), root);
-        let app = crate::build_router(state.clone()).merge(files_routes(state));
+        let app = files_routes(state);
         (TestServer::new(app).unwrap(), pool)
     }
 
@@ -987,6 +932,7 @@ mod tests {
         // cannot be uploaded in a test, so a tiny cap exercises the identical
         // code path: past the cap the body fails with `413 TOO_LARGE` and no
         // tempfile may be left behind.
+        #[allow(clippy::result_large_err)] // test helper mirroring production shape
         async fn run_stage(
             body: Vec<u8>,
             limit: u64,

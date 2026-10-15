@@ -245,6 +245,10 @@ fn tmp_name() -> String {
 /// directory, are fsynced, then renamed over the target. The existing file is
 /// untouched unless the rename succeeds. Symlinks are never followed: a final
 /// symlink component is refused.
+///
+/// Currently the upload path stages via its own helper; this remains the
+/// canonical small-write primitive for future config/file endpoints.
+#[allow(dead_code)]
 pub async fn write_file_atomic(
     root: &Path,
     path: &str,
@@ -879,7 +883,7 @@ mod tests {
         let mut b = tar::Builder::new(enc);
         for name in ["a.txt", "b.txt"] {
             let payload = b"data";
-            let mut h = reg_header(name, payload.len() as u64);
+            let h = reg_header(name, payload.len() as u64);
             b.append(&h, &payload[..]).unwrap();
         }
         let data = b.into_inner().unwrap().finish().unwrap();
@@ -974,7 +978,7 @@ mod tests {
         let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut b = tar::Builder::new(enc);
         let payload = b"pwned";
-        let mut h = reg_header("sub/evil", payload.len() as u64);
+        let h = reg_header("sub/evil", payload.len() as u64);
         b.append(&h, &payload[..]).unwrap();
         let data = b.into_inner().unwrap().finish().unwrap();
         assert_eq!(

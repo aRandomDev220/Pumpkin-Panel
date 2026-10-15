@@ -139,6 +139,12 @@ pub fn parse_and_validate(content: &str) -> Result<DocumentMut, Vec<String>> {
 /// Nested fields (`motd`, `max_players`, `view_distance`,
 /// `simulation_distance`, `online_mode`) are written to both
 /// `[networking.java]` and `[networking.bedrock]` to keep editions in sync.
+///
+/// Reserved for a future server-side guided endpoint: `PUT /config` accepts
+/// pre-merged content today (the UI merges via the same field semantics and
+/// the server re-validates), so this stays wired-but-unused.
+/// Dual-write is disclosed in the UI per the Phase 4 plan ruling.
+#[allow(dead_code)]
 pub fn apply_guided(doc: &mut DocumentMut, guided: &GuidedConfig) {
     if let Some(v) = guided.seed.as_deref() {
         set_top(doc, "seed", v.into());
