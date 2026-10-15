@@ -13,8 +13,9 @@
 //! container directly and record whether it was running. A failed pre-restore
 //! safety backup aborts the restore before anything is staged or swapped.
 //!
-//! Retention pruning is inline (newest 7 completed unprotected per server);
-//! there is no separate Task 1 pickup loop — both routes and the scheduler go
+//! Retention pruning applies the server's retention rule (most recently
+//! updated enabled `backup_policies` row, else keep 7 / 30 days) through
+//! Task 1's canonical decision fn — both routes and the scheduler go
 //! through [`enqueue_backup`] / [`enqueue_restore`], which `tokio::spawn`
 //! execution under a process-wide single-permit semaphore.
 
@@ -49,8 +50,10 @@ use crate::{
 const TASK_TYPE_BACKUP: &str = "backup";
 const TASK_TYPE_RESTORE: &str = "restore";
 
-/// Completed unprotected backups retained per server by the worker prune.
-const RETAIN_COMPLETED: usize = 7;
+/// Worker prune fallback when the server has no enabled retention policy
+/// (mirrors the `backup_policies` column defaults in `0004_backups.sql`).
+const DEFAULT_RETENTION_COUNT: usize = 7;
+const DEFAULT_MAX_AGE_DAYS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -686,13 +689,32 @@ async fn run_backup_capture(
 // Backup worker
 // ---------------------------------------------------------------------------
 
+/// The server's retention rule for the worker prune: the most recently
+/// updated ENABLED `backup_policies` row, else the table defaults
+/// (`retention_count=7, max_age_days=30`). Same rule family the retention
+/// preview evaluates, so the worker never deletes what a policy retains.
+async fn retention_rule(pool: &SqlitePool, server_id: &str) -> (usize, u64) {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT retention_count, max_age_days FROM backup_policies
+         WHERE server_id = ? AND enabled != 0
+         ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    match row {
+        Some((keep, age)) => (keep.max(0) as usize, age.max(0) as u64),
+        None => (DEFAULT_RETENTION_COUNT, DEFAULT_MAX_AGE_DAYS),
+    }
+}
 /// Retention prune via Task 1's canonical
 /// [`backup_service::select_for_deletion`]: backup rows newest-first mapped
-/// to [`backup_service::RetentionInput`] (`completed` ⇒ verified), newest
-/// [`RETAIN_COMPLETED`] kept, no age expiry. Protected rows consume keep
-/// slots and in-progress rows are never listed, per the canonical
-/// semantics. The executor (file + row deletion, per-row audit) stays here.
-/// Best-effort — never fails the task.
+/// to [`backup_service::RetentionInput`], with the server's retention rule
+/// (see [`retention_rule`]). Protected rows consume keep slots and
+/// in-progress rows are never listed, per the canonical semantics. The
+/// executor (file + row deletion, per-row audit) stays here. Best-effort —
+/// never fails the task.
 async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>) {
     let rows = sqlx::query_as::<_, RetentionRow>(
         "SELECT id, state, completed_at, protected, storage_path FROM backups
@@ -712,11 +734,12 @@ async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>
             in_progress: r.state == "in_progress",
         })
         .collect();
+    let (keep, max_age_days) = retention_rule(pool, server_id).await;
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let delete = backup_service::select_for_deletion(&inputs, RETAIN_COMPLETED, 0, now_unix);
+    let delete = backup_service::select_for_deletion(&inputs, keep, max_age_days, now_unix);
     if delete.is_empty() {
         return;
     }
@@ -738,7 +761,12 @@ async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>
             id,
             "ok",
             &audit::request_id(),
-            serde_json::json!({ "server_id": server_id, "reason": "retention" }),
+            serde_json::json!({
+                "server_id": server_id,
+                "reason": "retention",
+                "retention_count": keep,
+                "max_age_days": max_age_days,
+            }),
         )
         .await;
     }
@@ -2344,6 +2372,9 @@ mod tests {
             .await;
         }
         seed_completed(&fx, &id, "p1", "2026-01-01T00:00:07Z", true).await;
+        // keep=7 with no age expiry: only the keep-slot rule applies, so the
+        // protected seed consuming a slot is what dooms the oldest seed.
+        insert_policy(&fx, &id, 7, 0).await;
 
         let (_, fresh) = backup_and_wait(&fx, &id, "live").await;
 
@@ -2356,6 +2387,69 @@ mod tests {
         // The executor removed the pruned file and kept the protected one.
         assert!(!fx.backup_dir.join("c1.tar.gz").exists());
         assert!(fx.backup_dir.join("p1.tar.gz").exists());
+    }
+
+    async fn insert_policy(fx: &Fixture, server_id: &str, keep: i64, max_age: i64) {
+        sqlx::query(
+            "INSERT INTO backup_policies
+                (id, server_id, name, schedule, timezone,
+                 retention_count, max_age_days, enabled)
+             VALUES (?, ?, 'test', '0 2 * * *', 'UTC', ?, ?, 1)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(server_id)
+        .bind(keep)
+        .bind(max_age)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_prune_honors_server_retention_policy() {
+        // FIX round 2: the post-backup prune uses the server's retention
+        // rule (most recently updated enabled policy, else 7/30). keep=1
+        // with two pre-existing completed backups + one protected row:
+        // after one successful backup exactly 1 unprotected completed
+        // backup remains and the protected row is never pruned.
+        let _guard = test_guard();
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-policy").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+        insert_policy(&fx, &id, 1, 0).await;
+        seed_completed(&fx, &id, "k1", "2026-09-01T00:00:01Z", false).await;
+        seed_completed(&fx, &id, "k2", "2026-09-01T00:00:02Z", false).await;
+        seed_completed(&fx, &id, "kp", "2026-09-01T00:00:03Z", true).await;
+
+        let (_, fresh) = backup_and_wait(&fx, &id, "live").await;
+
+        let remaining = backup_ids(&fx, &id).await;
+        assert_eq!(remaining.len(), 2, "wrong survivors: {remaining:?}");
+        assert!(remaining.contains(&fresh));
+        assert!(remaining.iter().any(|b| b == "kp"));
+        assert!(!fx.backup_dir.join("k1.tar.gz").exists());
+        assert!(!fx.backup_dir.join("k2.tar.gz").exists());
+        assert!(fx.backup_dir.join("kp.tar.gz").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_prune_defaults_without_policy() {
+        // No enabled policy → table defaults (keep 7, 30 days): a backup
+        // older than 30 days is pruned by age even though the keep count
+        // is not exceeded.
+        let _guard = test_guard();
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-policy-default").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+        seed_completed(&fx, &id, "old", "2026-01-01T00:00:01Z", false).await;
+
+        let (_, fresh) = backup_and_wait(&fx, &id, "live").await;
+
+        let remaining = backup_ids(&fx, &id).await;
+        assert_eq!(remaining, vec![fresh], "wrong survivors: {remaining:?}");
+        assert!(!fx.backup_dir.join("old.tar.gz").exists());
     }
 
     #[tokio::test]
