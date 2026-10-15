@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -35,10 +35,9 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::{
     audit,
     auth::AuthUser,
-    file_service,
+    backup_service, file_service,
     runtime::{DockerAdapter, RuntimeAdapter, RuntimeError},
-    task_runner,
-    AppState,
+    task_runner, AppState,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,9 +187,13 @@ struct BackupRow {
     protected: i64,
 }
 
+/// One backup row projected onto Task 1's retention-decision input.
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct PruneRow {
+struct RetentionRow {
     id: String,
+    state: String,
+    completed_at: Option<String>,
+    protected: i64,
     storage_path: String,
 }
 
@@ -429,14 +432,10 @@ fn semaphore() -> &'static Semaphore {
     BACKUP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
 
-static BACKUP_OP_LOCKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn op_locks() -> &'static Mutex<HashSet<String>> {
-    BACKUP_OP_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-async fn claim(server_id: &str) -> bool {
-    let mut guard = op_locks().lock().await;
+/// Try to claim the per-server op lock on the shared [`AppState::op_locks`].
+/// `false` = conflicting op in flight (same pattern as `routes_servers`).
+async fn try_lock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) -> bool {
+    let mut guard = locks.lock().await;
     if guard.contains(server_id) {
         return false;
     }
@@ -444,8 +443,8 @@ async fn claim(server_id: &str) -> bool {
     true
 }
 
-async fn release(server_id: &str) {
-    op_locks().lock().await.remove(server_id);
+async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
+    locks.lock().await.remove(server_id);
 }
 
 async fn cancel_requested(pool: &SqlitePool, task_id: &str) -> bool {
@@ -467,13 +466,7 @@ async fn fail_backup_row(pool: &SqlitePool, backup_id: &str, summary: &str) {
         .await;
 }
 
-async fn fail_backup(
-    pool: &SqlitePool,
-    task_id: &str,
-    backup_id: &str,
-    code: &str,
-    summary: &str,
-) {
+async fn fail_backup(pool: &SqlitePool, task_id: &str, backup_id: &str, code: &str, summary: &str) {
     fail_backup_row(pool, backup_id, summary).await;
     let _ = task_runner::mark_failed(pool, task_id, code, &truncate500(summary)).await;
     audit::record(
@@ -545,8 +538,8 @@ async fn run_backup_capture(
     cancel_task_id: &str,
     actor: Option<&str>,
 ) -> Result<(BackupOutcome, Option<String>), BackupError> {
-    let server_root =
-        parent_of(&server.data_path).ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
+    let server_root = parent_of(&server.data_path)
+        .ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
     let backup_root = backup_root_for(&server_root);
     ensure_writable_dir(&backup_root)
         .await
@@ -593,20 +586,17 @@ async fn run_backup_capture(
         match a.inspect(&server.container_id).await {
             Ok(snap) => {
                 if snap.status == "running" {
-                    a.stop(
-                        &server.container_id,
-                        task_runner::TASK_STOP_TIMEOUT_SECS,
-                    )
-                    .await
-                    .map_err(|e| {
-                        if is_daemon_down(&e) {
-                            BackupError::RuntimeUnavailable
-                        } else {
-                            BackupError::Failed(format!(
-                                "failed to stop container for consistent backup: {e}"
-                            ))
-                        }
-                    })?;
+                    a.stop(&server.container_id, task_runner::TASK_STOP_TIMEOUT_SECS)
+                        .await
+                        .map_err(|e| {
+                            if is_daemon_down(&e) {
+                                BackupError::RuntimeUnavailable
+                            } else {
+                                BackupError::Failed(format!(
+                                    "failed to stop container for consistent backup: {e}"
+                                ))
+                            }
+                        })?;
                     resume = Some(server.container_id.clone());
                 }
             }
@@ -696,28 +686,48 @@ async fn run_backup_capture(
 // Backup worker
 // ---------------------------------------------------------------------------
 
-/// Retention prune: keep the newest [`RETAIN_COMPLETED`] completed
-/// unprotected backups per server; delete files + rows for the rest.
+/// Retention prune via Task 1's canonical
+/// [`backup_service::select_for_deletion`]: backup rows newest-first mapped
+/// to [`backup_service::RetentionInput`] (`completed` ⇒ verified), newest
+/// [`RETAIN_COMPLETED`] kept, no age expiry. Protected rows consume keep
+/// slots and in-progress rows are never listed, per the canonical
+/// semantics. The executor (file + row deletion, per-row audit) stays here.
 /// Best-effort — never fails the task.
 async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>) {
-    let rows = sqlx::query_as::<_, PruneRow>(
-        "SELECT id, storage_path FROM backups
-         WHERE server_id = ? AND state = 'completed' AND protected = 0
-         ORDER BY created_at DESC",
+    let rows = sqlx::query_as::<_, RetentionRow>(
+        "SELECT id, state, completed_at, protected, storage_path FROM backups
+         WHERE server_id = ? ORDER BY created_at DESC",
     )
     .bind(server_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    if rows.len() <= RETAIN_COMPLETED {
+    let inputs: Vec<backup_service::RetentionInput> = rows
+        .iter()
+        .map(|r| backup_service::RetentionInput {
+            id: r.id.clone(),
+            completed_at: r.completed_at.clone(),
+            verified: r.state == "completed",
+            protected: r.protected != 0,
+            in_progress: r.state == "in_progress",
+        })
+        .collect();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delete = backup_service::select_for_deletion(&inputs, RETAIN_COMPLETED, 0, now_unix);
+    if delete.is_empty() {
         return;
     }
-    for old in rows.iter().skip(RETAIN_COMPLETED) {
-        if !old.storage_path.is_empty() {
-            let _ = tokio::fs::remove_file(&old.storage_path).await;
+    for id in &delete {
+        if let Some(row) = rows.iter().find(|r| &r.id == id) {
+            if !row.storage_path.is_empty() {
+                let _ = tokio::fs::remove_file(&row.storage_path).await;
+            }
         }
         let _ = sqlx::query("DELETE FROM backups WHERE id = ?")
-            .bind(&old.id)
+            .bind(id)
             .execute(pool)
             .await;
         audit::record(
@@ -725,7 +735,7 @@ async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>
             actor,
             "backup.prune",
             "backup",
-            &old.id,
+            id,
             "ok",
             &audit::request_id(),
             serde_json::json!({ "server_id": server_id, "reason": "retention" }),
@@ -750,17 +760,10 @@ async fn execute_backup(
     {
         return;
     }
-    if !claim(server_id).await {
-        fail_backup(
-            pool,
-            task_id,
-            backup_id,
-            "SERVER_BUSY",
-            "another operation is in flight for this server",
-        )
-        .await;
-        return;
-    }
+    // Cross-operation safety comes from the shared `AppState::op_locks`
+    // (held by lifecycle handlers for their synchronous section) plus the
+    // `conflicting_task` check in `enqueue_backup`; the worker itself holds
+    // no lock, mirroring the lifecycle runner.
     let outcome = execute_backup_inner(
         pool,
         adapter,
@@ -771,7 +774,6 @@ async fn execute_backup(
         actor,
     )
     .await;
-    release(server_id).await;
 
     match outcome {
         Ok(_) => {
@@ -817,7 +819,8 @@ async fn execute_backup(
         Err(BackupError::ResumeFailed(msg)) => {
             // The backup row is `completed` and verified; only the task
             // reports the restart failure, with both facts recorded.
-            let _ = task_runner::mark_failed(pool, task_id, "RESTART_FAILED", &truncate500(&msg)).await;
+            let _ =
+                task_runner::mark_failed(pool, task_id, "RESTART_FAILED", &truncate500(&msg)).await;
             audit::record(
                 pool,
                 actor,
@@ -856,9 +859,16 @@ async fn execute_backup_inner(
     let server = fetch_server(pool, server_id)
         .await?
         .ok_or(BackupError::ServerNotFound)?;
-    let (outcome, resume) =
-        run_backup_capture(pool, adapter, backup_id, &server, consistency, task_id, actor)
-            .await?;
+    let (outcome, resume) = run_backup_capture(
+        pool,
+        adapter,
+        backup_id,
+        &server,
+        consistency,
+        task_id,
+        actor,
+    )
+    .await?;
     // Resume the container we stopped. `desired_state` stays untouched; a
     // restart failure fails the task but keeps the verified backup row.
     if let Some(cid) = resume {
@@ -896,8 +906,7 @@ async fn execute_backup_inner(
 /// Re-verify a completed backup row against the file on disk. Anything off —
 /// missing row state, missing file, checksum mismatch — is `BACKUP_CORRUPT`.
 async fn verify_backup_file(backup: &BackupRow) -> Result<(), BackupError> {
-    if backup.state != "completed" || backup.storage_path.is_empty() || backup.checksum.is_empty()
-    {
+    if backup.state != "completed" || backup.storage_path.is_empty() || backup.checksum.is_empty() {
         return Err(BackupError::Corrupt);
     }
     let path = PathBuf::from(&backup.storage_path);
@@ -935,19 +944,8 @@ async fn execute_restore(
             return;
         }
     };
-    if !claim(&backup.server_id).await {
-        let _ = task_runner::mark_failed(
-            pool,
-            task_id,
-            "SERVER_BUSY",
-            "another operation is in flight for this server",
-        )
-        .await;
-        return;
-    }
     let result =
         execute_restore_inner(pool, adapter, task_id, &backup, pre_restore_backup, actor).await;
-    release(&backup.server_id).await;
 
     match result {
         Ok(msg) => {
@@ -968,9 +966,8 @@ async fn execute_restore(
             .await;
         }
         Err(e) => {
-            let _ =
-                task_runner::mark_failed(pool, task_id, e.code(), &truncate500(&e.to_string()))
-                    .await;
+            let _ = task_runner::mark_failed(pool, task_id, e.code(), &truncate500(&e.to_string()))
+                .await;
             audit::record(
                 pool,
                 actor,
@@ -1160,9 +1157,7 @@ async fn execute_restore_inner(
     if had_data {
         std::fs::rename(&data_dir, &recovery).map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
-            BackupError::Failed(format!(
-                "restore swap failed, current data untouched: {e}"
-            ))
+            BackupError::Failed(format!("restore swap failed, current data untouched: {e}"))
         })?;
     }
     if let Err(e) = std::fs::rename(&staging, &data_dir) {
@@ -1199,7 +1194,9 @@ async fn execute_restore_inner(
     Ok(format!(
         "restore completed ({} files{} )",
         staged_count,
-        pre_id.map(|id| format!(", pre-restore backup {id}")).unwrap_or_default()
+        pre_id
+            .map(|id| format!(", pre-restore backup {id}"))
+            .unwrap_or_default()
     ))
 }
 
@@ -1305,8 +1302,8 @@ pub async fn enqueue_restore(
     // Synchronous guards: corrupt archives and unwritable storage fail here,
     // before any task exists and before live data is touched.
     verify_backup_file(&backup).await?;
-    let server_root =
-        parent_of(&server.data_path).ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
+    let server_root = parent_of(&server.data_path)
+        .ok_or_else(|| BackupError::Failed("server has no data path".into()))?;
     ensure_writable_dir(&backup_root_for(&server_root))
         .await
         .map_err(BackupError::Storage)?;
@@ -1372,15 +1369,25 @@ pub async fn create_backup(
         );
     }
     let consistency = body.consistency.unwrap_or_else(|| "stopped".to_string());
-    match enqueue_backup(
+    // Shared op lock (same domain as lifecycle ops): fail fast when another
+    // operation holds the server, mirroring `routes_servers`.
+    if !try_lock(&state.op_locks, &id).await {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "another operation is in flight for this server",
+        );
+    }
+    let outcome = enqueue_backup(
         &state.pool,
         state.adapter.as_deref(),
         &id,
         Some(&user.id),
         &consistency,
     )
-    .await
-    {
+    .await;
+    unlock(&state.op_locks, &id).await;
+    match outcome {
         Ok((task_id, backup_id)) => {
             audit::record(
                 &state.pool,
@@ -1653,15 +1660,23 @@ pub async fn restore_backup(
             "stop the server before restoring a backup",
         );
     }
-    match enqueue_restore(
+    if !try_lock(&state.op_locks, &server.id).await {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "another operation is in flight for this server",
+        );
+    }
+    let outcome = enqueue_restore(
         &state.pool,
         state.adapter.as_deref(),
         &id,
         Some(&user.id),
         body.pre_restore_backup,
     )
-    .await
-    {
+    .await;
+    unlock(&state.op_locks, &server.id).await;
+    match outcome {
         Ok(task_id) => {
             audit::record(
                 &state.pool,
@@ -1755,11 +1770,11 @@ mod tests {
     /// Mirror of the production wiring the controller will add to
     /// `build_router`: identical paths + permission gates.
     fn test_router(state: AppState) -> axum::Router {
+        use crate::auth::Permission;
         use axum::{
             middleware,
             routing::{delete, get, post},
         };
-        use crate::auth::Permission;
 
         let pool = state.pool.clone();
         let public = axum::Router::new()
@@ -1772,9 +1787,9 @@ mod tests {
         let protected = axum::Router::new()
             .route(
                 "/api/v1/servers",
-                post(crate::routes_servers::create_server).route_layer(
-                    middleware::from_fn(crate::auth::require_permission(Permission::ServerCreate)),
-                ),
+                post(crate::routes_servers::create_server).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::ServerCreate),
+                )),
             )
             .route(
                 "/api/v1/tasks/:id",
@@ -1796,9 +1811,9 @@ mod tests {
             )
             .route(
                 "/api/v1/backups/:id",
-                get(get_backup).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerRead),
-                )),
+                get(get_backup).route_layer(middleware::from_fn(crate::auth::require_permission(
+                    Permission::ServerRead,
+                ))),
             )
             .route(
                 "/api/v1/backups/:id/download",
@@ -1831,17 +1846,19 @@ mod tests {
         token: String,
         server_root: PathBuf,
         backup_dir: PathBuf,
+        state: AppState,
     }
 
     async fn fixture() -> Fixture {
         let pool = test_pool().await;
-        let server_root = std::env::temp_dir().join(format!("pm-bak-root-{}", uuid::Uuid::new_v4()));
+        let server_root =
+            std::env::temp_dir().join(format!("pm-bak-root-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&server_root).unwrap();
         let backup_dir = std::env::temp_dir().join(format!("pm-bak-dir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", &backup_dir);
         let state = AppState::for_tests(pool.clone(), server_root.clone());
-        let server = TestServer::new(test_router(state)).unwrap();
+        let server = TestServer::new(test_router(state.clone())).unwrap();
         let res = server
             .post("/api/v1/auth/setup")
             .json(&json!({"username": "owner", "password": "supersecret1"}))
@@ -1854,6 +1871,7 @@ mod tests {
             token,
             server_root,
             backup_dir,
+            state,
         }
     }
 
@@ -2079,7 +2097,10 @@ mod tests {
         let task = poll_terminal(&fx, &task_id).await;
         assert_eq!(task["state"], json!("succeeded"), "restore failed: {task}");
 
-        assert_eq!(std::fs::read(dir.join("data.txt")).unwrap(), b"original-bytes");
+        assert_eq!(
+            std::fs::read(dir.join("data.txt")).unwrap(),
+            b"original-bytes"
+        );
         assert!(!dir.join("extra.txt").exists());
 
         // A protected pre-restore backup row exists.
@@ -2106,12 +2127,11 @@ mod tests {
         let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
 
         // Tamper with the archive on disk (checksum now mismatches).
-        let storage: (String,) =
-            sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
-                .bind(&backup_id)
-                .fetch_one(&fx.pool)
-                .await
-                .unwrap();
+        let storage: (String,) = sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
         let mut bytes = std::fs::read(&storage.0).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
@@ -2259,6 +2279,149 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pre, 0);
+    }
+
+    async fn seed_completed(
+        fx: &Fixture,
+        server_id: &str,
+        bid: &str,
+        created_at: &str,
+        protected: bool,
+    ) {
+        let path = fx.backup_dir.join(format!("{bid}.tar.gz"));
+        std::fs::write(&path, b"seed-bytes").unwrap();
+        sqlx::query(
+            "INSERT INTO backups
+                (id, server_id, type, state, storage_path, size_bytes,
+                 checksum_algorithm, checksum, consistency_method,
+                 created_at, completed_at, protected)
+             VALUES (?, ?, 'full', 'completed', ?, 10, 'sha256', 'abc', 'live', ?, ?, ?)",
+        )
+        .bind(bid)
+        .bind(server_id)
+        .bind(path.to_string_lossy().into_owned())
+        .bind(created_at)
+        .bind(created_at)
+        .bind(i64::from(protected))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn backup_ids(fx: &Fixture, server_id: &str) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>("SELECT id FROM backups WHERE server_id = ?")
+            .bind(server_id)
+            .fetch_all(&fx.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id,)| id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prune_uses_canonical_retention_decisions() {
+        // Pins FIX 1: the worker prune goes through Task 1's
+        // `select_for_deletion`, whose protected rows consume keep slots.
+        // Six unprotected seeds + one newest protected seed, then one real
+        // backup: canonical ranks [new, protected, c6..c1] and deletes only
+        // the oldest unprotected seed. The old inline copy kept 7
+        // unprotected and would delete nothing.
+        let _guard = test_guard();
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-prune").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+
+        for (i, bid) in ["c1", "c2", "c3", "c4", "c5", "c6"].iter().enumerate() {
+            seed_completed(
+                &fx,
+                &id,
+                bid,
+                &format!("2026-01-01T00:00:0{}Z", i + 1),
+                false,
+            )
+            .await;
+        }
+        seed_completed(&fx, &id, "p1", "2026-01-01T00:00:07Z", true).await;
+
+        let (_, fresh) = backup_and_wait(&fx, &id, "live").await;
+
+        let mut remaining = backup_ids(&fx, &id).await;
+        remaining.sort();
+        let mut expected = vec!["c2", "c3", "c4", "c5", "c6", "p1", fresh.as_str()];
+        expected.sort_unstable();
+        assert_eq!(remaining, expected, "canonical prune deleted wrong rows");
+
+        // The executor removed the pruned file and kept the protected one.
+        assert!(!fx.backup_dir.join("c1.tar.gz").exists());
+        assert!(fx.backup_dir.join("p1.tar.gz").exists());
+    }
+
+    #[tokio::test]
+    async fn shared_op_lock_guards_backup_enqueue() {
+        // Pins FIX 2: the backup handler claims the shared
+        // `AppState::op_locks`, so a lifecycle-style holder makes backup
+        // creation fail fast with `SERVER_BUSY` (and nothing is enqueued).
+        let _guard = test_guard();
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-lock1").await;
+
+        fx.state.op_locks.lock().await.insert(id.clone());
+        let busy = fx
+            .server
+            .post(&format!("/api/v1/servers/{id}/backups"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({"mode": "full", "consistency": "live"}))
+            .await;
+        assert_eq!(busy.status_code(), 409, "body: {}", busy.text());
+        assert_eq!(busy.json::<Value>()["error_code"], json!("SERVER_BUSY"));
+        assert_eq!(backup_count(&fx, &id).await, 0);
+        fx.state.op_locks.lock().await.remove(&id);
+
+        let res = fx
+            .server
+            .post(&format!("/api/v1/servers/{id}/backups"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({"mode": "full", "consistency": "live"}))
+            .await;
+        assert_eq!(res.status_code(), 202, "body: {}", res.text());
+        let task_id = res.json::<Value>()["task_id"].as_str().unwrap().to_string();
+        let task = poll_terminal(&fx, &task_id).await;
+        assert_eq!(task["state"], json!("succeeded"), "backup failed: {task}");
+    }
+
+    #[tokio::test]
+    async fn shared_op_lock_guards_restore_enqueue() {
+        // Same shared-lock gate on the restore path.
+        let _guard = test_guard();
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-lock2").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+        let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
+
+        fx.state.op_locks.lock().await.insert(id.clone());
+        let busy = fx
+            .server
+            .post(&format!("/api/v1/backups/{backup_id}/restore"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({}))
+            .await;
+        assert_eq!(busy.status_code(), 409, "body: {}", busy.text());
+        assert_eq!(busy.json::<Value>()["error_code"], json!("SERVER_BUSY"));
+        fx.state.op_locks.lock().await.remove(&id);
+
+        let res = fx
+            .server
+            .post(&format!("/api/v1/backups/{backup_id}/restore"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({}))
+            .await;
+        assert_eq!(res.status_code(), 202, "body: {}", res.text());
+        let task_id = res.json::<Value>()["task_id"].as_str().unwrap().to_string();
+        let task = poll_terminal(&fx, &task_id).await;
+        assert_eq!(task["state"], json!("succeeded"), "restore failed: {task}");
     }
 
     #[test]
