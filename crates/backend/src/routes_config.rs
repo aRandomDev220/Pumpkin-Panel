@@ -1,6 +1,8 @@
 //! Per-server `pumpkin.toml` management (Phase 4, Task 2).
 //!
-//! - `GET /servers/:id/config` → current content + guided view + profile.
+//! - `GET /servers/:id/config` → current content + guided view + profile,
+//!   plus `diverged`/`diverged_reason` when the file disagrees with the
+//!   revision baseline (detectable, never auto-healed).
 //! - `PUT /servers/:id/config {revision, content}` → revision-checked,
 //!   validated, atomic save with a pre-change copy in `config_revisions`.
 //! - `POST /servers/:id/config/validate {content}` → dry-run validation.
@@ -17,6 +19,9 @@
 //! into `main.rs` (same transient state as the other Phase 4 task modules).
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -25,6 +30,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use tokio::sync::Mutex;
 
 use crate::{
     audit,
@@ -106,9 +112,11 @@ fn config_path(server: &ServerRow) -> std::path::PathBuf {
     std::path::Path::new(&server.data_path).join("pumpkin.toml")
 }
 
-/// Current `configuration_revision`, creating the settings row on demand
-/// (older rows may predate `server_settings`).
-async fn current_revision(pool: &SqlitePool, server_id: &str) -> Result<i64, sqlx::Error> {
+/// Current `(configuration_revision, content_hash baseline)`, creating the
+/// settings row on demand (older rows may predate `server_settings`).
+/// `content_hash` is `None` until the first API save populates it (migration
+/// 0004) or when the database predates that column — both mean "no baseline".
+async fn current_state(pool: &SqlitePool, server_id: &str) -> (i64, Option<String>) {
     let _ = sqlx::query(
         "INSERT INTO server_settings (server_id) VALUES (?)
           ON CONFLICT(server_id) DO NOTHING",
@@ -116,12 +124,46 @@ async fn current_revision(pool: &SqlitePool, server_id: &str) -> Result<i64, sql
     .bind(server_id)
     .execute(pool)
     .await;
-    sqlx::query_scalar::<_, i64>(
+    if let Ok(row) = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT configuration_revision, content_hash FROM server_settings
+          WHERE server_id = ?",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await
+    {
+        return row;
+    }
+    // Pre-0004 database: revision without a baseline.
+    let revision = sqlx::query_scalar::<_, i64>(
         "SELECT configuration_revision FROM server_settings WHERE server_id = ?",
     )
     .bind(server_id)
     .fetch_one(pool)
     .await
+    .unwrap_or(1);
+    (revision, None)
+}
+
+/// Try to claim the per-server op lock (same pattern as `routes_servers`).
+/// `false` = a conflicting save is in flight; the caller must fail fast
+/// with `SERVER_BUSY` instead of queuing behind I/O.
+async fn try_lock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) -> bool {
+    let mut guard = locks.lock().await;
+    if guard.contains(server_id) {
+        return false;
+    }
+    guard.insert(server_id.to_string());
+    true
+}
+
+async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
+    locks.lock().await.remove(server_id);
+}
+
+/// Short hash prefix for human-facing divergence messages (never bodies).
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 fn profile_json(runtime_version: &str) -> serde_json::Value {
@@ -169,8 +211,13 @@ pub async fn get_config(
             )
         }
     };
-    let revision = current_revision(&state.pool, &server.id).await.unwrap_or(1);
+    let (revision, baseline) = current_state(&state.pool, &server.id).await;
     let hash = content_hash(&content);
+    // Divergence detection: the DB revision row and the on-disk file are
+    // dual writes (a crash between rename and bump, or an edit that
+    // bypassed this API, leaves them disagreeing). The file is served
+    // as-is — never auto-healed — but flagged for the operator.
+    let diverged = baseline.as_deref().is_some_and(|b| b != hash);
     let guided = match parse_and_validate(&content) {
         Ok(doc) => guided_from_doc(&doc),
         Err(errors) => {
@@ -185,14 +232,25 @@ pub async fn get_config(
                 .into_response();
         }
     };
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "revision": revision,
         "hash": hash,
         "content": content,
         "guided": guided,
         "profile": profile,
-    }))
-    .into_response()
+        "diverged": diverged,
+    });
+    if diverged {
+        body["diverged_reason"] = serde_json::json!(format!(
+            "pumpkin.toml on disk (hash {}) does not match revision {} baseline (hash {}); \
+             edited outside the config API or left behind by an interrupted save — \
+             review and re-save to reconcile",
+            short_hash(&hash),
+            revision,
+            short_hash(baseline.as_deref().unwrap_or("unknown")),
+        ));
+    }
+    Json(body).into_response()
 }
 
 /// PUT /api/v1/servers/:id/config — revision-checked atomic save.
@@ -228,7 +286,8 @@ pub async fn validate_config(
     }
 }
 
-/// GET /api/v1/servers/:id/config/revisions — history without bodies.
+/// GET /api/v1/servers/:id/config/revisions — history with per-entry content
+/// for read-only preview (amendment).
 pub async fn list_revisions(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -309,7 +368,7 @@ pub async fn revert_config(
             "no such config revision",
         );
     };
-    let expected = current_revision(&state.pool, &server.id).await.unwrap_or(1);
+    let (expected, _) = current_state(&state.pool, &server.id).await;
     save_new_revision(&state, &user, &server, expected, content).await
 }
 
@@ -317,9 +376,10 @@ pub async fn revert_config(
 // Shared save transaction
 // ---------------------------------------------------------------------------
 
-/// Revision check → validate → pre-change copy → atomic rename → re-read +
-/// hash verify → revision bump, under `BEGIN IMMEDIATE` so two concurrent
-/// saves serialize and exactly one wins (loser gets `409 CONFIG_CONFLICT`).
+/// Entry point for PUT + revert: claims the per-server op lock (fail fast
+/// with `409 SERVER_BUSY`, never queue behind another save's I/O), runs the
+/// save, then releases the lock. Splitting lock handling from `save_inner`
+/// keeps every exit path unlock-safe without `Drop`-based async hacks.
 async fn save_new_revision(
     state: &AppState,
     user: &AuthUser,
@@ -327,17 +387,30 @@ async fn save_new_revision(
     expected_revision: i64,
     new_content: String,
 ) -> Response {
+    if !try_lock(&state.op_locks, &server.id).await {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "another config save is in flight for this server",
+        );
+    }
+    let response = save_inner(state, user, server, expected_revision, new_content).await;
+    unlock(&state.op_locks, &server.id).await;
+    response
+}
+
+/// Revision check → validate → pre-change copy → atomic rename → re-read +
+/// hash verify → revision bump (+ baseline hash), under `BEGIN IMMEDIATE` so
+/// a save that bypassed the op lock still cannot interleave mid-transaction.
+async fn save_inner(
+    state: &AppState,
+    user: &AuthUser,
+    server: &ServerRow,
+    expected_revision: i64,
+    new_content: String,
+) -> Response {
     let request_id = audit::request_id();
-    let current = match current_revision(&state.pool, &server.id).await {
-        Ok(rev) => rev,
-        Err(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                "failed to load configuration revision",
-            )
-        }
-    };
+    let (current, _) = current_state(&state.pool, &server.id).await;
     if expected_revision != current {
         return (
             StatusCode::CONFLICT,
@@ -494,11 +567,12 @@ async fn save_new_revision(
             ));
         }
         sqlx::query(
-            "UPDATE server_settings SET configuration_revision = ?,
+            "UPDATE server_settings SET configuration_revision = ?, content_hash = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
               WHERE server_id = ?",
         )
         .bind(next_revision)
+        .bind(&new_hash)
         .bind(&server.id)
         .execute(&mut *conn)
         .await
@@ -582,6 +656,7 @@ mod tests {
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0003_config_revisions.sql"),
+            include_str!("../../../migrations/0004_config_baseline_hash.sql"),
         ] {
             // Strip `--` comment lines first: they may contain semicolons
             // (e.g. "immutable; new tables only") that naive splitting
@@ -972,5 +1047,206 @@ mod tests {
         // Amendment: the UI previews revision bodies read-only, so each
         // entry carries its full content (files are ~4KB, limit is capped).
         assert_eq!(list_body["revisions"][0]["content"], json!(V1));
+    }
+
+    /// Crash/out-of-band divergence is DETECTABLE: the file is served as-is
+    /// with `diverged: true` + a human reason, never auto-healed.
+    #[tokio::test]
+    async fn out_of_band_write_flags_diverged() {
+        let (server, _pool) = test_server().await;
+        let token = setup_owner(&server).await;
+        let created = make_server(&server, &token, "cfg-diverged", 26107).await;
+        let id = created["server"]["id"].as_str().unwrap().to_string();
+        let data_path = created["server"]["data_path"].as_str().unwrap().to_string();
+        write_pumpkin_toml(&data_path, V1);
+
+        // Establish the baseline via a normal save.
+        let rev = revision_of(&server, &token, &id).await;
+        let put = server
+            .put(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .json(&json!({"revision": rev, "content": V2}))
+            .await;
+        assert_eq!(put.status_code(), 200, "body: {}", put.text());
+
+        // Clean read: file matches the baseline, no divergence.
+        let clean = server
+            .get(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .await
+            .json::<Value>();
+        assert_eq!(clean["diverged"], json!(false));
+
+        // Out-of-band write (crash between rename and DB bump, or an edit
+        // via the file manager that bypassed the revision tracking).
+        let tampered = "[networking.java]\nmotd = \"tampered\"\nmax_players = 20\n";
+        write_pumpkin_toml(&data_path, tampered);
+
+        let get = server
+            .get(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .await;
+        assert_eq!(get.status_code(), 200, "body: {}", get.text());
+        let body = get.json::<Value>();
+        // Served as-is — never auto-healed — but flagged.
+        assert_eq!(body["content"], json!(tampered));
+        assert_eq!(body["diverged"], json!(true));
+        assert!(
+            body["diverged_reason"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "expected a human diverged_reason, got: {body}"
+        );
+    }
+
+    /// True parallel contention: 8 concurrent PUTs on the same base revision
+    /// → exactly one winner (`200`), every loser `409` (immediate
+    /// `SERVER_BUSY` while the save is in flight, or `CONFIG_CONFLICT` if it
+    /// lands after the winner commits), and exactly one new revision row.
+    #[tokio::test]
+    async fn parallel_puts_have_single_winner() {
+        let (server, pool) = test_server().await;
+        let token = setup_owner(&server).await;
+        let created = make_server(&server, &token, "cfg-parallel", 26108).await;
+        let id = created["server"]["id"].as_str().unwrap().to_string();
+        let data_path = created["server"]["data_path"].as_str().unwrap().to_string();
+        write_pumpkin_toml(&data_path, V1);
+        let rev = revision_of(&server, &token, &id).await;
+
+        let url = format!("/api/v1/servers/{id}/config");
+        let bodies: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({"revision": rev,
+                       "content": format!("seed = \"w{i}\"\n[networking.java]\nmotd = \"w{i}\"\nmax_players = 20\n")})
+            })
+            .collect();
+        let resps = futures_util::future::join_all(bodies.into_iter().map(|b| {
+            let req = server.put(&url).authorization_bearer(&token).json(&b);
+            async move { req.await }
+        }))
+        .await;
+
+        let ok = resps.iter().filter(|r| r.status_code() == 200).count();
+        assert_eq!(ok, 1, "exactly one winner expected");
+        for r in &resps {
+            assert!(
+                r.status_code() == 200 || r.status_code() == 409,
+                "unexpected status {}: {}",
+                r.status_code(),
+                r.text()
+            );
+        }
+        let busy_or_conflict: Vec<String> = resps
+            .iter()
+            .filter(|r| r.status_code() == 409)
+            .map(|r| r.json::<Value>()["error_code"].to_string())
+            .collect();
+        assert_eq!(busy_or_conflict.len(), 7);
+        for code in &busy_or_conflict {
+            assert!(
+                code.contains("SERVER_BUSY") || code.contains("CONFIG_CONFLICT"),
+                "unexpected 409 code: {code}"
+            );
+        }
+
+        // Exactly one save took effect: one pre-change row, one bump.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM config_revisions WHERE server_id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+        let bumped: i64 = sqlx::query_scalar(
+            "SELECT configuration_revision FROM server_settings WHERE server_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bumped, rev + 1);
+        // The winner's bytes are on disk (one of the eight candidates).
+        let disk = read_pumpkin_toml(&data_path);
+        assert!(
+            disk.contains("motd = \"w"),
+            "unexpected disk content: {disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_version_profile_is_unknown() {
+        let (server, _pool) = test_server().await;
+        let token = setup_owner(&server).await;
+        let created = make_server(&server, &token, "cfg-emptyver", 26109).await;
+        let id = created["server"]["id"].as_str().unwrap().to_string();
+        let data_path = created["server"]["data_path"].as_str().unwrap().to_string();
+        write_pumpkin_toml(&data_path, V1);
+        // `runtime_version` defaults to '' (never reported by the server).
+        let res = server
+            .get(&format!("/api/v1/servers/{id}/config"))
+            .authorization_bearer(&token)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(body["profile"]["known"], json!(false));
+        assert_eq!(body["profile"]["pumpkin_version"], json!(""));
+    }
+
+    #[tokio::test]
+    async fn validate_ok_path_and_revision_pagination() {
+        let (server, pool) = test_server().await;
+        let token = setup_owner(&server).await;
+        let created = make_server(&server, &token, "cfg-pages", 26110).await;
+        let id = created["server"]["id"].as_str().unwrap().to_string();
+        let data_path = created["server"]["data_path"].as_str().unwrap().to_string();
+        write_pumpkin_toml(&data_path, V1);
+
+        // `ok: true` dry-run path.
+        let res = server
+            .post(&format!("/api/v1/servers/{id}/config/validate"))
+            .authorization_bearer(&token)
+            .json(&json!({"content": V1}))
+            .await;
+        assert_eq!(res.status_code(), 200);
+        let body = res.json::<Value>();
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["errors"], json!([]));
+
+        // Seed 105 history rows directly; pagination clamps limit to 100.
+        for n in 1..=105i64 {
+            sqlx::query(
+                "INSERT INTO config_revisions
+                    (id, server_id, revision, content, hash)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(format!("rev-{n}"))
+            .bind(&id)
+            .bind(n)
+            .bind(format!("content-{n}"))
+            .bind(format!("hash-{n}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let list = server
+            .get(&format!("/api/v1/servers/{id}/config/revisions?limit=1000"))
+            .authorization_bearer(&token)
+            .await;
+        assert_eq!(list.status_code(), 200);
+        let list_body = list.json::<Value>();
+        assert_eq!(list_body["total"], json!(105));
+        assert_eq!(list_body["revisions"].as_array().unwrap().len(), 100);
+        // Newest first.
+        assert_eq!(list_body["revisions"][0]["revision"], json!(105));
+
+        let page = server
+            .get(&format!(
+                "/api/v1/servers/{id}/config/revisions?limit=2&offset=1"
+            ))
+            .authorization_bearer(&token)
+            .await
+            .json::<Value>();
+        assert_eq!(page["revisions"][0]["revision"], json!(104));
+        assert_eq!(page["revisions"][1]["revision"], json!(103));
     }
 }
