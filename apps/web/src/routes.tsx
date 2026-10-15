@@ -4,6 +4,7 @@ import { useAuth } from "./lib/auth";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
 import Overview from "./pages/Overview";
+import Monitoring from "./pages/Monitoring";
 import Servers from "./pages/Servers";
 import ServerDetail from "./pages/ServerDetail";
 import Config from "./pages/Config";
@@ -52,6 +53,14 @@ export default function AppRoutes() {
         element={
           <RequireAuth>
             <Files />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/monitoring"
+        element={
+          <RequireAuth>
+            <Monitoring />
           </RequireAuth>
         }
       />

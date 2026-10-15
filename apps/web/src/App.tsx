@@ -32,6 +32,7 @@ export default function App() {
               <nav>
                 <Link to="/">Overview</Link>
                 <Link to="/servers">Servers</Link>
+                <Link to="/monitoring">Monitoring</Link>
               </nav>
               <HealthBadge />
             </header>

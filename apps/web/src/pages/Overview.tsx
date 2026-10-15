@@ -12,6 +12,8 @@ import type {
   ServerSummary,
   ServerTask,
 } from "../lib/servers";
+import { fetchAlerts } from "../lib/monitoring";
+import { AlertsList } from "./Monitoring";
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "n/a";
@@ -102,6 +104,11 @@ export default function Overview() {
   const metricsQuery = useQuery({
     queryKey: ["metrics", "summary"],
     queryFn: fetchMetricsSummary,
+    retry: 1,
+  });
+  const backendAlertsQuery = useQuery({
+    queryKey: ["alerts"],
+    queryFn: fetchAlerts,
     retry: 1,
   });
 
@@ -297,6 +304,18 @@ export default function Overview() {
               ))}
             </ul>
           )}
+
+          <h3>Monitoring alerts</h3>
+          {backendAlertsQuery.isLoading && <p>Loading monitoring alerts…</p>}
+          {backendAlertsQuery.error && (
+            <p className="err">Failed to load monitoring alerts.</p>
+          )}
+          {backendAlertsQuery.data && (
+            <AlertsList alerts={backendAlertsQuery.data.alerts} />
+          )}
+          <p className="muted">
+            <Link to="/monitoring">Open monitoring →</Link>
+          </p>
 
           <h3>Recent activity</h3>
           {tasksLoading && <p>Loading recent tasks…</p>}

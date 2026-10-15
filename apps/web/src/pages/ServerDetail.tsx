@@ -14,6 +14,13 @@ import {
   postLifecycle,
 } from "../lib/servers";
 import type { LifecycleOp, TaskStatus } from "../lib/servers";
+import {
+  METRICS_RANGES,
+  fetchMetricsHistory,
+  isMetricsRange,
+} from "../lib/monitoring";
+import type { MetricsRange } from "../lib/monitoring";
+import { ServerHistoryPanels } from "./Monitoring";
 import BackupsSection from "./Backups";
 
 const LOG_TAIL_OPTIONS = [50, 200, 500];
@@ -41,6 +48,7 @@ export default function ServerDetail() {
   const [opError, setOpError] = useState<string | null>(null);
   const [logTail, setLogTail] = useState<number>(200);
   const [copied, setCopied] = useState(false);
+  const [historyRange, setHistoryRange] = useState<MetricsRange>("1h");
 
   const serverQuery = useQuery({
     queryKey: ["servers", id],
@@ -76,6 +84,14 @@ export default function ServerDetail() {
     queryFn: fetchMetricsSummary,
     retry: 1,
     staleTime: 10_000,
+  });
+
+  const historyDetailQuery = useQuery({
+    queryKey: ["servers", id, "metrics", "history", historyRange],
+    queryFn: () => fetchMetricsHistory(id ?? "", historyRange),
+    enabled: !!id,
+    retry: 1,
+    staleTime: 30_000,
   });
 
   const taskQuery = useQuery<TaskStatus>({
@@ -311,6 +327,35 @@ export default function ServerDetail() {
           )}
         </dd>
       </dl>
+
+      <h3>Metrics history</h3>
+      <div className="row">
+        <label>
+          Range{" "}
+          <select
+            value={historyRange}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (isMetricsRange(v)) setHistoryRange(v);
+            }}
+            aria-label="Metrics history range"
+          >
+            {METRICS_RANGES.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Link to="/monitoring">Full monitoring →</Link>
+      </div>
+      {historyDetailQuery.isLoading && <p>Loading metrics history…</p>}
+      {historyDetailQuery.error && (
+        <p className="err">Failed to load metrics history.</p>
+      )}
+      {historyDetailQuery.data && (
+        <ServerHistoryPanels samples={historyDetailQuery.data.samples} />
+      )}
 
       <h3>Logs</h3>
       <div className="row">
