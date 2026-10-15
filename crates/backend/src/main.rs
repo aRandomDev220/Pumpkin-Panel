@@ -12,13 +12,13 @@ mod routes_servers;
 mod runtime;
 mod task_runner;
 #[cfg(test)]
-mod tests_phase2;
-#[cfg(test)]
-mod tests_phase3;
+mod tests_concurrency;
 #[cfg(test)]
 mod tests_docker;
 #[cfg(test)]
-mod tests_concurrency;
+mod tests_phase2;
+#[cfg(test)]
+mod tests_phase3;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

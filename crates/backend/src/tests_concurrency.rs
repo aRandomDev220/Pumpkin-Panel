@@ -192,12 +192,7 @@ async fn concurrency_starts_without_runtime_stay_clean() {
         .to_string();
     let url = format!("/api/v1/servers/{id}/start");
 
-    let requests = (0..6).map(|_| {
-        server
-            .post(&url)
-            .authorization_bearer(&token)
-            .into_future()
-    });
+    let requests = (0..6).map(|_| server.post(&url).authorization_bearer(&token).into_future());
     let responses = join_all(requests).await;
 
     for res in &responses {

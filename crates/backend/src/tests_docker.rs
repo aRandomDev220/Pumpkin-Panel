@@ -254,38 +254,54 @@ async fn docker_dispatch_start_updates_observed() {
     let spec = make_spec(&root, &slug);
     chown_leaf_for_pumpkin(Path::new(&spec.data_path));
 
-    let handle = adapter
-        .create(&spec)
-        .await
-        .expect("create container for dispatch");
+    // Inner fallible body; teardown below runs whether setup,
+    // dispatch, or assertions fail. (`container_id` is tracked outside
+    // so cleanup knows what to remove.)
     let server_id = spec.server_id.to_string();
-    sqlx::query(
-        "INSERT INTO servers (id, name, slug, image_reference, container_id, data_path, game_port, observed_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'created')",
-    )
-    .bind(&server_id)
-    .bind(&spec.name)
-    .bind(&spec.slug)
-    .bind(&spec.image_reference)
-    .bind(&handle.container_id)
-    .bind(&spec.data_path)
-    .bind(i64::from(spec.game_port))
-    .execute(&pool)
-    .await
-    .expect("server row");
+    let mut container_id: Option<String> = None;
+    let result: Result<String, String> = async {
+        let handle = adapter
+            .create(&spec)
+            .await
+            .map_err(|e| format!("create container for dispatch: {e}"))?;
+        container_id = Some(handle.container_id.clone());
 
-    let task = task_runner::enqueue(&pool, "start", Some(&server_id), None)
+        sqlx::query(
+            "INSERT INTO servers (id, name, slug, image_reference, container_id, data_path, game_port, observed_state)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'created')",
+        )
+        .bind(&server_id)
+        .bind(&spec.name)
+        .bind(&spec.slug)
+        .bind(&spec.image_reference)
+        .bind(&handle.container_id)
+        .bind(&spec.data_path)
+        .bind(i64::from(spec.game_port))
+        .execute(&pool)
         .await
-        .expect("enqueue start");
+        .map_err(|e| format!("server row: {e}"))?;
 
-    // Dispatch, then clean up before asserting so teardown runs on failure too.
-    let dispatch = task_runner::dispatch_task(&pool, &adapter, &task.id).await;
-    let _ = adapter.stop(&handle.container_id, 10).await;
-    let _ = adapter.remove(&handle.container_id).await;
+        let task = task_runner::enqueue(&pool, "start", Some(&server_id), None)
+            .await
+            .map_err(|e| format!("enqueue start: {e}"))?;
+        let task_id = task.id.clone();
+
+        task_runner::dispatch_task(&pool, &adapter, &task.id)
+            .await
+            .map_err(|e| format!("dispatch start: {e}"))?;
+        Ok(task_id)
+    }
+    .await;
+
+    // Defer-style teardown: always runs, even on early failure.
+    if let Some(id) = container_id.as_deref() {
+        let _ = adapter.stop(id, 10).await;
+        let _ = adapter.remove(id).await;
+    }
     let _ = std::fs::remove_dir_all(&root);
 
-    dispatch.expect("dispatch start");
-    let rec = task_runner::get(&pool, &task.id)
+    let task_id = result.expect("dispatch start");
+    let rec = task_runner::get(&pool, &task_id)
         .await
         .expect("get task")
         .expect("task row");
