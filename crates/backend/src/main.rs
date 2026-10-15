@@ -15,6 +15,10 @@ mod task_runner;
 mod tests_phase2;
 #[cfg(test)]
 mod tests_phase3;
+#[cfg(test)]
+mod tests_docker;
+#[cfg(test)]
+mod tests_concurrency;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
