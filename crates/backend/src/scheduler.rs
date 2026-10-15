@@ -21,7 +21,6 @@
 // Task 2 (routes) / controller wiring consumes this module's entry points;
 // nothing in the crate wires it up yet, so dead-code is expected until then
 // (remove once wired).
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::str::FromStr;
@@ -795,7 +794,6 @@ async fn push_next_run(pool: &SqlitePool, policy: &PolicyRow, now: &DateTime<Utc
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use axum::routing::{delete, get, patch, post};
     use axum_test::TestServer;
     use serde_json::{json, Value};
     use std::path::PathBuf;
@@ -826,47 +824,10 @@ mod tests {
         pool
     }
 
-    /// Full production router plus the policy routes the controller will own
-    /// (same paths/permission gates as the Task 4 contract).
+    /// Full production router (policy routes are wired in `build_router`
+    /// by the controller with the same permission gates).
     fn test_app(state: AppState) -> axum::Router {
-        use axum::middleware;
-        let pool = state.pool.clone();
-        let policies = axum::Router::new()
-            .route(
-                "/api/v1/servers/:id/backup-policies",
-                get(list_policies).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerRead),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/backup-policies",
-                post(create_policy).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerBackupCreate),
-                )),
-            )
-            .route(
-                "/api/v1/backup-policies/:id",
-                patch(update_policy).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerBackupCreate),
-                )),
-            )
-            .route(
-                "/api/v1/backup-policies/:id",
-                delete(delete_policy).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerBackupCreate),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/backup-policies/preview",
-                post(retention_preview).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerRead),
-                )),
-            )
-            .route_layer(middleware::from_fn_with_state(
-                pool,
-                crate::auth::auth_middleware,
-            ));
-        crate::build_router(state.clone()).merge(policies.with_state(state))
+        crate::build_router(state)
     }
 
     async fn test_server_with_roots() -> (TestServer, SqlitePool, PathBuf, PathBuf) {

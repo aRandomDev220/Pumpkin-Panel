@@ -1,6 +1,6 @@
 mod audit;
-mod backup_service;
 mod auth;
+mod backup_service;
 mod config;
 mod config_profile;
 mod db;
@@ -9,7 +9,6 @@ mod file_service;
 mod health;
 mod metrics;
 mod readiness;
-mod scheduler;
 mod routes_admin;
 mod routes_auth;
 mod routes_backup;
@@ -17,6 +16,7 @@ mod routes_config;
 mod routes_files;
 mod routes_servers;
 mod runtime;
+mod scheduler;
 mod task_runner;
 #[cfg(test)]
 mod tests_concurrency;
@@ -173,6 +173,72 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/admin/reconcile",
             post(routes_admin::trigger_reconcile).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::SettingsManage),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/backups",
+            get(routes_backup::list_backups).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/backups",
+            post(routes_backup::create_backup).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupCreate),
+            )),
+        )
+        .route(
+            "/api/v1/backups/:id",
+            get(routes_backup::get_backup).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/backups/:id/download",
+            get(routes_backup::download_backup).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/backups/:id",
+            delete(routes_backup::delete_backup).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupCreate),
+            )),
+        )
+        .route(
+            "/api/v1/backups/:id/restore",
+            post(routes_backup::restore_backup).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupRestore),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/backup-policies",
+            get(scheduler::list_policies).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/backup-policies",
+            post(scheduler::create_policy).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupCreate),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/backup-policies/preview",
+            post(scheduler::retention_preview).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/backup-policies/:id",
+            axum::routing::patch(scheduler::update_policy).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupCreate),
+            )),
+        )
+        .route(
+            "/api/v1/backup-policies/:id",
+            delete(scheduler::delete_policy).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
@@ -379,6 +445,26 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     let server_root = settings.data_dir.clone();
+    // Backup storage shares the derivation routes use (`backup_root_for`),
+    // so boot cleanup and the scheduler tick see the same directory.
+    let backup_root = routes_backup::backup_root_for(&server_root);
+    if let Err(e) = std::fs::create_dir_all(&backup_root) {
+        tracing::warn!(path = %backup_root.display(), error = %e, "cannot create backup dir");
+    }
+    routes_backup::startup_cleanup(&pool, &backup_root).await;
+    // Single-node scheduler: one 60s loop per manager process (no second
+    // replica may run against the same DB — see spec §19.2).
+    {
+        let pool = pool.clone();
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                scheduler::tick_once(&pool, adapter.as_deref(), &backup_root).await;
+            }
+        });
+    }
     let state = AppState {
         pool,
         adapter,

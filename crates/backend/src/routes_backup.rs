@@ -51,7 +51,7 @@ const TASK_TYPE_BACKUP: &str = "backup";
 const TASK_TYPE_RESTORE: &str = "restore";
 
 /// Worker prune fallback when the server has no enabled retention policy
-/// (mirrors the `backup_policies` column defaults in `0004_backups.sql`).
+/// (mirrors the `backup_policies` column defaults in `0005_backups.sql`).
 const DEFAULT_RETENTION_COUNT: usize = 7;
 const DEFAULT_MAX_AGE_DAYS: u64 = 30;
 
@@ -804,7 +804,7 @@ async fn execute_backup(
     .await;
 
     match outcome {
-        Ok(_) => {
+        Ok(outcome) => {
             // Cooperative cancel before the prune: the backup itself is done
             // and verified; only the retention sweep is skipped.
             if cancel_requested(pool, task_id).await {
@@ -823,6 +823,22 @@ async fn execute_backup(
                 return;
             }
             prune_retention(pool, server_id, actor).await;
+            audit::record(
+                pool,
+                actor,
+                "backup.complete",
+                "backup",
+                backup_id,
+                "ok",
+                &audit::request_id(),
+                serde_json::json!({
+                    "server_id": server_id,
+                    "storage_path": outcome.storage_path,
+                    "size_bytes": outcome.size_bytes,
+                    "archive_entries": outcome.archive_entries,
+                }),
+            )
+            .await;
             let _ = task_runner::mark_succeeded(pool, task_id, "backup completed").await;
         }
         Err(BackupError::Cancelled) => {
@@ -1390,11 +1406,7 @@ pub async fn create_backup(
     let request_id = audit::request_id();
     let mode = body.mode.unwrap_or_else(|| "full".to_string());
     if mode != "full" {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "INVALID_CONFIGURATION",
-            &format!("unsupported backup mode '{mode}'"),
-        );
+        return backup_error(BackupError::UnsupportedMode(mode));
     }
     let consistency = body.consistency.unwrap_or_else(|| "stopped".to_string());
     // Shared op lock (same domain as lifecycle ops): fail fast when another
@@ -1592,11 +1604,7 @@ pub async fn delete_backup(
         }
     };
     if backup.protected != 0 {
-        return error(
-            StatusCode::CONFLICT,
-            "BACKUP_PROTECTED",
-            "backup is protected from deletion",
-        );
+        return backup_error(BackupError::Protected);
     }
     if backup.state == "completed" {
         let completed: i64 = sqlx::query_scalar(
@@ -1755,10 +1763,10 @@ mod tests {
     use axum_test::TestServer;
     use serde_json::{json, Value};
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     // Tolerate poisoning: a failed test must not cascade-fail the rest.
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().await
     }
 
     async fn test_pool() -> SqlitePool {
@@ -1774,7 +1782,7 @@ mod tests {
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0004_backups.sql"),
+            include_str!("../../../migrations/0005_backups.sql"),
         ] {
             // Strip `--` comment lines first: headers may contain `;`
             // (e.g. 0002's "immutable; new tables only"), which would split
@@ -2004,7 +2012,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_backup_completes_verified() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak1").await;
         let dir = data_dir(&fx, &id).await;
@@ -2064,7 +2072,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_mode_rejected() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak2").await;
         let res = fx
@@ -2078,7 +2086,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_requires_stopped() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak3").await;
         let dir = data_dir(&fx, &id).await;
@@ -2104,7 +2112,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_round_trip() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak4").await;
         let dir = data_dir(&fx, &id).await;
@@ -2147,7 +2155,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_restore_rejected() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak5").await;
         let dir = data_dir(&fx, &id).await;
@@ -2179,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreign_backup_rejected() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak6").await;
         let dir = data_dir(&fx, &id).await;
@@ -2217,7 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn retention_floor() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak7").await;
         let dir = data_dir(&fx, &id).await;
@@ -2273,7 +2281,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_restore_failure_aborts() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak8").await;
         let dir = data_dir(&fx, &id).await;
@@ -2355,7 +2363,7 @@ mod tests {
         // backup: canonical ranks [new, protected, c6..c1] and deletes only
         // the oldest unprotected seed. The old inline copy kept 7
         // unprotected and would delete nothing.
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-prune").await;
         let dir = data_dir(&fx, &id).await;
@@ -2412,7 +2420,7 @@ mod tests {
         // with two pre-existing completed backups + one protected row:
         // after one successful backup exactly 1 unprotected completed
         // backup remains and the protected row is never pruned.
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-policy").await;
         let dir = data_dir(&fx, &id).await;
@@ -2438,7 +2446,7 @@ mod tests {
         // No enabled policy → table defaults (keep 7, 30 days): a backup
         // older than 30 days is pruned by age even though the keep count
         // is not exceeded.
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-policy-default").await;
         let dir = data_dir(&fx, &id).await;
@@ -2457,7 +2465,7 @@ mod tests {
         // Pins FIX 2: the backup handler claims the shared
         // `AppState::op_locks`, so a lifecycle-style holder makes backup
         // creation fail fast with `SERVER_BUSY` (and nothing is enqueued).
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-lock1").await;
 
@@ -2488,7 +2496,7 @@ mod tests {
     #[tokio::test]
     async fn shared_op_lock_guards_restore_enqueue() {
         // Same shared-lock gate on the restore path.
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-lock2").await;
         let dir = data_dir(&fx, &id).await;
@@ -2520,7 +2528,7 @@ mod tests {
 
     #[test]
     fn backup_root_defaults_and_overrides() {
-        let _guard = test_guard();
+        let _guard = TEST_LOCK.blocking_lock();
         std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
         assert_eq!(
             backup_root_for(Path::new("/data/servers")),
@@ -2534,7 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_cleanup_removes_stale_staging() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         let pool = test_pool().await;
         let dir = std::env::temp_dir().join(format!("pm-bak-clean-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".tmp-stale-1")).unwrap();
