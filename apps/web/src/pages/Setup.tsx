@@ -46,6 +46,13 @@ export default function Setup() {
 
   return (
     <section className="auth-page">
+      <div className="auth-aside" aria-hidden="true">
+        <div className="auth-brand"><span className="brand-mark">P</span><span>Pumpkin Manager</span></div>
+        <div className="eyebrow">First launch</div>
+        <h1>Set up a calmer way to run your worlds.</h1>
+        <p>Create the owner account once, then keep every server, backup, and operational task in one place.</p>
+        <div className="auth-notes"><div className="auth-note"><span className="auth-note-mark" />Your account is stored locally with the manager.</div><div className="auth-note"><span className="auth-note-mark" />You can add admins and viewers after setup.</div></div>
+      </div>
       <div className="auth-card">
         <div className="auth-heading">
           <span className="auth-kicker">PUMPKIN CONTROL PLANE</span>

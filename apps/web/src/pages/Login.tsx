@@ -23,6 +23,13 @@ export default function Login() {
 
   return (
     <section className="auth-page">
+      <div className="auth-aside" aria-hidden="true">
+        <div className="auth-brand"><span className="brand-mark">P</span><span>Pumpkin Manager</span></div>
+        <div className="eyebrow">Self-hosted control plane</div>
+        <h1>Your worlds, clearly under control.</h1>
+        <p>Operate Pumpkin servers with honest status, visible tasks, and safe recovery paths.</p>
+        <div className="auth-notes"><div className="auth-note"><span className="auth-note-mark" />Live readiness comes from a real Minecraft status response.</div><div className="auth-note"><span className="auth-note-mark" />Backups, config changes, and updates stay visible and deliberate.</div></div>
+      </div>
       <div className="auth-card">
         <div className="auth-heading">
           <span className="auth-kicker">PUMPKIN CONTROL PLANE</span>

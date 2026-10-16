@@ -7,11 +7,7 @@ import {
   fetchStatus,
   listServers,
 } from "../lib/servers";
-import type {
-  ReadinessInfo,
-  ServerSummary,
-  ServerTask,
-} from "../lib/servers";
+import type { ReadinessInfo, ServerSummary, ServerTask } from "../lib/servers";
 import { fetchAlerts } from "../lib/monitoring";
 import { AlertsList } from "./Monitoring";
 
@@ -27,323 +23,146 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function readinessBadgeClass(state: string): string {
+function readinessClass(state: string): string {
   if (state === "online") return "badge badge-ok";
   if (state === "unhealthy") return "badge badge-err";
   return "badge";
 }
 
-function ReadinessBadge({
-  readiness,
-  observed,
-}: {
-  readiness?: ReadinessInfo | null;
-  observed: string;
-}): React.JSX.Element {
+function shelfClass(state: string): string {
+  if (state === "online") return "server-row server-online";
+  if (state === "unhealthy") return "server-row server-error";
+  if (state === "starting" || state === "stopping") return "server-row server-warning";
+  return "server-row";
+}
+
+function ReadinessBadge({ readiness, observed }: { readiness?: ReadinessInfo | null; observed: string }): React.JSX.Element {
   if (readiness) {
-    return (
-      <span className={readinessBadgeClass(readiness.state)} title={readiness.reason}>
-        {readiness.state}: {readiness.reason}
-      </span>
-    );
+    return <span className={readinessClass(readiness.state)} title={readiness.reason}>{readiness.state}</span>;
   }
-  // Backend revisions before the readiness contract omit `readiness`;
-  // fall back to observed state text so the row still carries status.
-  return (
-    <span className="badge" title="Readiness not reported by backend">
-      observed:{observed} · readiness n/a
-    </span>
-  );
+  return <span className="badge" title="Readiness is not reported by this backend">{observed}</span>;
 }
 
-interface Alert {
-  level: "err" | "warn";
-  text: string;
-}
+type Alert = { level: "err" | "warn"; text: string };
 
-function buildAlerts(
-  servers: ServerSummary[],
-  statuses: Map<string, { dockerAvailable: boolean; containerMissing: boolean }>,
-  statusFailed: boolean,
-): Alert[] {
+function buildAlerts(servers: ServerSummary[], statuses: Map<string, { dockerAvailable: boolean; containerMissing: boolean }>, statusFailed: boolean): Alert[] {
   const alerts: Alert[] = [];
-  for (const s of servers) {
-    if (digestWarning(s.image_reference) !== null) {
-      alerts.push({
-        level: "warn",
-        text: `${s.name}: unpinned image (no @sha256:) — tag may drift between pulls.`,
-      });
+  for (const server of servers) {
+    if (digestWarning(server.image_reference) !== null) {
+      alerts.push({ level: "warn", text: `${server.name} uses an unpinned image reference.` });
     }
-    if (s.desired_state !== s.observed_state) {
-      alerts.push({
-        level: "warn",
-        text: `${s.name}: desired≠observed drift (desired:${s.desired_state} observed:${s.observed_state}).`,
-      });
+    if (server.desired_state !== server.observed_state) {
+      alerts.push({ level: "warn", text: `${server.name} has desired/observed state drift.` });
     }
-    const st = statuses.get(s.id);
-    if (st) {
-      if (!st.dockerAvailable) {
-        alerts.push({ level: "err", text: `${s.name}: docker unavailable.` });
-      }
-      if (st.containerMissing) {
-        alerts.push({ level: "err", text: `${s.name}: missing container.` });
-      }
-    }
+    const status = statuses.get(server.id);
+    if (status?.dockerAvailable === false) alerts.push({ level: "err", text: `${server.name} cannot reach Docker.` });
+    if (status?.containerMissing) alerts.push({ level: "err", text: `${server.name} is missing its container.` });
   }
-  if (statusFailed && servers.length > 0) {
-    alerts.push({
-      level: "warn",
-      text: "Some status probes failed; docker/container alerts may be incomplete.",
-    });
-  }
+  if (statusFailed && servers.length > 0) alerts.push({ level: "warn", text: "Some live status checks failed." });
   return alerts;
 }
 
-export default function Overview() {
+export default function Overview(): React.JSX.Element {
   const serversQuery = useQuery({ queryKey: ["servers"], queryFn: listServers });
-  const metricsQuery = useQuery({
-    queryKey: ["metrics", "summary"],
-    queryFn: fetchMetricsSummary,
-    retry: 1,
-  });
-  const backendAlertsQuery = useQuery({
-    queryKey: ["alerts"],
-    queryFn: fetchAlerts,
-    retry: 1,
-  });
-
+  const metricsQuery = useQuery({ queryKey: ["metrics", "summary"], queryFn: fetchMetricsSummary, retry: 1 });
+  const backendAlertsQuery = useQuery({ queryKey: ["alerts"], queryFn: fetchAlerts, retry: 1 });
   const servers = serversQuery.data?.servers ?? [];
 
   const statusQueries = useQueries({
-    queries: servers.map((s) => ({
-      queryKey: ["servers", s.id, "status"],
-      queryFn: () => fetchStatus(s.id),
+    queries: servers.map((server) => ({
+      queryKey: ["servers", server.id, "status"],
+      queryFn: () => fetchStatus(server.id),
       retry: 1,
       staleTime: 10_000,
     })),
   });
-
   const recentTaskQueries = useQueries({
-    queries: servers.map((s) => ({
-      queryKey: ["servers", s.id, "tasks", "recent"],
-      queryFn: () => fetchServerTasks(s.id, 3, 0),
+    queries: servers.map((server) => ({
+      queryKey: ["servers", server.id, "tasks", "recent"],
+      queryFn: () => fetchServerTasks(server.id, 3, 0),
       retry: 1,
       staleTime: 10_000,
     })),
   });
 
-  const desiredRunning = servers.filter((s) => s.desired_state === "running").length;
-  const observedRunning = servers.filter((s) => s.observed_state === "running").length;
-  const drifted = servers.filter((s) => s.desired_state !== s.observed_state).length;
-
-  const statusById = new Map<
-    string,
-    { dockerAvailable: boolean; containerMissing: boolean }
-  >();
-  servers.forEach((s, i) => {
-    const data = statusQueries[i]?.data;
-    if (data) {
-      statusById.set(s.id, {
-        dockerAvailable: data.docker_available,
-        containerMissing: data.container === null || data.observed_state === "missing",
-      });
-    }
+  const statusById = new Map<string, { dockerAvailable: boolean; containerMissing: boolean }>();
+  servers.forEach((server, index) => {
+    const status = statusQueries[index]?.data;
+    if (status) statusById.set(server.id, { dockerAvailable: status.docker_available, containerMissing: status.container === null || status.observed_state === "missing" });
   });
-  const statusFailed = statusQueries.some((q) => q.isError);
-  const statusLoading = statusQueries.some((q) => q.isLoading);
-  const alerts = buildAlerts(servers, statusById, statusFailed);
-
-  const recentActivity: { serverName: string; task: ServerTask }[] = [];
-  servers.forEach((s, i) => {
-    const tasks = recentTaskQueries[i]?.data?.tasks ?? [];
-    for (const task of tasks) recentActivity.push({ serverName: s.name, task });
+  const alerts = buildAlerts(servers, statusById, statusQueries.some((query) => query.isError));
+  const desiredRunning = servers.filter((server) => server.desired_state === "running").length;
+  const observedRunning = servers.filter((server) => server.observed_state === "running").length;
+  const drifted = servers.filter((server) => server.desired_state !== server.observed_state).length;
+  const recentActivity: Array<{ serverName: string; task: ServerTask }> = [];
+  servers.forEach((server, index) => {
+    for (const task of recentTaskQueries[index]?.data?.tasks ?? []) recentActivity.push({ serverName: server.name, task });
   });
-  const tasksLoading = recentTaskQueries.some((q) => q.isLoading);
-  const tasksFailed = recentTaskQueries.filter((q) => q.isError).length;
 
   return (
     <section>
-      <h2>Overview</h2>
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">Workspace overview</div>
+          <h2>Keep your worlds in view.</h2>
+          <p>A clear read on server health, host capacity, and the work happening across your control plane.</p>
+        </div>
+        <div className="heading-actions"><Link to="/servers"><button type="button">Create server</button></Link></div>
+      </div>
 
-      {serversQuery.isLoading && <p>Loading servers…</p>}
-      {serversQuery.error && <p className="err">Failed to load servers.</p>}
+      {serversQuery.isLoading && <div className="panel"><p className="muted">Loading your servers…</p></div>}
+      {serversQuery.error && <div className="panel"><p className="err" role="alert">Failed to load servers. Refresh to try again.</p></div>}
+
       {!serversQuery.isLoading && !serversQuery.error && servers.length === 0 && (
-        <p className="muted">
-          No servers yet. <Link to="/servers">Create one</Link> to get started.
-        </p>
+        <div className="empty-state">
+          <h3>Your workspace is ready.</h3>
+          <p>Create the first Pumpkin server to start monitoring worlds, logs, backups, and player activity from here.</p>
+          <Link to="/servers"><button type="button">Create your first server</button></Link>
+        </div>
       )}
 
-      {!serversQuery.isLoading && !serversQuery.error && servers.length > 0 && (
+      {servers.length > 0 && (
         <>
-          <div className="cards" aria-label="Server state counts">
-            <div className="card">
-              <div className="card-num">{servers.length}</div>
-              <div className="muted">servers total</div>
+          <div className="metric-grid" aria-label="Server summary">
+            <div className="metric-card"><div className="card-num">{servers.length}</div><div className="metric-label">Servers</div><div className="metric-detail">Across this workspace</div></div>
+            <div className="metric-card"><div className="card-num">{observedRunning}</div><div className="metric-label">Running now</div><div className="metric-detail">{desiredRunning} desired running</div></div>
+            <div className="metric-card"><div className="card-num">{drifted}</div><div className="metric-label">Needs attention</div><div className="metric-detail">Desired/observed drift</div></div>
+            <div className="metric-card"><div className="card-num">{alerts.length}</div><div className="metric-label">Open alerts</div><div className="metric-detail">Across servers and host</div></div>
+          </div>
+
+          <div className="overview-grid">
+            <div className="panel attention-panel">
+              <h3>Attention</h3>
+              {alerts.length === 0 ? <div className="attention-empty"><strong>All clear</strong><span>No server issues require action.</span></div> : <ul className="attention-list">{alerts.slice(0, 5).map((alert, index) => <li key={`${alert.text}-${index}`} className={alert.level}><span>{alert.text}</span><Link to="/monitoring">Open monitoring</Link></li>)}</ul>}
             </div>
-            <div className="card">
-              <div className="card-num">{desiredRunning}</div>
-              <div className="muted">desired running</div>
-            </div>
-            <div className="card">
-              <div className="card-num">{observedRunning}</div>
-              <div className="muted">observed running</div>
-            </div>
-            <div className="card">
-              <div className="card-num">{drifted}</div>
-              <div className="muted">desired≠observed drift</div>
+            <div className="server-shelf">
+              <div className="server-shelf-header"><strong>Server shelf</strong><span>{servers.length} registered</span></div>
+              {servers.map((server, index) => {
+                const status = statusQueries[index]?.data;
+                const metric = metricsQuery.data?.servers.find((item) => item.server_id === server.id);
+                const readiness = status?.readiness;
+                return <div className={shelfClass(readiness?.state ?? server.observed_state)} key={server.id}>
+                  <div><Link className="server-name" to={`/servers/${encodeURIComponent(server.id)}`}>{server.name}</Link><div className="server-meta">Port {server.game_port} · desired {server.desired_state}</div></div>
+                  <div className="server-state">{statusQueries[index]?.isLoading ? <span className="muted">Checking…</span> : <ReadinessBadge readiness={readiness} observed={server.observed_state} />}</div>
+                  <div className="server-stat"><strong>{readiness?.ping ? `${readiness.ping.players_online}/${readiness.ping.players_max}` : "—"}</strong><small>players</small></div>
+                  <Link className="section-link" to={`/servers/${encodeURIComponent(server.id)}`}>Open</Link>
+                  {metric && <span className="sr-only">CPU {metric.cpu_percent === null ? "unavailable" : `${metric.cpu_percent.toFixed(1)} percent`}</span>}
+                </div>;
+              })}
             </div>
           </div>
 
-          <h3>Host</h3>
-          {metricsQuery.isLoading && <p>Loading host stats…</p>}
-          {metricsQuery.error && (
-            <p className="err">Failed to load host stats.</p>
-          )}
-          {metricsQuery.data && (
-            <div className="cards" aria-label="Host stats">
-              <div className="card">
-                <div className="card-num">
-                  {metricsQuery.data.host.cpu_percent.toFixed(1)}%
-                </div>
-                <div className="muted">host CPU</div>
-              </div>
-              <div className="card">
-                <div className="card-num">
-                  {formatBytes(metricsQuery.data.host.memory_used_bytes)} /{" "}
-                  {formatBytes(metricsQuery.data.host.memory_total_bytes)}
-                </div>
-                <div className="muted">memory used / total</div>
-              </div>
-              <div className="card">
-                <div className="card-num">
-                  {formatBytes(metricsQuery.data.host.disk_free_bytes)} free
-                </div>
-                <div className="muted">
-                  of {formatBytes(metricsQuery.data.host.disk_total_bytes)} disk
-                </div>
-              </div>
-            </div>
-          )}
+          {metricsQuery.data && <><div className="section-heading"><h3>Host capacity</h3><Link className="section-link" to="/monitoring">View monitoring</Link></div><div className="host-summary"><div className="card"><div className="card-num">{metricsQuery.data.host.cpu_percent.toFixed(1)}%</div><div className="muted">Host CPU</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.memory_used_bytes)}</div><div className="muted">Memory used of {formatBytes(metricsQuery.data.host.memory_total_bytes)}</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.disk_free_bytes)}</div><div className="muted">Disk available</div></div></div></>}
 
-          <h3>Servers</h3>
-          {statusLoading && servers.length > 0 && (
-            <p className="muted">Loading live status…</p>
-          )}
-          <table className="table">
-            <thead>
-              <tr>
-                <th scope="col">Name</th>
-                <th scope="col">Readiness</th>
-                <th scope="col">Desired</th>
-                <th scope="col">Observed</th>
-                <th scope="col">CPU</th>
-                <th scope="col">Memory</th>
-              </tr>
-            </thead>
-            <tbody>
-              {servers.map((s, i) => {
-                const st = statusQueries[i]?.data;
-                const metric = metricsQuery.data?.servers.find(
-                  (m) => m.server_id === s.id,
-                );
-                return (
-                  <tr key={s.id}>
-                    <td>
-                      <Link to={`/servers/${encodeURIComponent(s.id)}`}>
-                        {s.name}
-                      </Link>
-                    </td>
-                    <td>
-                      {statusQueries[i]?.isLoading && (
-                        <span className="muted">checking…</span>
-                      )}
-                      {statusQueries[i]?.error && (
-                        <span className="err">status failed</span>
-                      )}
-                      {st && (
-                        <ReadinessBadge
-                          readiness={st.readiness}
-                          observed={st.observed_state}
-                        />
-                      )}
-                    </td>
-                    <td>
-                      <span className="badge">{s.desired_state}</span>
-                    </td>
-                    <td>
-                      <span className="badge">{s.observed_state}</span>
-                    </td>
-                    <td>
-                      {metric?.cpu_percent === null ||
-                      metric?.cpu_percent === undefined
-                        ? "n/a"
-                        : `${metric.cpu_percent.toFixed(1)}%`}
-                    </td>
-                    <td>
-                      {metric?.memory_bytes === null ||
-                      metric?.memory_bytes === undefined
-                        ? "n/a"
-                        : formatBytes(metric.memory_bytes)}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <div className="section-heading"><h3>Recent activity</h3><Link className="section-link" to="/monitoring">All monitoring</Link></div>
+          {recentTaskQueries.some((query) => query.isLoading) && <div className="panel"><p className="muted">Loading recent activity…</p></div>}
+          {!recentTaskQueries.some((query) => query.isLoading) && recentActivity.length === 0 && <div className="panel"><p className="muted">No tasks have run recently.</p></div>}
+          {recentActivity.length > 0 && <ul className="activity-list">{recentActivity.slice(0, 8).map(({ serverName, task }) => <li key={task.id}><span className="badge">{task.state}</span><span className="activity-kind">{task.kind}</span><strong>{serverName}</strong><span className="muted">{task.progress_percent !== null && task.progress_percent !== undefined ? `${task.progress_percent}% ` : ""}{task.message ?? task.error ?? ""}</span></li>)}</ul>}
 
-          <h3>Alerts</h3>
-          {alerts.length === 0 && (
-            <p className="muted">No alerts. All servers look healthy.</p>
-          )}
-          {alerts.length > 0 && (
-            <ul>
-              {alerts.map((a, i) => (
-                <li key={i} className={a.level === "err" ? "err" : "warn"}>
-                  {a.text}
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <h3>Monitoring alerts</h3>
-          {backendAlertsQuery.isLoading && <p>Loading monitoring alerts…</p>}
-          {backendAlertsQuery.error && (
-            <p className="err">Failed to load monitoring alerts.</p>
-          )}
-          {backendAlertsQuery.data && (
-            <AlertsList alerts={backendAlertsQuery.data.alerts} />
-          )}
-          <p className="muted">
-            <Link to="/monitoring">Open monitoring →</Link>
-          </p>
-
-          <h3>Recent activity</h3>
-          {tasksLoading && <p>Loading recent tasks…</p>}
-          {!tasksLoading && tasksFailed > 0 && (
-            <p className="err">
-              Failed to load tasks for {tasksFailed} server
-              {tasksFailed === 1 ? "" : "s"}.
-            </p>
-          )}
-          {!tasksLoading && tasksFailed === 0 && recentActivity.length === 0 && (
-            <p className="muted">No recent tasks.</p>
-          )}
-          {recentActivity.length > 0 && (
-            <ul>
-              {recentActivity.map(({ serverName, task }) => (
-                <li key={task.id}>
-                  <span className="badge">{task.state}</span>{" "}
-                  <span className="muted">{task.kind}</span> {serverName}{" "}
-                  <span className="muted">
-                    {task.progress_percent !== null &&
-                      `${task.progress_percent}% `}
-                    {task.message ?? ""}
-                    {task.error ? ` — ${task.error}` : ""}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <div className="section-heading"><h3>Monitoring alerts</h3><Link className="section-link" to="/monitoring">Open monitoring</Link></div>
+          {backendAlertsQuery.isLoading && <div className="panel"><p className="muted">Loading monitoring alerts…</p></div>}
+          {backendAlertsQuery.error && <div className="panel"><p className="err">Failed to load monitoring alerts.</p></div>}
+          {backendAlertsQuery.data && <div className="panel"><AlertsList alerts={backendAlertsQuery.data.alerts} /></div>}
         </>
       )}
     </section>
