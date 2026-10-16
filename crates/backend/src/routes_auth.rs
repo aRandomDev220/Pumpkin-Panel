@@ -130,10 +130,7 @@ pub async fn setup(
     // Rate-limit first: junk payloads must consume a token too.
     if let Err(retry) = check_rate_limit(
         &app,
-        &[
-            client_key(&headers, peer.as_ref()),
-            user_key("setup", &body.username),
-        ],
+        &[client_key(peer.as_ref()), user_key("setup", &body.username)],
     ) {
         return rate_limited(retry);
     }
@@ -227,10 +224,7 @@ pub async fn login(
     // Rate-limit first: junk payloads must consume a token too.
     if let Err(retry) = check_rate_limit(
         &app,
-        &[
-            client_key(&headers, peer.as_ref()),
-            user_key("login", &body.username),
-        ],
+        &[client_key(peer.as_ref()), user_key("login", &body.username)],
     ) {
         return rate_limited(retry);
     }
@@ -531,19 +525,12 @@ fn origin_authority(url: &str) -> Option<&str> {
     (!authority.is_empty()).then_some(authority)
 }
 
-/// Rate-limit key for the calling client: first `X-Forwarded-For` hop, else the
-/// peer address, else a shared "global" bucket. Bounded in length so a
-/// header-flood cannot mint unbounded keys.
-fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
-    if let Some(hop) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|xff| xff.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return format!("ip:{}", truncate_key(hop));
-    }
+/// Rate-limit key for the calling client. Only the transport peer is trusted;
+/// accepting a client-supplied `X-Forwarded-For` here would let an attacker
+/// mint a new bucket for every login attempt. When the manager sits behind a
+/// proxy without a trusted-proxy configuration, all forwarded requests share
+/// the fallback bucket rather than bypassing the limiter.
+fn client_key(peer: Option<&SocketAddr>) -> String {
     match peer {
         Some(addr) => format!("ip:{addr}"),
         None => "ip:global".to_string(),
@@ -556,10 +543,6 @@ fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
 fn user_key(endpoint: &str, username: &str) -> String {
     let bounded: String = username.trim().chars().take(MAX_USERNAME_LEN).collect();
     format!("{endpoint}:user:{}", bounded.to_lowercase())
-}
-
-fn truncate_key(value: &str) -> String {
-    value.chars().take(64).collect()
 }
 
 /// Consume one token for each key. Returns `Err(retry_after_secs)` if any key

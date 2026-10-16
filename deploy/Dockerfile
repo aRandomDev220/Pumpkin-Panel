@@ -4,7 +4,9 @@
 FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS webbuild
 WORKDIR /web
 COPY apps/web/package.json apps/web/package-lock.json ./
-RUN npm ci
+# Vite's lightningcss binary is an optional musl-specific dependency. Explicitly
+# include optional packages so npm does not prune the Alpine native binding.
+RUN npm ci --include=optional
 COPY apps/web/ ./
 RUN npm run build
 
