@@ -27,6 +27,12 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # The root-side entrypoint needs these capabilities to initialize a fresh
+    # named /data volume and drop to the unprivileged app user.
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
 
   # Pumpkins are NOT statically listed here in production — the manager
   # creates one container per server via the Docker API (see README).
