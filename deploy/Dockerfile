@@ -13,7 +13,11 @@ RUN npm run build
 FROM rust:1.90-alpine@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS apibuild
 RUN apk add --no-cache musl-dev sqlite-dev pkgconfig
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
+# The builder image is itself pinned to Rust 1.90 above. Do not copy the
+# workspace rust-toolchain.toml here: that file pins the local development
+# toolchain and would make rustup download a second toolchain (and components)
+# inside this Alpine build, where it can appear to hang for a long time.
+COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
 COPY migrations/ ./migrations/
 RUN cargo build --release -p pumpkin-manager-backend
