@@ -322,9 +322,11 @@ async fn container_for_server(
 
 /// Execute a single task to a terminal state.
 ///
-/// Handles runtime ops (`start`/`stop`/`restart`/`remove`); anything else is
-/// failed with `UNKNOWN_TASK_TYPE` so new task kinds fail loudly instead of
-/// silently no-opping. (The backup workstream extends this match.)
+/// Handles runtime ops (`start`/`stop`/`restart`/`remove`) and Phase 7 image
+/// ops (`update`/`rollback`, dispatched to `update_service` executors);
+/// anything else is failed with `UNKNOWN_TASK_TYPE` so new task kinds fail
+/// loudly instead of silently no-opping. (The backup workstream extends this
+/// match.)
 ///
 /// Generic over [`RuntimeAdapter`] so cancellation paths are unit-testable
 /// without a daemon.
@@ -435,6 +437,12 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
                     fail_task(pool, task_id, e.code(), &e.to_string()).await?;
                 }
             }
+        }
+        "update" => {
+            crate::update_service::execute_update(pool, adapter, task_id).await?;
+        }
+        "rollback" => {
+            crate::update_service::execute_rollback(pool, adapter, task_id).await?;
         }
         other => {
             warn!(task_id, task_type = other, "no worker for task type");

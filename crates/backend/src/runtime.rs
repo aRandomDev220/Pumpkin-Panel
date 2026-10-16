@@ -522,6 +522,19 @@ pub trait RuntimeAdapter: Send + Sync {
         &self,
         container_id: &str,
     ) -> impl Future<Output = Result<RuntimeStats, RuntimeError>> + Send;
+    /// Pull an image reference from the registry (Phase 7 updates).
+    ///
+    /// Default body reports unsupported so non-Docker backends (test fakes)
+    /// keep compiling; [`DockerAdapter`] overrides it with a real
+    /// `create_image` drain.
+    fn pull_image(&self, reference: &str) -> impl Future<Output = Result<(), RuntimeError>> + Send {
+        let reference = reference.to_string();
+        async move {
+            Err(RuntimeError::InvalidConfiguration(format!(
+                "image pull not supported for reference '{reference}'"
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +810,41 @@ impl RuntimeAdapter for DockerAdapter {
                 out.push(String::from_utf8_lossy(&bytes).into_owned());
             }
             Ok(out)
+        }
+    }
+
+    fn pull_image(&self, reference: &str) -> impl Future<Output = Result<(), RuntimeError>> + Send {
+        let docker = self.docker.clone();
+        let reference = reference.to_string();
+        async move {
+            use bollard::image::CreateImageOptions;
+            use futures_util::TryStreamExt;
+
+            // Split `name[:tag]` explicitly: an empty `tag` query param
+            // makes the daemon pull every tag, so never send one when the
+            // tag is known. Digest references (`name@sha256:…`) travel whole
+            // in `from_image`.
+            let (from_image, tag) = match reference.split_once('@') {
+                Some(_) => (reference.as_str(), ""),
+                None => match reference.rsplit_once(':') {
+                    Some((name, tag)) if !tag.contains('/') => (name, tag),
+                    _ => (reference.as_str(), ""),
+                },
+            };
+            let options = CreateImageOptions {
+                from_image,
+                tag,
+                ..Default::default()
+            };
+            let mut stream = docker.create_image(Some(options), None, None);
+            while stream
+                .try_next()
+                .await
+                .map_err(RuntimeError::from_bollard)?
+                .is_some()
+            {}
+            info!(%reference, "pulled image");
+            Ok(())
         }
     }
 
@@ -1324,5 +1372,19 @@ mod tests {
             SpecError::UnusableServerRoot("rel".into()).code(),
             "CAPABILITY_UNAVAILABLE"
         );
+    }
+
+    #[tokio::test]
+    async fn pull_image_without_daemon_errors() {
+        // No daemon needed: pulling with no daemon listening must fail,
+        // never report success. (Client constructors perform no I/O.)
+        let docker =
+            bollard::Docker::connect_with_http_defaults().expect("client builds without I/O");
+        let adapter = DockerAdapter::with_docker(docker);
+        let err = adapter
+            .pull_image("ghcr.io/pumpkin-mc/pumpkin:master")
+            .await
+            .expect_err("pull without a daemon must fail");
+        assert_eq!(err.code(), "DOCKER_API_ERROR");
     }
 }
