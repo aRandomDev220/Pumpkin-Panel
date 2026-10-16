@@ -164,15 +164,7 @@ pumpkin-manager/
 
 ---
 
-## Roadmap
-
-Phases 1–7 are complete, and the Phase 8 release-candidate work is documented and verified:
-security review, release evidence, documentation, and checksummed source artifacts.
-Before publishing, run the documented upgrade test against the previous published release,
-then create the Git tag and GitHub release for `0.1.0`.
-
 ## License
 
-No license file has been published yet — by default all rights are reserved to the
-contributors. If you plan to fork or redistribute, open an issue first so a license
-(GPL-3.0 to match Pumpkin, or alternatives) can be chosen explicitly.
+This project is licensed under the **GNU Affero General Public License v3.0 or later**.
+See [`LICENSE`](LICENSE) for the full license text.
