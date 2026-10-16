@@ -400,6 +400,9 @@ pub struct RuntimeSnapshot {
     pub exit_code: Option<i64>,
     /// Healthcheck status (`none`, `starting`, `healthy`, `unhealthy`), if any.
     pub health: Option<String>,
+    /// Daemon-reported restart count (`-1` when the daemon does not
+    /// report one — never `0`-as-unknown).
+    pub restart_count: i64,
 }
 
 /// Resource usage sample from `stats` (one-shot). Consumed by the
@@ -754,6 +757,7 @@ impl RuntimeAdapter for DockerAdapter {
                     .and_then(|s| s.health.as_ref())
                     .and_then(|h| h.status.as_ref())
                     .map(ToString::to_string),
+                restart_count: info.restart_count.unwrap_or(-1),
             })
         }
     }
