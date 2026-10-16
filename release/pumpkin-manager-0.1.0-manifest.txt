@@ -1,6 +1,6 @@
 Pumpkin Manager 0.1.0 release-candidate manifest
 
-Source commit: 0ed0f4bd0e8329eb0fabb0578ab456a5c7c7fc06
+Source commit: 025ec534f79907076459d4b67a9b691706deb655
 Database migrations: 0001 through 0009
 Docker image tag: pumpkin-manager:phase8
 Docker image manifest digest: sha256:ea945857573625a141ee69432cf05832c5fc27c194b8c268af8af6cae137238a
