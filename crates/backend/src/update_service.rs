@@ -19,17 +19,20 @@
 //!   data-format one-way warning so it is present even before the worker
 //!   runs; every terminal rollback message carries it too.
 //! * Worker steps (inside `update` execution): worker-side op-lock → disk
-//!   preflight (free ≥ 2× data dir size) → mandatory protected auto-backup
-//!   (same outcome as the backup workstream: `full`/`stopped`/protected row
-//!   with a checksummed, re-verified archive — implemented here because the
-//!   backup capture internals are private to `routes_backup` and
-//!   `enqueue_backup` self-conflicts with the running update task) → pull in
-//!   the worker → stop → remove → persist `previous_image_*` FIRST, then swap
+//!   preflight (free ≥ 2× data dir size, measured on the configured backup
+//!   filesystem) → mandatory protected auto-backup via the canonical
+//!   [`routes_backup::run_backup_capture`] (same code path as
+//!   `enqueue_backup`: `full`/`live`/protected row, reason `pre-update`,
+//!   same checksum/verify semantics; the backup dir is resolved from
+//!   `Settings::backup_dir`, never from `data_path`) → pull in the worker →
+//!   stop → remove → persist `previous_image_*` FIRST, then swap
 //!   `image_reference/digest` → create with the NEW image → start → readiness
 //!   (container `running` + 20s Java-ping window). Success KEEPS the previous
 //!   reference (only the next update overwrites it). On ANY failure after the
 //!   remove, the worker recreates + starts with the previous image and the
-//!   task message states whether that rollback succeeded.
+//!   task message states whether that rollback succeeded. Missing
+//!   `0007_update` columns fail loudly (`UPDATE_PRECONDITION`) instead of
+//!   silently dropping the rollback target.
 //!
 //! Handlers ([`preview_image_update`], [`update_server`], [`rollback_server`])
 //! are standalone `pub async fn` taking `State<AppState>`; route wiring and
@@ -59,7 +62,9 @@ use uuid::Uuid;
 use crate::{
     audit,
     auth::AuthUser,
-    config_profile, file_service, readiness,
+    config::Settings,
+    config_profile, readiness,
+    routes_backup::{self, BackupError},
     runtime::{
         DockerAdapter, RuntimeAdapter, RuntimeError, ValidatedServerSpec, IMAGE_ALLOWLIST_PREFIX,
     },
@@ -112,6 +117,10 @@ pub enum UpdateError {
     /// Another task is queued/running, or the op lock is held.
     #[error("another operation is in flight for this server")]
     ServerBusy,
+    /// Required schema/table state is missing (e.g. `0007_update` columns).
+    /// Fails loudly so an update can never silently drop its rollback target.
+    #[error("update precondition failed: {0}")]
+    Precondition(String),
     /// Task bookkeeping failure.
     #[error("task error: {0}")]
     Task(String),
@@ -139,6 +148,7 @@ impl UpdateError {
             Self::NoBackup => "UPDATE_NO_BACKUP",
             Self::NoRollbackTarget => "NO_ROLLBACK_TARGET",
             Self::ServerBusy => "SERVER_BUSY",
+            Self::Precondition(_) => "UPDATE_PRECONDITION",
             Self::Task(_) | Self::Db(_) => "INTERNAL",
         }
     }
@@ -150,7 +160,9 @@ impl UpdateError {
             Self::ServerNotFound => StatusCode::NOT_FOUND,
             Self::InvalidImage(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NoBackup | Self::NoRollbackTarget | Self::ServerBusy => StatusCode::CONFLICT,
-            Self::Task(_) | Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Precondition(_) | Self::Task(_) | Self::Db(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 }
@@ -174,8 +186,8 @@ fn update_error(e: UpdateError) -> Response {
 // Rows + small queries
 // ---------------------------------------------------------------------------
 
-/// Server columns the update worker needs. `previous_image_*` default to ""
-/// when the `0007_update` columns are absent (pre-migration test schemas).
+/// Server columns the update worker needs. A missing `0007_update` migration
+/// is a loud [`UpdateError::Precondition`], never a silent fallback.
 struct ServerRow {
     id: String,
     name: String,
@@ -191,23 +203,26 @@ struct ServerRow {
     desired_state: String,
 }
 
-async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerRow>, sqlx::Error> {
+async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerRow>, UpdateError> {
     use sqlx::Row;
     const FULL: &str = "SELECT id, name, slug, image_reference, image_digest, \
         previous_image_reference, previous_image_digest, container_id, data_path, \
         game_port, bind_address, desired_state \
         FROM servers WHERE id = ? AND deleted_at IS NULL";
-    const LEGACY: &str = "SELECT id, name, slug, image_reference, image_digest, \
-        container_id, data_path, game_port, bind_address, desired_state \
-        FROM servers WHERE id = ? AND deleted_at IS NULL";
-    let (row, legacy) = match sqlx::query(FULL).bind(id).fetch_optional(pool).await {
-        Ok(r) => (r, false),
-        Err(e) if e.to_string().contains("no such column") => (
-            sqlx::query(LEGACY).bind(id).fetch_optional(pool).await?,
-            true,
-        ),
-        Err(e) => return Err(e),
-    };
+    let row = sqlx::query(FULL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("no such column") {
+                UpdateError::Precondition(
+                    "servers table is missing previous_image_* columns (0007_update not applied)"
+                        .to_string(),
+                )
+            } else {
+                UpdateError::Db(e)
+            }
+        })?;
     row.map(|r| {
         Ok::<_, sqlx::Error>(ServerRow {
             id: r.try_get("id")?,
@@ -215,16 +230,8 @@ async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerRow>, 
             slug: r.try_get("slug")?,
             image_reference: r.try_get("image_reference")?,
             image_digest: r.try_get("image_digest")?,
-            previous_image_reference: if legacy {
-                String::new()
-            } else {
-                r.try_get("previous_image_reference").unwrap_or_default()
-            },
-            previous_image_digest: if legacy {
-                String::new()
-            } else {
-                r.try_get("previous_image_digest").unwrap_or_default()
-            },
+            previous_image_reference: r.try_get("previous_image_reference")?,
+            previous_image_digest: r.try_get("previous_image_digest")?,
             container_id: r.try_get("container_id")?,
             data_path: r.try_get("data_path")?,
             game_port: r.try_get("game_port")?,
@@ -233,6 +240,7 @@ async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerRow>, 
         })
     })
     .transpose()
+    .map_err(UpdateError::Db)
 }
 
 /// `(memory_limit_bytes, cpu_limit)` from `server_settings`, else defaults.
@@ -277,8 +285,9 @@ async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
         > 0
 }
 
-/// Persist previous + current image refs. Falls back to current-only when the
-/// `0007_update` columns are absent.
+/// Persist previous + current image refs in one UPDATE. A missing
+/// `0007_update` migration fails loudly instead of silently dropping the
+/// rollback target.
 async fn swap_images(
     pool: &SqlitePool,
     id: &str,
@@ -286,8 +295,8 @@ async fn swap_images(
     prev_digest: &str,
     cur_ref: &str,
     cur_digest: &str,
-) {
-    let full = sqlx::query(
+) -> Result<(), UpdateError> {
+    sqlx::query(
         "UPDATE servers SET previous_image_reference = ?, previous_image_digest = ?,
                 image_reference = ?, image_digest = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
@@ -298,20 +307,18 @@ async fn swap_images(
     .bind(cur_digest)
     .bind(id)
     .execute(pool)
-    .await;
-    if let Err(e) = full {
+    .await
+    .map_err(|e| {
         if e.to_string().contains("no such column") {
-            let _ = sqlx::query(
-                "UPDATE servers SET image_reference = ?, image_digest = ?,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            UpdateError::Precondition(
+                "servers table is missing previous_image_* columns (0007_update not applied)"
+                    .to_string(),
             )
-            .bind(cur_ref)
-            .bind(cur_digest)
-            .bind(id)
-            .execute(pool)
-            .await;
+        } else {
+            UpdateError::Db(e)
         }
-    }
+    })?;
+    Ok(())
 }
 
 async fn set_container(pool: &SqlitePool, id: &str, container_id: &str) {
@@ -433,30 +440,15 @@ fn free_bytes_for(path: &Path) -> Option<u64> {
     best.map(|(_, free)| free)
 }
 
-/// Fully decode a tar.gz in memory, draining every regular file.
-fn verify_archive_bytes(data: &[u8]) -> Result<usize, String> {
-    use std::io::Read as _;
-    let decoder = flate2::read::GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive.entries().map_err(|e| e.to_string())?;
-    let mut count = 0usize;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        if entry.header().entry_type().is_file() {
-            let mut sink = Vec::new();
-            entry.read_to_end(&mut sink).map_err(|e| e.to_string())?;
-        }
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn parent_backup_dir(data_path: &str) -> Option<PathBuf> {
-    let parent = Path::new(data_path).parent()?;
-    if data_path.is_empty() {
-        return None;
-    }
-    Some(parent.join("backups"))
+/// Backup root, resolved EXACTLY the way `enqueue_backup` callers do:
+/// `Settings::load().backup_dir` (env `PUMPKIN_MANAGER_BACKUP_DIR` feeds
+/// `Settings`; default `/data/backups`). Never derived from `data_path`, so
+/// a customized backup dir, backup listing/GC, and the disk preflight all
+/// agree on one location.
+fn resolve_backup_dir() -> Result<PathBuf, String> {
+    Settings::load()
+        .map(|s| s.backup_dir)
+        .map_err(|e| format!("cannot load backup dir settings: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -750,62 +742,13 @@ async fn wait_ready<A: RuntimeAdapter>(
     }
 }
 
-/// Mandatory protected auto-backup inside the update worker: a `full`/
-/// `stopped`/protected row plus a checksummed, re-verified archive.
-async fn run_pre_update_backup(
-    pool: &SqlitePool,
-    backup_root: &Path,
-    backup_id: &str,
-    server: &ServerRow,
-    actor: Option<&str>,
-) -> Result<(), String> {
-    tokio::fs::create_dir_all(backup_root)
-        .await
-        .map_err(|e| format!("cannot create backup dir: {e}"))?;
-    let data_dir = PathBuf::from(&server.data_path);
-    let bytes = tokio::task::spawn_blocking(move || {
-        file_service::export_tar_gz(&data_dir, &[""]).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|_| "pre-update backup task failed".to_string())??;
-    let final_path = backup_root.join(format!("{backup_id}.tar.gz"));
-    tokio::fs::write(&final_path, &bytes)
-        .await
-        .map_err(|e| format!("cannot write pre-update backup: {e}"))?;
-    // Verify from disk: checksum + full archive re-list.
-    let data = tokio::fs::read(&final_path)
-        .await
-        .map_err(|e| format!("cannot read back pre-update backup: {e}"))?;
-    use sha2::Digest as _;
-    let checksum = format!("{:x}", sha2::Sha256::digest(&data));
-    let size_bytes = data.len() as i64;
-    let entries = tokio::task::spawn_blocking(move || verify_archive_bytes(&data))
-        .await
-        .map_err(|_| "pre-update backup verify task failed".to_string())??;
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    sqlx::query(
-        "UPDATE backups SET state = 'completed', storage_path = ?, size_bytes = ?,
-                checksum_algorithm = 'sha256', checksum = ?, completed_at = ?
-          WHERE id = ?",
-    )
-    .bind(final_path.to_string_lossy().into_owned())
-    .bind(size_bytes)
-    .bind(&checksum)
-    .bind(&now)
-    .bind(backup_id)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    audit_update(
-        pool,
-        actor,
-        "update.pre_backup",
-        &server.id,
-        "ok",
-        serde_json::json!({ "backup_id": backup_id, "checksum": checksum, "entries": entries }),
-    )
-    .await;
-    Ok(())
+/// Map a canonical backup-capture failure onto an update task code.
+fn backup_task_code(e: &BackupError) -> &'static str {
+    match e {
+        BackupError::Cancelled => "TASK_CANCELLED",
+        BackupError::NoSpace => "UPDATE_NO_SPACE",
+        _ => "BACKUP_FAILED",
+    }
 }
 
 /// Recreate + start with the previous image after a post-remove failure.
@@ -888,7 +831,19 @@ async fn auto_rollback<A: RuntimeAdapter>(
     set_container(pool, server_id, &handle.container_id).await;
     // The container runs the previous image again: record previous=new so a
     // further rollback/manual retry still knows both sides.
-    swap_images(pool, server_id, new_ref, new_digest, prev_ref, prev_digest).await;
+    if let Err(e) = swap_images(pool, server_id, new_ref, new_digest, prev_ref, prev_digest).await {
+        terminal_fail(
+            pool,
+            task_id,
+            e.code(),
+            &format!(
+                "update to {new_ref} failed at {failed_stage}: {reason}; rolled back to {prev_ref} (container {}) but image refs could not be persisted: {e}. {DATA_FORMAT_WARNING}",
+                handle.container_id
+            ),
+        )
+        .await;
+        return;
+    }
     if should_start {
         if let Err(e) = adapter.start(&handle.container_id).await {
             let msg = format!(
@@ -956,13 +911,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
     let Some(server) = (match fetch_server(pool, server_id).await {
         Ok(s) => s,
         Err(e) => {
-            terminal_fail(
-                pool,
-                task_id,
-                "INTERNAL",
-                &format!("update failed: database error: {e}"),
-            )
-            .await;
+            terminal_fail(pool, task_id, e.code(), &format!("update failed: {e}")).await;
             return;
         }
     }) else {
@@ -1022,13 +971,25 @@ async fn execute_update_inner<A: RuntimeAdapter>(
     )
     .await;
 
-    // Preflight: free disk must hold ~2x the data dir.
+    // Preflight: free disk on the CONFIGURED backup filesystem must hold
+    // ~2x the data dir.
     let data_path = PathBuf::from(&server.data_path);
     let data_size = tokio::task::spawn_blocking(move || dir_size_bytes(&data_path))
         .await
         .unwrap_or(0);
-    let backup_root =
-        parent_backup_dir(&server.data_path).unwrap_or_else(|| PathBuf::from("backups"));
+    let backup_root = match resolve_backup_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            terminal_fail(
+                pool,
+                task_id,
+                "BACKUP_FAILED",
+                &format!("update failed: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
     if data_size > 0 {
         if let Some(free) = free_bytes_for(&backup_root) {
             if free < data_size.saturating_mul(2) {
@@ -1056,12 +1017,16 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         }
     }
 
-    // Mandatory protected auto-backup (reason: pre-update).
+    // Mandatory protected auto-backup (reason: pre-update) through the
+    // canonical backup capture — the same code path `enqueue_backup` runs
+    // (tar, staging, checksum, verify, row lifecycle, audits).
+    // `enqueue_backup` itself cannot run here: its `conflicting_task` gate
+    // would self-conflict with this running update task.
     let backup_id = Uuid::new_v4().to_string();
     if let Err(e) = sqlx::query(
         "INSERT INTO backups
             (id, server_id, type, state, consistency_method, protected, created_by)
-          VALUES (?, ?, 'full', 'in_progress', 'stopped', 1, ?)",
+          VALUES (?, ?, 'full', 'in_progress', 'live', 1, ?)",
     )
     .bind(&backup_id)
     .bind(server_id)
@@ -1084,32 +1049,82 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         "update.pre_backup",
         server_id,
         "started",
-        serde_json::json!({ "task_id": task_id, "backup_id": backup_id }),
+        serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "reason": "pre-update" }),
     )
     .await;
-    if let Err(e) = run_pre_update_backup(pool, &backup_root, &backup_id, &server, actor).await {
-        let _ = sqlx::query("UPDATE backups SET state = 'failed', error_summary = ? WHERE id = ?")
-            .bind(e.chars().take(500).collect::<String>())
-            .bind(&backup_id)
-            .execute(pool)
+    let backup_server = routes_backup::ServerRow {
+        id: server.id.clone(),
+        data_path: server.data_path.clone(),
+        container_id: server.container_id.clone(),
+        desired_state: server.desired_state.clone(),
+    };
+    match routes_backup::run_backup_capture(
+        pool,
+        None,
+        &backup_root,
+        &backup_id,
+        &backup_server,
+        "live",
+        task_id,
+        actor,
+    )
+    .await
+    {
+        Ok((outcome, _resume)) => {
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "ok",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "backup_id": backup_id,
+                    "reason": "pre-update",
+                    "size_bytes": outcome.size_bytes,
+                    "checksum": outcome.checksum,
+                }),
+            )
             .await;
-        terminal_fail(
-            pool,
-            task_id,
-            "BACKUP_FAILED",
-            &format!("update failed: pre-update backup failed, nothing was changed: {e}"),
-        )
-        .await;
-        audit_update(
-            pool,
-            actor,
-            "update.pre_backup",
-            server_id,
-            "failed",
-            serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "error": e }),
-        )
-        .await;
-        return;
+        }
+        Err(BackupError::Cancelled) => {
+            let _ = task_runner::mark_cancelled(pool, task_id).await;
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "cancelled",
+                serde_json::json!({ "task_id": task_id, "backup_id": backup_id }),
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            let _ =
+                sqlx::query("UPDATE backups SET state = 'failed', error_summary = ? WHERE id = ?")
+                    .bind(e.to_string().chars().take(500).collect::<String>())
+                    .bind(&backup_id)
+                    .execute(pool)
+                    .await;
+            terminal_fail(
+                pool,
+                task_id,
+                backup_task_code(&e),
+                &format!("update failed: pre-update backup failed, nothing was changed: {e}"),
+            )
+            .await;
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "failed",
+                serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "error": e.to_string() }),
+            )
+            .await;
+            return;
+        }
     }
 
     // Pull the target image in the worker.
@@ -1233,7 +1248,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
     // Persist previous FIRST, then swap to the target.
     let old_ref = server.image_reference.clone();
     let old_digest = server.image_digest.clone();
-    swap_images(
+    if let Err(e) = swap_images(
         pool,
         server_id,
         &old_ref,
@@ -1241,7 +1256,17 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         &target.image_reference,
         &target.image_digest,
     )
-    .await;
+    .await
+    {
+        terminal_fail(
+            pool,
+            task_id,
+            e.code(),
+            &format!("update failed: cannot persist image refs: {e}"),
+        )
+        .await;
+        return;
+    }
     set_container(pool, server_id, "").await;
     audit_update(
         pool,
@@ -1455,8 +1480,8 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
             terminal_fail(
                 pool,
                 task_id,
-                "INTERNAL",
-                &format!("rollback failed: database error: {e}. {DATA_FORMAT_WARNING}"),
+                e.code(),
+                &format!("rollback failed: {e}. {DATA_FORMAT_WARNING}"),
             )
             .await;
             return;
@@ -1602,7 +1627,7 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
         }
     };
     set_container(pool, server_id, &handle.container_id).await;
-    swap_images(
+    if let Err(e) = swap_images(
         pool,
         server_id,
         &cur_ref,
@@ -1610,7 +1635,11 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
         &prev_ref,
         &prev_digest,
     )
-    .await;
+    .await
+    {
+        terminal_fail(pool, task_id, e.code(), &format!("rollback to {prev_ref} recreated (container {}) but image refs could not be persisted: {e}. {DATA_FORMAT_WARNING}", handle.container_id)).await;
+        return;
+    }
     let should_start = was_running || server.desired_state == "running";
     if should_start {
         if let Err(e) = adapter.start(&handle.container_id).await {
@@ -2215,9 +2244,10 @@ mod tests {
         tokio::fs::write(data.join("level.dat"), b"fake world")
             .await
             .expect("seed file");
-        seed_server(&pool, "srv-1", 25565, data.to_string_lossy().as_ref()).await;
+        let _env = BackupDirEnv::set(&root.join("backups"));
+        seed_server(&pool, "srv-arm", 25565, data.to_string_lossy().as_ref()).await;
 
-        let task_id = enqueue_update(&pool, None, "srv-1", None, TARGET, None, true)
+        let task_id = enqueue_update(&pool, None, "srv-arm", None, TARGET, None, true)
             .await
             .expect("enqueue");
         // Through the real dispatch arms: the worker takes its protected
@@ -2233,7 +2263,7 @@ mod tests {
         assert_eq!(task.error_code.as_deref(), Some("IMAGE_PULL_FAILED"));
 
         // Nothing was swapped: current image untouched, no rollback target.
-        let server = fetch_server(&pool, "srv-1")
+        let server = fetch_server(&pool, "srv-arm")
             .await
             .expect("fetch")
             .expect("row");
@@ -2246,15 +2276,15 @@ mod tests {
     #[tokio::test]
     async fn rollback_failure_message_carries_warning() {
         let pool = test_pool().await;
-        seed_server(&pool, "srv-1", 25565, "/tmp/pumpkin-test-srv-1").await;
+        seed_server(&pool, "srv-rbfail", 25565, "/tmp/pumpkin-test-srv-1").await;
         sqlx::query(
             "UPDATE servers SET previous_image_reference = 'ghcr.io/pumpkin-mc/pumpkin:v1'
-              WHERE id = 'srv-1'",
+              WHERE id = 'srv-rbfail'",
         )
         .execute(&pool)
         .await
         .expect("seed previous");
-        let task_id = enqueue_rollback(&pool, None, "srv-1", None)
+        let task_id = enqueue_rollback(&pool, None, "srv-rbfail", None)
             .await
             .expect("enqueue");
         task_runner::dispatch_task(&pool, &NoDaemon, &task_id)
@@ -2270,5 +2300,258 @@ mod tests {
             "failed rollback message must carry the one-way warning, got: {}",
             task.message
         );
+    }
+
+    // --- fix round: canonical backup path, configured dir, loud preconditions ---
+
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets `PUMPKIN_MANAGER_BACKUP_DIR` for the test body; restores the env
+    /// on drop. Serializes env-sensitive tests process-wide.
+    struct BackupDirEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BackupDirEnv {
+        fn set(dir: &std::path::Path) -> Self {
+            let lock = ENV_GUARD.lock().expect("env guard");
+            std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", dir);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for BackupDirEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
+        }
+    }
+
+    /// Pre-migration schema: `servers` WITHOUT the `0007_update` columns.
+    async fn legacy_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        sqlx::query(
+            "CREATE TABLE servers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                slug TEXT NOT NULL UNIQUE,
+                image_reference TEXT NOT NULL DEFAULT '',
+                image_digest TEXT NOT NULL DEFAULT '',
+                container_id TEXT NOT NULL DEFAULT '',
+                data_path TEXT NOT NULL DEFAULT '',
+                game_port INTEGER NOT NULL UNIQUE,
+                bind_address TEXT NOT NULL DEFAULT '0.0.0.0',
+                desired_state TEXT NOT NULL DEFAULT 'stopped',
+                observed_state TEXT NOT NULL DEFAULT 'created',
+                deleted_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("servers table");
+        sqlx::query(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                server_id TEXT REFERENCES servers(id) ON DELETE CASCADE,
+                requested_by TEXT,
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (state IN ('queued','running','succeeded','failed','cancel_requested','cancelled')),
+                progress_percent INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                error_code TEXT,
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                started_at TEXT,
+                finished_at TEXT,
+                cancel_requested_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tasks table");
+        sqlx::query(
+            "CREATE TABLE backups (
+                id TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+                type TEXT NOT NULL DEFAULT 'full',
+                state TEXT NOT NULL DEFAULT 'in_progress'
+                    CHECK (state IN ('in_progress','completed','failed')),
+                storage_path TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                checksum_algorithm TEXT NOT NULL DEFAULT 'sha256',
+                checksum TEXT NOT NULL DEFAULT '',
+                consistency_method TEXT NOT NULL DEFAULT 'stopped',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                completed_at TEXT,
+                created_by TEXT,
+                error_summary TEXT,
+                protected INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("backups table");
+        sqlx::query(
+            "CREATE TABLE audit_events (
+                id TEXT PRIMARY KEY,
+                actor_user_id TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT 'ok',
+                request_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                metadata TEXT NOT NULL DEFAULT '{}'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("audit table");
+        pool
+    }
+
+    #[tokio::test]
+    async fn pre_update_backup_uses_canonical_path_and_configured_dir() {
+        let pool = test_pool().await;
+        let root =
+            std::env::temp_dir().join(format!("pumpkin-update-canonical-{}", Uuid::new_v4()));
+        let data = root.join("data");
+        tokio::fs::create_dir_all(&data).await.expect("data dir");
+        tokio::fs::write(data.join("level.dat"), b"fake world")
+            .await
+            .expect("seed file");
+        let custom = root.join("custom-backups");
+        let _env = BackupDirEnv::set(&custom);
+        seed_server(&pool, "srv-canon", 25565, data.to_string_lossy().as_ref()).await;
+
+        let task_id = enqueue_update(&pool, None, "srv-canon", None, TARGET, None, true)
+            .await
+            .expect("enqueue");
+        // No daemon: the protected backup must succeed, then the pull fails.
+        task_runner::dispatch_task(&pool, &NoDaemon, &task_id)
+            .await
+            .expect("dispatch");
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(task.state, task_runner::TaskState::Failed);
+        assert_eq!(task.error_code.as_deref(), Some("IMAGE_PULL_FAILED"));
+
+        // The artifact lands in the CONFIGURED dir, not beside the data dir.
+        let row: (String, String, i64) = sqlx::query_as(
+            "SELECT storage_path, state, protected FROM backups
+              WHERE server_id = 'srv-canon' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("backup row");
+        assert_eq!(row.1, "completed");
+        assert_eq!(row.2, 1);
+        assert!(
+            row.0.starts_with(custom.to_string_lossy().as_ref()),
+            "pre-update artifact must live in the configured backup dir, got: {}",
+            row.0
+        );
+        assert!(std::path::Path::new(&row.0).exists());
+        // Canonical helper signature: it writes its own `backup.complete`
+        // audit (the old inline capture never did).
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'backup.complete'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("audit count");
+        assert!(
+            n >= 1,
+            "canonical backup capture must audit backup.complete"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pre_update_backup_failure_aborts_update() {
+        let pool = test_pool().await;
+        let root = std::env::temp_dir().join(format!("pumpkin-update-bakfail-{}", Uuid::new_v4()));
+        let data = root.join("data");
+        tokio::fs::create_dir_all(&data).await.expect("data dir");
+        tokio::fs::write(data.join("level.dat"), b"fake world")
+            .await
+            .expect("seed file");
+        // A FILE where the backup dir should be: the canonical storage
+        // probe fails deterministically and the update must abort.
+        let not_a_dir = root.join("not-a-dir");
+        tokio::fs::write(&not_a_dir, b"in the way")
+            .await
+            .expect("blocker file");
+        let _env = BackupDirEnv::set(&not_a_dir);
+        seed_server(&pool, "srv-bakfail", 25565, data.to_string_lossy().as_ref()).await;
+
+        let task_id = enqueue_update(&pool, None, "srv-bakfail", None, TARGET, None, true)
+            .await
+            .expect("enqueue");
+        task_runner::dispatch_task(&pool, &NoDaemon, &task_id)
+            .await
+            .expect("dispatch");
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(task.state, task_runner::TaskState::Failed);
+        assert_eq!(task.error_code.as_deref(), Some("BACKUP_FAILED"));
+        assert!(
+            task.message.contains("backup storage unavailable"),
+            "failure must come from the canonical storage probe, got: {}",
+            task.message
+        );
+        // Aborted before pull/mutate: image refs and container untouched.
+        let server = fetch_server(&pool, "srv-bakfail")
+            .await
+            .expect("fetch")
+            .expect("row");
+        assert_eq!(server.image_reference, "ghcr.io/pumpkin-mc/pumpkin:master");
+        assert!(server.previous_image_reference.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn missing_migration_fails_loudly() {
+        let pool = legacy_pool().await;
+        seed_server(&pool, "srv-1", 25565, "/tmp/pumpkin-test-srv-1").await;
+        // No silent fallback: without `0007_update` every entry point fails
+        // with UPDATE_PRECONDITION instead of dropping the rollback target.
+        let err = enqueue_update(&pool, None, "srv-1", None, TARGET, None, true)
+            .await
+            .expect_err("update without the migration must fail loudly");
+        assert_eq!(err.code(), "UPDATE_PRECONDITION");
+        let err = enqueue_rollback(&pool, None, "srv-1", None)
+            .await
+            .expect_err("rollback without the migration must fail loudly");
+        assert_eq!(err.code(), "UPDATE_PRECONDITION");
+        let err = preview_update(&pool, "srv-1", TARGET, None)
+            .await
+            .expect_err("preview without the migration must fail loudly");
+        assert_eq!(err.code(), "UPDATE_PRECONDITION");
+    }
+
+    #[tokio::test]
+    async fn swap_without_migration_fails_loudly() {
+        let pool = legacy_pool().await;
+        seed_server(&pool, "srv-1", 25565, "/tmp/pumpkin-test-srv-1").await;
+        let err = swap_images(&pool, "srv-1", "prev", "", "cur", "")
+            .await
+            .expect_err("swap without the migration must fail loudly");
+        assert_eq!(err.code(), "UPDATE_PRECONDITION");
+        // And the row is untouched — no current-only silent write.
+        let cur: String =
+            sqlx::query_scalar("SELECT image_reference FROM servers WHERE id = 'srv-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("readback");
+        assert_eq!(cur, "ghcr.io/pumpkin-mc/pumpkin:master");
     }
 }

@@ -165,11 +165,11 @@ fn backup_error(e: BackupError) -> Response {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ServerRow {
-    id: String,
-    data_path: String,
-    container_id: String,
-    desired_state: String,
+pub(crate) struct ServerRow {
+    pub(crate) id: String,
+    pub(crate) data_path: String,
+    pub(crate) container_id: String,
+    pub(crate) desired_state: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -525,18 +525,18 @@ fn nanos_now() -> u128 {
 // workers — the backup semaphore permit.
 // ---------------------------------------------------------------------------
 
-struct BackupOutcome {
-    storage_path: String,
-    size_bytes: i64,
-    checksum: String,
-    archive_entries: usize,
+pub(crate) struct BackupOutcome {
+    pub(crate) storage_path: String,
+    pub(crate) size_bytes: i64,
+    pub(crate) checksum: String,
+    pub(crate) archive_entries: usize,
 }
 
 /// Capture a verified `.tar.gz` of the server data dir. Stops the container
 /// first when `consistency == "stopped"` and it is running (recording the
 /// need to resume in the return value); `desired_state` is never modified.
 #[allow(clippy::too_many_arguments)]
-async fn run_backup_capture(
+pub(crate) async fn run_backup_capture(
     pool: &SqlitePool,
     adapter: Option<&DockerAdapter>,
     backup_dir: &Path,
