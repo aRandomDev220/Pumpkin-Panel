@@ -9,6 +9,10 @@ mod file_service;
 mod health;
 mod metrics;
 mod metrics_collector;
+// The RAII op-lock API is the frozen foundation Tasks 3-9 migrate onto; until
+// those land it has no non-test caller in the binary.
+#[allow(dead_code)]
+mod op_lock;
 mod readiness;
 mod routes_admin;
 mod routes_auth;
@@ -59,6 +63,10 @@ pub struct AppState {
     /// `settings.backup_dir`, which itself honors `PUMPKIN_MANAGER_BACKUP_DIR`).
     /// All backup routes/workers must use this, never a derived heuristic.
     pub backup_dir: PathBuf,
+    /// Root of the bundled SPA build. Requests that miss the API are served
+    /// from here (with traversal rejected). Production default is `/app/web`;
+    /// tests point it at a temp dir.
+    pub web_root: PathBuf,
     pub op_locks: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -68,8 +76,9 @@ impl AppState {
             pool,
             adapter: None,
             runner: None,
-            server_root: server_root.clone(),
             backup_dir: server_root.join("backups"),
+            web_root: server_root.join("web"),
+            server_root,
             op_locks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -547,6 +556,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // Web root: bundled SPA build, overridable for non-images deployments.
+    let web_root = std::env::var_os("PUMPKIN_MANAGER_WEB_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/app/web"));
     let server_root = settings.data_dir.clone();
     // Backup storage has one source of truth: `settings.backup_dir` (env
     // `PUMPKIN_MANAGER_BACKUP_DIR` feeds `Settings`, never the routes).
@@ -577,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
         runner,
         server_root,
         backup_dir: backup_root,
+        web_root,
         op_locks: Arc::new(Mutex::new(HashSet::new())),
     };
     let docker_ok = state.adapter.is_some();
@@ -624,33 +638,93 @@ async fn sync_observed(pool: &SqlitePool, adapter: &DockerAdapter) {
 }
 
 /// Serves the Vite build (`apps/web/dist`) when bundled in the single
-/// Docker image, otherwise returns 404 JSON so the API still works in dev.
-async fn static_handler(req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+/// Docker image. Unknown non-API paths fall back to `index.html` for
+/// client-side routing; traversal attempts are rejected with 404.
+async fn static_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    let dist = state.web_root.clone();
+    serve_static(&dist, req.uri().path())
+}
+
+fn serve_static(dist: &std::path::Path, raw_path: &str) -> axum::response::Response {
     use axum::http::StatusCode;
 
-    let path = req.uri().path().to_owned();
     // Never shadow API routes.
-    if path.starts_with("/api/") {
+    if raw_path.starts_with("/api/") {
         return (StatusCode::NOT_FOUND, "{\"error_code\":\"NOT_FOUND\"}").into_response();
     }
-    let dist = PathBuf::from("/app/web");
-    let file = if path == "/" {
-        dist.join("index.html")
-    } else {
-        dist.join(path.trim_start_matches('/'))
+
+    // Percent-decode once, then reject any `..` component. `Path::starts_with`
+    // does NOT resolve `..`, so it must never be the containment check.
+    let Some(decoded) = percent_decode(raw_path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    // Path traversal guard.
-    if !file.starts_with(&dist) || !file.is_file() {
-        let index = dist.join("index.html");
-        if index.is_file() {
-            let body = std::fs::read(&index).unwrap_or_default();
-            return ([("content-type", "text/html")], body).into_response();
-        }
+    if decoded.contains('\0') || has_parent_component(&decoded) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let body = std::fs::read(&file).unwrap_or_default();
-    let ct = mime_for(&file);
-    ([("content-type", ct)], body).into_response()
+
+    let candidate = if decoded == "/" {
+        dist.join("index.html")
+    } else {
+        dist.join(decoded.trim_start_matches('/'))
+    };
+    // Belt-and-braces containment: canonicalize both sides (resolves `..` and
+    // symlinks) and require the file to resolve inside the web root.
+    if let (Ok(root), Ok(file)) = (dist.canonicalize(), candidate.canonicalize()) {
+        if file.starts_with(&root) && file.is_file() {
+            let body = std::fs::read(&file).unwrap_or_default();
+            let ct = mime_for(&file);
+            return ([("content-type", ct)], body).into_response();
+        }
+    }
+
+    // SPA fallback: unknown, non-traversing routes get index.html.
+    let index = dist.join("index.html");
+    if index.is_file() {
+        let body = std::fs::read(&index).unwrap_or_default();
+        return ([("content-type", "text/html")], body).into_response();
+    }
+    (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// True if any `/`-separated component is exactly `..`.
+fn has_parent_component(path: &str) -> bool {
+    path.split('/').any(|c| c == "..")
+}
+
+/// Minimal one-pass percent-decoder for a request path. Returns `None` on a
+/// malformed escape or invalid UTF-8. `%2f`/`%2e` are decoded so an encoded
+/// traversal cannot slip past [`has_parent_component`].
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn mime_for(p: &std::path::Path) -> &'static str {
@@ -685,4 +759,63 @@ fn db_path_parent(url: &str) -> Option<PathBuf> {
         return None;
     }
     PathBuf::from(path).parent().map(|p| p.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AppState;
+    use sqlx::SqlitePool;
+
+    async fn empty_pool() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool")
+    }
+
+    /// Unauthenticated path traversal in the SPA fallback must 404 and must
+    /// never read a file outside the web root.
+    #[tokio::test]
+    async fn spa_fallback_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!("pm-spa-{}", uuid::Uuid::new_v4()));
+        let web = root.join("web");
+        std::fs::create_dir_all(&web).expect("web root");
+        std::fs::write(web.join("index.html"), "<html>SPA-INDEX-MARKER</html>").expect("index");
+        let secret = "TOP-SECRET-OUTSIDE-WEB-ROOT";
+        std::fs::write(root.join("Cargo.toml"), secret).expect("secret file");
+
+        let state = AppState::for_tests(empty_pool().await, root.clone());
+        let app = crate::build_router(state);
+
+        // `axum_test` normalizes `..` via the `url` crate before dispatch, so
+        // drive the real router directly to send the path verbatim (the
+        // production case: `curl --path-as-is` / hyper do not normalize).
+        use tower::ServiceExt as _;
+        for path in ["/../Cargo.toml", "/..%2fCargo.toml", "/%2e%2e/Cargo.toml"] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let res = app.clone().oneshot(req).await.expect("router call");
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, 404, "path {path} body: {body}");
+            assert!(
+                !body.contains(secret),
+                "path {path} leaked file contents outside the web root"
+            );
+        }
+
+        // The SPA is still served for genuine client-side routes.
+        let server = axum_test::TestServer::new(app).expect("server");
+        let res = server.get("/servers/abc/overview").await;
+        assert_eq!(res.status_code(), 200);
+        assert!(res.text().contains("SPA-INDEX-MARKER"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

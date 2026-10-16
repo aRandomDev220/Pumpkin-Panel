@@ -8,9 +8,11 @@
 //! * [`spawn_runner`] starts a supervisor holding an `mpsc` queue plus a
 //!   [`tokio::sync::Semaphore`] that caps concurrent Docker operations
 //!   (default [`DEFAULT_CONCURRENCY`]).
-//! * [`requeue_interrupted`] marks tasks left `queued`/`running` by a
-//!   previous process as `failed` with `TASK_INTERRUPTED`. Call it once on
-//!   boot before [`spawn_runner`].
+//! * [`requeue_interrupted`] marks tasks left non-terminal (`queued`/
+//!   `running`/`cancel_requested`) by a previous process as `failed` with
+//!   `TASK_INTERRUPTED`. Call it once on boot before [`spawn_runner`].
+//! * [`claim_task`] is the compare-and-set a worker uses to take a `queued`
+//!   task exactly once.
 //! * [`mark_running`] / [`mark_succeeded`] / [`mark_failed`] are the only
 //!   state transitions workers use.
 //!
@@ -205,6 +207,47 @@ pub async fn enqueue(
     get(pool, &id).await?.ok_or_else(|| TaskError::NotFound(id))
 }
 
+/// Atomically claim a `queued` task for this worker.
+///
+/// The state transition is a compare-and-set: only the caller whose UPDATE
+/// affects one row gets `Some(record)`; everyone else gets `None` (the task
+/// was already claimed by another worker, or a `queued`→`cancelled` CAS won
+/// the race). This is what makes a cancelled task impossible to resurrect and
+/// a double-submitted id impossible to run twice.
+pub async fn claim_task(
+    pool: &sqlx::SqlitePool,
+    task_id: &str,
+) -> Result<Option<TaskRecord>, sqlx::Error> {
+    // NOTE: `message` is intentionally left untouched — update/rollback tasks
+    // carry their target image payload in `message` until the worker parses
+    // it, and overwriting it here would destroy that payload.
+    let res = sqlx::query(
+        "UPDATE tasks SET state = 'running', error_code = NULL, error_summary = NULL, \
+         started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND state = 'queued'",
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT id, type, server_id, requested_by, state, progress_percent, message, error_code, error_summary FROM tasks WHERE id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Ok(None),
+        Some(ref r) => match row_to_record(r) {
+            Ok(record) => Ok(Some(record)),
+            Err(TaskError::Database(e)) => Err(e),
+            Err(other) => Err(sqlx::Error::Decode(Box::new(other))),
+        },
+    }
+}
+
 /// Mark a task `running` (sets `started_at`, clears stale errors).
 pub async fn mark_running(
     pool: &sqlx::SqlitePool,
@@ -266,12 +309,13 @@ pub async fn mark_cancelled(pool: &sqlx::SqlitePool, task_id: &str) -> Result<()
     Ok(())
 }
 
-/// Crash recovery: fail every task left `queued` or `running` by a previous
-/// process with `TASK_INTERRUPTED`. Call once on boot, before
-/// [`spawn_runner`]. Returns the number of rows failed.
+/// Crash recovery: fail every task left non-terminal (`queued`, `running` or
+/// `cancel_requested`) by a previous process with `TASK_INTERRUPTED`. Call
+/// once on boot, before [`spawn_runner`], so an orphaned task can never wedge
+/// its server in `SERVER_BUSY` forever. Returns the number of rows failed.
 pub async fn requeue_interrupted(pool: &sqlx::SqlitePool) -> Result<u64, TaskError> {
     let res = sqlx::query(
-        "UPDATE tasks SET state = 'failed', error_code = 'TASK_INTERRUPTED', error_summary = 'Manager restarted while the task was in flight', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE state IN ('queued', 'running')",
+        "UPDATE tasks SET state = 'failed', error_code = 'TASK_INTERRUPTED', error_summary = 'Manager restarted while the task was in flight', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE state IN ('queued', 'running', 'cancel_requested')",
     )
     .execute(pool)
     .await?;
@@ -346,11 +390,12 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
         mark_cancelled(pool, task_id).await?;
         return Ok(());
     }
-    // Only claim queued (or previously interrupted) work; never stomp a
-    // terminal state or another worker's running task.
-    if !matches!(task.state, TaskState::Queued) {
+    // Atomic claim: the CAS only fires for a `queued` row, so exactly one
+    // worker runs the task. If it has already been claimed, cancelled, or
+    // otherwise left the queue, this worker does nothing.
+    let Some(task) = claim_task(pool, task_id).await? else {
         return Ok(());
-    }
+    };
 
     match task.task_type.as_str() {
         "start" | "stop" | "restart" | "remove" => {
@@ -408,7 +453,19 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
                     .remove(&container_id)
                     .await
                     .map(|()| "container removed".to_string()),
-                _ => unreachable!(),
+                // The outer `match` only routes the four lifecycle ops here,
+                // so this arm is defensive: fail loudly instead of panicking.
+                other => {
+                    warn!(task_id, task_type = other, "unhandled lifecycle op");
+                    fail_task(
+                        pool,
+                        task_id,
+                        "UNKNOWN_TASK_TYPE",
+                        &format!("no runtime handler for task type '{other}'"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             match outcome {
                 Ok(msg) => {
@@ -523,7 +580,21 @@ pub async fn enqueue_and_submit(
     requested_by: Option<&str>,
 ) -> Result<TaskRecord, TaskError> {
     let record = enqueue(pool, task_type, server_id, requested_by).await?;
-    runner.submit(&record.id).await?;
+    if let Err(e) = runner.submit(&record.id).await {
+        // Roll back the enqueue: a `queued` row whose id never reached the
+        // runner would leave the server stuck in `SERVER_BUSY` forever.
+        if let Err(mark_err) = mark_failed(
+            pool,
+            &record.id,
+            "QUEUE_UNAVAILABLE",
+            "task could not be handed to the worker queue",
+        )
+        .await
+        {
+            error!(task_id = %record.id, error = %mark_err, "failed to roll back enqueue");
+        }
+        return Err(e);
+    }
     Ok(record)
 }
 
@@ -671,5 +742,94 @@ mod tests {
         let r = get(&pool, &rec.id).await.expect("get").expect("row");
         assert_eq!(r.state, TaskState::Failed);
         assert_eq!(r.error_code.as_deref(), Some("UNKNOWN_TASK_TYPE"));
+    }
+
+    #[tokio::test]
+    async fn claim_task_is_single_winner() {
+        let pool = test_pool().await;
+        let rec = enqueue(&pool, "start", None, None).await.expect("q");
+
+        let (a, b) = tokio::join!(claim_task(&pool, &rec.id), claim_task(&pool, &rec.id));
+        let winners = [&a, &b].iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+        assert_eq!(winners, 1, "exactly one claim_task must win: {a:?} / {b:?}");
+
+        let row = get(&pool, &rec.id).await.expect("get").expect("row");
+        assert_eq!(row.state, TaskState::Running);
+
+        // A second claim on the now-running row returns None.
+        assert!(claim_task(&pool, &rec.id).await.expect("claim").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_then_late_claim_does_not_run() {
+        let pool = test_pool().await;
+        let rec = enqueue(&pool, "start", None, None).await.expect("q");
+
+        // The cancel handler CASes queued -> cancelled.
+        let cancelled = sqlx::query(
+            "UPDATE tasks SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND state = 'queued'",
+        )
+        .bind(&rec.id)
+        .execute(&pool)
+        .await
+        .expect("cancel");
+        assert_eq!(cancelled.rows_affected(), 1);
+
+        // A worker that dequeues afterwards must not resurrect it.
+        assert!(claim_task(&pool, &rec.id).await.expect("claim").is_none());
+        let row = get(&pool, &rec.id).await.expect("get").expect("row");
+        assert_eq!(row.state, TaskState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn orphan_queued_task_reconciled_on_boot() {
+        let pool = test_pool().await;
+        let queued = enqueue(&pool, "start", None, None).await.expect("queued");
+        let running = enqueue(&pool, "stop", None, None).await.expect("running");
+        mark_running(&pool, &running.id, "in flight")
+            .await
+            .expect("running");
+        let cancelling = enqueue(&pool, "restart", None, None)
+            .await
+            .expect("cancelling");
+        sqlx::query("UPDATE tasks SET state = 'cancel_requested' WHERE id = ?")
+            .bind(&cancelling.id)
+            .execute(&pool)
+            .await
+            .expect("cancel_requested");
+
+        let n = requeue_interrupted(&pool).await.expect("reconcile");
+        assert_eq!(n, 3, "queued, running and cancel_requested are reconciled");
+        for id in [&queued.id, &running.id, &cancelling.id] {
+            let row = get(&pool, id).await.expect("get").expect("row");
+            assert_eq!(row.state, TaskState::Failed, "task {id}");
+            assert_eq!(row.error_code.as_deref(), Some("TASK_INTERRUPTED"));
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_submit_failure_marks_task_failed() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO servers (id, container_id) VALUES ('srv-1', 'cid-1')")
+            .execute(&pool)
+            .await
+            .expect("server row");
+
+        // A runner whose queue receiver is already gone: `submit` fails.
+        let (tx, rx) = mpsc::channel::<String>(1);
+        drop(rx);
+        let handle = RunnerHandle { tx };
+
+        let result = enqueue_and_submit(&pool, &handle, "start", Some("srv-1"), None).await;
+        assert!(matches!(result, Err(TaskError::Queue(_))), "{result:?}");
+
+        // The enqueued row must not be left `queued` (it would wedge the server).
+        let (state, code): (String, Option<String>) =
+            sqlx::query_as("SELECT state, error_code FROM tasks")
+                .fetch_one(&pool)
+                .await
+                .expect("task row");
+        assert_eq!(state, "failed");
+        assert_eq!(code.as_deref(), Some("QUEUE_UNAVAILABLE"));
     }
 }
