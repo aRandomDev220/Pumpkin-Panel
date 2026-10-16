@@ -17,7 +17,6 @@
 //! racing Docker.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
@@ -27,11 +26,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
 
 use crate::{
     audit,
     auth::AuthUser,
+    op_lock,
     runtime::{self, RuntimeAdapter, RuntimeError, ServerSpecInput, ValidatedServerSpec},
     task_runner, AppState,
 };
@@ -64,6 +63,7 @@ pub struct ServerDto {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateServerRequest {
     pub name: String,
     #[serde(default)]
@@ -93,6 +93,7 @@ fn default_limit() -> i64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteQuery {
     #[serde(default = "default_retain")]
     pub retain_data: bool,
@@ -172,20 +173,6 @@ async fn taken_ports(pool: &SqlitePool) -> Result<HashSet<i64>, sqlx::Error> {
     Ok(set)
 }
 
-/// Try to claim the per-server op lock. `false` = conflicting op in flight.
-async fn try_lock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) -> bool {
-    let mut guard = locks.lock().await;
-    if guard.contains(server_id) {
-        return false;
-    }
-    guard.insert(server_id.to_string());
-    true
-}
-
-async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
-    locks.lock().await.remove(server_id);
-}
-
 async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM tasks
@@ -208,16 +195,16 @@ fn runtime_error(e: RuntimeError) -> Response {
         );
     }
     let code = e.code();
-    let (status, msg) = match &e {
-        RuntimeError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        RuntimeError::PortUnavailable(_) | RuntimeError::NameConflict(_) => {
-            (StatusCode::CONFLICT, e.to_string())
-        }
-        _ => (StatusCode::BAD_GATEWAY, e.to_string()),
+    // Log the full (possibly sensitive) detail; return only a stable,
+    // sanitized message. Never surface raw bollard/subprocess text or
+    // filesystem paths to clients (audit §9.4).
+    tracing::warn!(error = %e, %code, "runtime operation failed");
+    let status = match &e {
+        RuntimeError::NotFound(_) => StatusCode::NOT_FOUND,
+        RuntimeError::PortUnavailable(_) | RuntimeError::NameConflict(_) => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_GATEWAY,
     };
-    // Never leak raw daemon internals beyond the display string, which the
-    // adapter keeps free of socket paths and secrets.
-    error(status, code, &msg)
+    error(status, code, e.client_message())
 }
 
 /// Heuristic for "Docker is unreachable" inside bollard's error strings.
@@ -494,15 +481,24 @@ pub async fn delete_server(
     let Some(server) = fetch_server(&state.pool, &id).await.unwrap_or(None) else {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     };
-    if !try_lock(&state.op_locks, &id).await {
+    // Refuse while a lifecycle/backup/update op is queued, running, or holds
+    // the per-server lock: deleting under an in-flight op would race Docker
+    // and the DB. (Container removal + soft-delete + data retention below.)
+    if conflicting_task(&state.pool, &id).await {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "a task is already queued/running for this server",
+        );
+    }
+    let Some(_guard) = op_lock::try_acquire(&state.op_locks, &id).await else {
         return error(
             StatusCode::CONFLICT,
             "SERVER_BUSY",
             "another operation is in flight for this server",
         );
-    }
+    };
     let result = delete_server_inner(&state, &server, query.retain_data).await;
-    unlock(&state.op_locks, &id).await;
     match result {
         Ok(()) => {
             audit::record(
@@ -606,31 +602,31 @@ pub async fn lifecycle(
         }))
         .into_response();
     }
-    if !try_lock(&state.op_locks, &id).await {
-        return error(
+    if let Some(_guard) = op_lock::try_acquire(&state.op_locks, &id).await {
+        let outcome = lifecycle_inner(&state, &user, &server, &op, want).await;
+        match outcome {
+            Ok(task_id) => {
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    &format!("server.{op}"),
+                    "server",
+                    &id,
+                    "accepted",
+                    &request_id,
+                    serde_json::json!({ "task_id": task_id }),
+                )
+                .await;
+                (StatusCode::ACCEPTED, Json(TaskAccepted { task_id })).into_response()
+            }
+            Err(resp) => resp,
+        }
+    } else {
+        error(
             StatusCode::CONFLICT,
             "SERVER_BUSY",
             "another operation is in flight for this server",
-        );
-    }
-    let outcome = lifecycle_inner(&state, &user, &server, &op, want).await;
-    unlock(&state.op_locks, &id).await;
-    match outcome {
-        Ok(task_id) => {
-            audit::record(
-                &state.pool,
-                Some(&user.id),
-                &format!("server.{op}"),
-                "server",
-                &id,
-                "accepted",
-                &request_id,
-                serde_json::json!({ "task_id": task_id }),
-            )
-            .await;
-            (StatusCode::ACCEPTED, Json(TaskAccepted { task_id })).into_response()
-        }
-        Err(resp) => resp,
+        )
     }
 }
 
@@ -668,11 +664,14 @@ async fn lifecycle_inner(
         .await
     {
         Ok(record) => Ok(record.id),
-        Err(e) => Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TASK_QUEUE_FULL",
-            &format!("task queue unavailable: {e}"),
-        )),
+        Err(e) => {
+            tracing::warn!(server_id = %server.id, error = %e, "task enqueue failed");
+            Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "TASK_QUEUE_FULL",
+                "task queue unavailable; try again shortly",
+            ))
+        }
     }
 }
 
@@ -768,37 +767,71 @@ pub async fn server_status(
 }
 
 /// Derive game readiness from desired/observed container state.
-/// `online` is only reachable with a live ping (set by the caller).
+///
+/// Observed container reality wins over the requested desired state for the
+/// contradiction cases (audit finding): a stop-requested container that is
+/// still running reads `stopping`, not `starting`; a missing container is
+/// `unknown`; an exit while `running` was requested is `unhealthy`. `online`
+/// is only reachable from a live ping *and* a running container.
 fn readiness_for(
     desired: &str,
     observed: &str,
     exit_code: Option<i64>,
     ping_ok: bool,
 ) -> (&'static str, String) {
-    if observed == "running" && ping_ok {
-        return ("online", "game port answered status ping".to_string());
-    }
-    match (desired, observed) {
-        (_, "running") => (
-            "starting",
-            "container running, awaiting game ping".to_string(),
-        ),
-        ("stopped", _) => ("stopped", "server is stopped".to_string()),
-        (_, "created") => ("starting", "container created, not started yet".to_string()),
-        (_, "exited") => (
-            "unhealthy",
-            format!(
-                "process exited while running was requested{}",
-                exit_code
-                    .map(|c| format!(" (exit {c})"))
-                    .unwrap_or_default()
-            ),
-        ),
-        (_, "missing") => (
+    match observed {
+        "running" => {
+            if desired == "stopped" {
+                (
+                    "stopping",
+                    "stop requested; container still running".to_string(),
+                )
+            } else if ping_ok {
+                ("online", "game port answered status ping".to_string())
+            } else {
+                (
+                    "starting",
+                    "container running, awaiting game ping".to_string(),
+                )
+            }
+        }
+        "exited" => {
+            if desired == "running" {
+                (
+                    "unhealthy",
+                    format!(
+                        "process exited while running was requested{}",
+                        exit_code
+                            .map(|c| format!(" (exit {c})"))
+                            .unwrap_or_default()
+                    ),
+                )
+            } else {
+                ("stopped", "server is stopped".to_string())
+            }
+        }
+        "stopping" => ("stopping", "container is stopping".to_string()),
+        "created" => {
+            if desired == "stopped" {
+                ("stopped", "server is stopped".to_string())
+            } else {
+                ("starting", "container created, not started yet".to_string())
+            }
+        }
+        "starting" => ("starting", "container is starting".to_string()),
+        "missing" => (
             "unknown",
             "no container materialised for this server".to_string(),
         ),
-        _ => ("unknown", format!("observed state {observed}")),
+        _ => {
+            // Unknown/paused observations: honour an explicit stop request,
+            // otherwise report unknown rather than guessing.
+            if desired == "stopped" {
+                ("stopped", "server is stopped".to_string())
+            } else {
+                ("unknown", format!("observed state {observed}"))
+            }
+        }
     }
 }
 
@@ -943,4 +976,117 @@ pub async fn server_capabilities(
         }
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (pure readiness mapping + error sanitization; no daemon)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_prefers_observed_over_desired() {
+        // Contradiction: stop requested but container still running must read
+        // as `stopping`, never `starting` (audit finding).
+        assert_eq!(
+            readiness_for("stopped", "running", None, false).0,
+            "stopping"
+        );
+        assert_eq!(
+            readiness_for("stopped", "running", None, true).0,
+            "stopping"
+        );
+        // The happy path.
+        assert_eq!(readiness_for("running", "running", None, true).0, "online");
+        assert_eq!(
+            readiness_for("running", "running", None, false).0,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn readiness_missing_exited_and_idempotent_states() {
+        // Missing container is unknown, never a fabricated online/stopping.
+        assert_eq!(
+            readiness_for("running", "missing", None, false).0,
+            "unknown"
+        );
+        // Exited while running was requested is unhealthy, with the exit code.
+        let (state, reason) = readiness_for("running", "exited", Some(3), false);
+        assert_eq!(state, "unhealthy");
+        assert!(reason.contains('3'), "reason carries exit code: {reason}");
+        // Exited/created with desired=stopped is a clean stop.
+        assert_eq!(
+            readiness_for("stopped", "exited", Some(0), false).0,
+            "stopped"
+        );
+        assert_eq!(
+            readiness_for("stopped", "created", None, false).0,
+            "stopped"
+        );
+        // Created with desired=running is still starting.
+        assert_eq!(
+            readiness_for("running", "created", None, false).0,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn never_online_when_observed_is_not_running() {
+        for observed in [
+            "created", "starting", "stopping", "exited", "missing", "unknown", "paused",
+        ] {
+            let with_ping = readiness_for("running", observed, None, true).0;
+            let without_ping = readiness_for("running", observed, None, false).0;
+            assert_eq!(
+                with_ping, without_ping,
+                "a ping must not change readiness when observed={observed}"
+            );
+            assert_ne!(with_ping, "online", "observed={observed} cannot be online");
+        }
+    }
+
+    #[test]
+    fn container_status_mapping() {
+        assert_eq!(map_container_status("running"), "running");
+        assert_eq!(map_container_status("created"), "created");
+        assert_eq!(map_container_status("restarting"), "starting");
+        assert_eq!(map_container_status("removing"), "stopping");
+        assert_eq!(map_container_status("exited"), "exited");
+        assert_eq!(map_container_status("dead"), "exited");
+        assert_eq!(map_container_status("paused"), "paused");
+        assert_eq!(map_container_status("who-knows"), "unknown");
+    }
+
+    #[tokio::test]
+    async fn runtime_error_response_never_leaks_daemon_internals() {
+        let err = RuntimeError::Docker(bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "dial unix /var/run/docker.sock: connect: no such file".to_string(),
+        });
+        let resp = runtime_error(err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = body["message"].as_str().unwrap_or_default();
+        for leak in ["/var/run", "docker.sock", "bollard", "connect"] {
+            assert!(!msg.contains(leak), "message leaked {leak:?}: {msg}");
+        }
+        assert_eq!(body["error_code"], "DOCKER_API_ERROR");
+    }
+
+    #[test]
+    fn unknown_create_field_rejected_at_deserialization() {
+        let raw = serde_json::json!({
+            "name": "x",
+            "game_port": 25565,
+            "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master",
+            "privileged": true,
+        });
+        assert!(serde_json::from_value::<CreateServerRequest>(raw).is_err());
+    }
 }

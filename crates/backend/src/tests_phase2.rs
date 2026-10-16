@@ -729,3 +729,113 @@ async fn logout_clears_both_cookies() {
         "not expired: {csrf_cookie}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: delete busy guard + op-lock release, unknown-field rejection
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_refuses_busy_and_releases_op_lock() {
+    let pool = test_pool().await;
+    let root = std::env::temp_dir().join(format!("pm-busy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let state = AppState::for_tests(pool.clone(), root);
+    let locks = state.op_locks.clone();
+    let server = TestServer::new(build_router(state)).unwrap();
+    let t = setup_owner(&server).await;
+
+    let created = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "busy-del", "game_port": 25610,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(created.status_code(), 201, "body: {}", created.text());
+    let id = created.json::<Value>()["server"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A conflicting queued task must make DELETE fail safe with 409.
+    sqlx::query("INSERT INTO tasks (id, type, server_id, state) VALUES (?, 'stop', ?, 'queued')")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let busy = server
+        .delete(&format!("/api/v1/servers/{id}"))
+        .authorization_bearer(&t)
+        .await;
+    assert_eq!(busy.status_code(), 409, "body: {}", busy.text());
+    assert_eq!(busy.json::<Value>()["error_code"], json!("SERVER_BUSY"));
+
+    // Once the task is terminal the delete proceeds and the op-lock release
+    // is observable (guards against a leaked lock on a rejected/accepted op).
+    sqlx::query("UPDATE tasks SET state = 'failed' WHERE server_id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let del = server
+        .delete(&format!("/api/v1/servers/{id}"))
+        .authorization_bearer(&t)
+        .await;
+    assert_eq!(del.status_code(), 204, "body: {}", del.text());
+
+    // The handler released the per-server lock (deferred drop → `acquire`
+    // waits for the slot rather than racing it).
+    let freed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::op_lock::acquire(&locks, &id),
+    )
+    .await
+    .expect("delete handler must release the op-lock");
+    drop(freed);
+}
+
+#[tokio::test]
+async fn create_rejects_unknown_field() {
+    let (server, _) = test_server().await;
+    let t = setup_owner(&server).await;
+    let res = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "smuggle", "game_port": 25611,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master",
+                      "privileged": true}))
+        .await;
+    assert!(
+        matches!(res.status_code().as_u16(), 400 | 422),
+        "unknown field must be rejected, got {}: {}",
+        res.status_code(),
+        res.text()
+    );
+}
+
+#[tokio::test]
+async fn delete_rejects_unknown_query_field() {
+    let (server, _) = test_server().await;
+    let t = setup_owner(&server).await;
+    let created = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "qfield", "game_port": 25612,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(created.status_code(), 201);
+    let id = created.json::<Value>()["server"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = server
+        .delete(&format!("/api/v1/servers/{id}?evil=1"))
+        .authorization_bearer(&t)
+        .await;
+    assert!(
+        matches!(res.status_code().as_u16(), 400 | 422),
+        "unknown query field must be rejected, got {}: {}",
+        res.status_code(),
+        res.text()
+    );
+}

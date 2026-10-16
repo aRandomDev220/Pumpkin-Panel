@@ -65,7 +65,8 @@ use crate::{
     config_profile, readiness,
     routes_backup::{self, BackupError},
     runtime::{
-        DockerAdapter, RuntimeAdapter, RuntimeError, ValidatedServerSpec, IMAGE_ALLOWLIST_PREFIX,
+        is_allowlisted_image, is_valid_digest, DockerAdapter, RuntimeAdapter, RuntimeError,
+        ValidatedServerSpec, IMAGE_ALLOWLIST_PREFIX,
     },
     task_runner, AppState,
 };
@@ -455,11 +456,11 @@ fn resolve_backup_dir() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 fn check_allowlist(image_reference: &str) -> Result<(), UpdateError> {
-    if image_reference.starts_with(IMAGE_ALLOWLIST_PREFIX) {
+    if is_allowlisted_image(image_reference) {
         Ok(())
     } else {
         Err(UpdateError::InvalidImage(format!(
-            "image '{image_reference}' is not on the allowlist (must start with {IMAGE_ALLOWLIST_PREFIX})"
+            "image '{image_reference}' is not on the allowlist (must be {IMAGE_ALLOWLIST_PREFIX}<tag>)"
         )))
     }
 }
@@ -467,9 +468,9 @@ fn check_allowlist(image_reference: &str) -> Result<(), UpdateError> {
 /// Normalised digest (`""` when unpinned). Malformed digests are invalid.
 fn normalize_digest(digest: Option<&str>) -> Result<String, UpdateError> {
     let d = digest.unwrap_or("").trim().to_string();
-    if !d.is_empty() && !(d.starts_with("sha256:") && d.len() > 7) {
+    if !d.is_empty() && !is_valid_digest(&d) {
         return Err(UpdateError::InvalidImage(
-            "image digest must be empty or a sha256:<hex> digest".to_string(),
+            "image digest must be empty or a sha256:<64 lowercase hex> digest".to_string(),
         ));
     }
     Ok(d)

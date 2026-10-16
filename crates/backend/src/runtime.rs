@@ -267,6 +267,54 @@ pub fn is_reserved_port(port: u16) -> bool {
     RESERVED_PORTS.contains(&port)
 }
 
+/// True when `reference` is `ghcr.io/pumpkin-mc/pumpkin:` followed by exactly
+/// one non-empty tag segment of `[A-Za-z0-9._-]` (no extra `:`/`/`, no
+/// whitespace). The official mutable tag `:master` remains allowed; digest
+/// pinning, not a tag ban, is the reproducibility control.
+#[must_use]
+pub fn is_allowlisted_image(reference: &str) -> bool {
+    let Some(tag) = reference.strip_prefix(IMAGE_ALLOWLIST_PREFIX) else {
+        return false;
+    };
+    !tag.is_empty()
+        && !tag.contains(':')
+        && !tag.contains('/')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// True only for a strict `sha256:` + 64 lowercase hex chars digest.
+#[must_use]
+pub fn is_valid_digest(digest: &str) -> bool {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Resolve the image reference Docker should use.
+///
+/// When `digest` is non-empty the returned reference is `repo@sha256:…`
+/// (the mutable tag is stripped so the daemon resolves the pinned digest);
+/// otherwise `reference` is returned unchanged.
+#[must_use]
+pub fn pinned_image_reference(reference: &str, digest: &str) -> String {
+    if digest.is_empty() {
+        return reference.to_string();
+    }
+    // Strip the tag: `ghcr.io/pumpkin-mc/pumpkin:master` → `…/pumpkin`.
+    // The allowlist guarantees a single `:` after the repository path.
+    let repo = match reference.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => name,
+        _ => reference,
+    };
+    format!("{repo}@{digest}")
+}
+
 /// Lexically resolve `.`/`..` segments without touching the filesystem
 /// (the directory may not exist yet at validation time).
 fn lexical_join(root: &Path, path: &Path) -> Option<std::path::PathBuf> {
@@ -319,12 +367,10 @@ pub fn validate_spec(
     if !is_valid_slug(&input.slug) {
         return Err(SpecError::InvalidSlug(input.slug));
     }
-    if !input.image_reference.starts_with(IMAGE_ALLOWLIST_PREFIX) {
+    if !is_allowlisted_image(&input.image_reference) {
         return Err(SpecError::ImageNotAllowed(input.image_reference));
     }
-    if !input.image_digest.is_empty()
-        && !(input.image_digest.starts_with("sha256:") && input.image_digest.len() > 7)
-    {
+    if !input.image_digest.is_empty() && !is_valid_digest(&input.image_digest) {
         return Err(SpecError::InvalidDigest);
     }
     if input.game_port < MIN_GAME_PORT || input.game_port > MAX_GAME_PORT {
@@ -460,6 +506,25 @@ impl RuntimeError {
             Self::Database(_) | Self::Io(_) => "RUNTIME_ERROR",
             Self::Docker(_) => "DOCKER_API_ERROR",
             Self::NotFound(_) => "CONTAINER_NOT_FOUND",
+        }
+    }
+
+    /// Safe, client-facing message for API error bodies.
+    ///
+    /// Never contains raw Docker/bollard text, subprocess output, socket
+    /// paths, or filesystem paths (audit §9.4): the detailed `Display` is
+    /// only logged, never returned to a client.
+    #[must_use]
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::PortUnavailable(_) => "requested host port is unavailable",
+            Self::NotFound(_) => "container not found",
+            Self::NameConflict(_) => "container name is already in use",
+            Self::InvalidConfiguration(_) => "invalid runtime configuration",
+            Self::CapabilityUnavailable(_) => "runtime capability unavailable",
+            Self::Database(_) => "runtime database error",
+            Self::Io(_) => "runtime filesystem error",
+            Self::Docker(_) => "Docker daemon operation failed",
         }
     }
 
@@ -634,7 +699,10 @@ impl DockerAdapter {
         };
 
         Config {
-            image: Some(spec.image_reference.clone()),
+            image: Some(pinned_image_reference(
+                &spec.image_reference,
+                &spec.image_digest,
+            )),
             exposed_ports: Some(HashMap::from([
                 (format!("{CONTAINER_JAVA_PORT}/tcp"), HashMap::new()),
                 (format!("{CONTAINER_BEDROCK_PORT}/udp"), HashMap::new()),
@@ -1386,5 +1454,188 @@ mod tests {
             .await
             .expect_err("pull without a daemon must fail");
         assert_eq!(err.code(), "DOCKER_API_ERROR");
+    }
+
+    // -- Task 3: digest pinning, strict digest/allowlist validation ----------
+
+    fn valid_digest() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    #[test]
+    fn pinned_image_reference_applies_digest() {
+        let digest = valid_digest();
+        assert_eq!(
+            pinned_image_reference("ghcr.io/pumpkin-mc/pumpkin:master", &digest),
+            format!("ghcr.io/pumpkin-mc/pumpkin@{digest}")
+        );
+        // No digest → unchanged, tag preserved.
+        assert_eq!(
+            pinned_image_reference("ghcr.io/pumpkin-mc/pumpkin:master", ""),
+            "ghcr.io/pumpkin-mc/pumpkin:master"
+        );
+    }
+
+    #[test]
+    fn build_create_config_pins_digest() {
+        let digest = valid_digest();
+        let spec = validate_spec(
+            ServerSpecInput {
+                image_digest: digest.clone(),
+                ..input()
+            },
+            &root(),
+        )
+        .expect("pinned spec validates");
+        let cfg = DockerAdapter::build_create_config(&spec);
+        assert_eq!(
+            cfg.image.as_deref(),
+            Some(format!("ghcr.io/pumpkin-mc/pumpkin@{digest}").as_str())
+        );
+        assert!(cfg.image.as_deref().unwrap().contains("@sha256:"));
+
+        // Unpinned → tag unchanged.
+        let unpinned = validate_spec(input(), &root()).expect("unpinned validates");
+        let cfg = DockerAdapter::build_create_config(&unpinned);
+        assert_eq!(
+            cfg.image.as_deref(),
+            Some("ghcr.io/pumpkin-mc/pumpkin:master")
+        );
+    }
+
+    #[test]
+    fn digest_validation_is_strict() {
+        assert!(is_valid_digest(&valid_digest()));
+        for bad in [
+            String::new(),
+            "sha256:".to_string(),
+            format!("sha256:{}", "a".repeat(63)), // short
+            format!("sha256:{}", "a".repeat(65)), // extra chars
+            format!("sha256:{}", "A".repeat(64)), // uppercase hex
+            format!("sha256:{}", "z".repeat(64)), // non-hex
+            "abcdef".to_string(),                 // missing prefix
+            format!("md5:{}", "a".repeat(64)),    // wrong algorithm prefix
+        ] {
+            assert!(!is_valid_digest(&bad), "must reject digest {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_malformed_digest() {
+        // Empty digest stays legal (unpinned).
+        assert!(validate_spec(input(), &root()).is_ok());
+
+        for bad in [
+            "sha256:abc".to_string(),
+            "sha256:".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+        ] {
+            let mut i = input();
+            i.image_digest = bad.clone();
+            let err = validate_spec(i, &root()).expect_err("must reject digest");
+            assert!(
+                matches!(err, SpecError::InvalidDigest),
+                "digest {bad:?} → {err:?}"
+            );
+        }
+
+        let valid = validate_spec(
+            ServerSpecInput {
+                image_digest: valid_digest(),
+                ..input()
+            },
+            &root(),
+        )
+        .expect("valid digest");
+        assert!(is_valid_digest(&valid.image_digest));
+    }
+
+    #[test]
+    fn allowlist_requires_one_clean_tag_segment() {
+        for good in [
+            "ghcr.io/pumpkin-mc/pumpkin:master",
+            "ghcr.io/pumpkin-mc/pumpkin:v1.2.3",
+            "ghcr.io/pumpkin-mc/pumpkin:1_2-3",
+            "ghcr.io/pumpkin-mc/pumpkin:a",
+        ] {
+            assert!(is_allowlisted_image(good), "should allow {good}");
+            let spec = validate_spec(
+                ServerSpecInput {
+                    image_reference: good.to_string(),
+                    ..input()
+                },
+                &root(),
+            )
+            .expect("allowlisted");
+            assert_eq!(spec.image_reference, good);
+        }
+
+        for bad in [
+            "ghcr.io/pumpkin-mc/pumpkin:",           // empty tag
+            "ghcr.io/pumpkin-mc/pumpkin",            // no tag separator
+            "ghcr.io/pumpkin-mc/pumpkin:master:1",   // second colon
+            "ghcr.io/pumpkin-mc/pumpkin:mas ter",    // whitespace
+            "ghcr.io/pumpkin-mc/pumpkin:tag/extra",  // path after tag
+            "ghcr.io/pumpkin-mc/pumpkin:tag/",       // trailing slash
+            "ghcr.io/pumpkin-mc/pumpkin:@sha256:aa", // digest in ref
+            "ghcr.io/pumpkin-mc/pumpkin:#bad",       // invalid char
+            "docker.io/library/ubuntu:latest",
+            "ghcr.io/evil/pumpkin:master",
+            "",
+        ] {
+            assert!(!is_allowlisted_image(bad), "should reject {bad:?}");
+            let mut i = input();
+            i.image_reference = bad.to_string();
+            let err = validate_spec(i, &root()).expect_err("must reject ref");
+            assert!(
+                matches!(err, SpecError::ImageNotAllowed(_)),
+                "ref {bad:?} → {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_error_client_messages_are_sanitized() {
+        let docker =
+            RuntimeError::from_bollard(bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "/var/run/docker.sock exploded while talking to http://127.0.0.1:2375"
+                    .to_string(),
+            });
+        let cases = [
+            docker,
+            RuntimeError::NotFound("/var/run/docker.sock: No such container abc".to_string()),
+            RuntimeError::PortUnavailable(
+                "Bind for 0.0.0.0:25565 failed: port is already allocated".to_string(),
+            ),
+            RuntimeError::NameConflict(
+                "Conflict. The container name \"/pumpkin-live\" is already in use".to_string(),
+            ),
+            RuntimeError::Io("open /data/servers/x: permission denied".to_string()),
+        ];
+        for e in cases {
+            let msg = e.client_message();
+            for leak in [
+                "docker.sock",
+                "/var/run",
+                "0.0.0.0:25565",
+                "/pumpkin-live",
+                "/data/servers",
+                "permission denied",
+                "127.0.0.1",
+            ] {
+                assert!(
+                    !msg.contains(leak),
+                    "client message {msg:?} leaked {leak:?}"
+                );
+            }
+            // Codes stay stable and machine-readable.
+            assert!(
+                e.code().chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "unstable code {}",
+                e.code()
+            );
+        }
     }
 }
