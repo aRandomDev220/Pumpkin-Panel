@@ -633,11 +633,25 @@ async fn terminal_ok(pool: &SqlitePool, task_id: &str, message: &str) {
     let _ = task_runner::mark_succeeded(pool, task_id, message).await;
 }
 
+/// Cap a terminal task message at 500 chars without amputating the mandatory
+/// rollback one-way warning: when the warning rides at the end, the detail is
+/// truncated first to leave tail room, then the full warning is appended
+/// after truncation. Short messages pass through byte-identical.
+fn fit_terminal_message(summary: &str) -> String {
+    const LIMIT: usize = 500;
+    if let Some(detail) = summary.strip_suffix(DATA_FORMAT_WARNING) {
+        let room = LIMIT.saturating_sub(DATA_FORMAT_WARNING.chars().count() + 1);
+        let head: String = detail.chars().take(room).collect();
+        return format!("{} {DATA_FORMAT_WARNING}", head.trim_end());
+    }
+    summary.chars().take(LIMIT).collect()
+}
+
 /// Terminal failure marker. `mark_failed` only writes `error_*`, so the full
 /// story is stored in `message` first — rollback outcomes must be readable
 /// from the task message itself.
 async fn terminal_fail(pool: &SqlitePool, task_id: &str, code: &str, summary: &str) {
-    let summary: String = summary.chars().take(500).collect();
+    let summary = fit_terminal_message(summary);
     let _ = sqlx::query("UPDATE tasks SET message = ? WHERE id = ?")
         .bind(&summary)
         .bind(task_id)
@@ -1452,7 +1466,12 @@ pub async fn execute_update<A: RuntimeAdapter>(
         .await;
         return Ok(());
     }
-    task_runner::mark_running(pool, task_id, "update in progress").await?;
+    // Claim first, mark second: a DB error here must release the per-server
+    // op lock before propagating, or the lock wedges for the process lifetime.
+    if let Err(e) = task_runner::mark_running(pool, task_id, "update in progress").await {
+        op_release(&server_id).await;
+        return Err(e);
+    }
     execute_update_inner(
         pool,
         adapter,
@@ -1575,7 +1594,41 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
         }
     }
 
-    // Past the remove: recreate with the previous image, then swap the refs
+    // Past the remove: best-effort pull of the previous image before
+    // recreating, mirroring the update path. When the daemon pruned it but
+    // the registry still has it, this restores it; when it is truly gone the
+    // create below still fails honestly. Either way, proceed regardless.
+    let pull_ref = if prev_digest.is_empty() {
+        prev_ref.clone()
+    } else {
+        format!("{prev_ref}@{prev_digest}")
+    };
+    match adapter.pull_image(&pull_ref).await {
+        Ok(()) => {
+            audit_update(
+                pool,
+                actor,
+                "rollback.pull",
+                server_id,
+                "ok",
+                serde_json::json!({ "target": pull_ref }),
+            )
+            .await;
+        }
+        Err(e) => {
+            audit_update(
+                pool,
+                actor,
+                "rollback.pull",
+                server_id,
+                "failed",
+                serde_json::json!({ "target": pull_ref, "error": e.to_string(), "continued": true }),
+            )
+            .await;
+        }
+    }
+
+    // Recreate with the previous image, then swap the refs
     // (current ↔ previous) so the undone image stays reachable.
     let spec = match build_spec(
         &server,
@@ -1695,7 +1748,12 @@ pub async fn execute_rollback<A: RuntimeAdapter>(
         terminal_fail(pool, task_id, "SERVER_BUSY", &format!("rollback failed: another operation is in flight for this server. {DATA_FORMAT_WARNING}")).await;
         return Ok(());
     }
-    task_runner::mark_running(pool, task_id, "rollback in progress").await?;
+    // Same claim-then-mark discipline as the update entry: release the lock
+    // before propagating a DB error.
+    if let Err(e) = task_runner::mark_running(pool, task_id, "rollback in progress").await {
+        op_release(&server_id).await;
+        return Err(e);
+    }
     execute_rollback_inner(
         pool,
         adapter,
@@ -1788,26 +1846,50 @@ pub async fn update_server(
     unlock(&state.op_locks, &id).await;
     match outcome {
         Ok(task_id) => {
-            let Some(runner) = &state.runner else {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
+            // The task row already exists: a missing runtime or a failed
+            // submit must fail it (never leave it `queued`, which would wedge
+            // every later op behind SERVER_BUSY until a reboot recovery pass).
+            let failure: Option<(&'static str, String)> = match &state.runner {
+                None => Some((
                     "RUNTIME_UNAVAILABLE",
-                    "no task runner attached; update unavailable",
-                );
+                    "no task runner attached; update unavailable".to_string(),
+                )),
+                Some(runner) => {
+                    if state.adapter.is_none() {
+                        Some((
+                            "RUNTIME_UNAVAILABLE",
+                            "no runtime attached; update unavailable".to_string(),
+                        ))
+                    } else {
+                        match runner.submit(&task_id).await {
+                            Ok(()) => None,
+                            Err(e) => {
+                                Some(("TASK_QUEUE_FULL", format!("task queue unavailable: {e}")))
+                            }
+                        }
+                    }
+                }
             };
-            if state.adapter.is_none() {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "RUNTIME_UNAVAILABLE",
-                    "no runtime attached; update unavailable",
-                );
-            }
-            if let Err(e) = runner.submit(&task_id).await {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "TASK_QUEUE_FULL",
-                    &format!("task queue unavailable: {e}"),
-                );
+            if let Some((code, msg)) = failure {
+                terminal_fail(
+                    &state.pool,
+                    &task_id,
+                    code,
+                    &format!("update failed: {msg}"),
+                )
+                .await;
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "update.enqueue",
+                    "server",
+                    &id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "task_id": task_id, "error_code": code }),
+                )
+                .await;
+                return error(StatusCode::SERVICE_UNAVAILABLE, code, &msg);
             }
             audit::record(
                 &state.pool,
@@ -1862,26 +1944,50 @@ pub async fn rollback_server(
     unlock(&state.op_locks, &id).await;
     match outcome {
         Ok(task_id) => {
-            let Some(runner) = &state.runner else {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
+            // The task row already exists: a missing runtime or a failed
+            // submit must fail it (never leave it `queued`, which would wedge
+            // every later op behind SERVER_BUSY until a reboot recovery pass).
+            let failure: Option<(&'static str, String)> = match &state.runner {
+                None => Some((
                     "RUNTIME_UNAVAILABLE",
-                    "no task runner attached; rollback unavailable",
-                );
+                    "no task runner attached; rollback unavailable".to_string(),
+                )),
+                Some(runner) => {
+                    if state.adapter.is_none() {
+                        Some((
+                            "RUNTIME_UNAVAILABLE",
+                            "no runtime attached; rollback unavailable".to_string(),
+                        ))
+                    } else {
+                        match runner.submit(&task_id).await {
+                            Ok(()) => None,
+                            Err(e) => {
+                                Some(("TASK_QUEUE_FULL", format!("task queue unavailable: {e}")))
+                            }
+                        }
+                    }
+                }
             };
-            if state.adapter.is_none() {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "RUNTIME_UNAVAILABLE",
-                    "no runtime attached; rollback unavailable",
-                );
-            }
-            if let Err(e) = runner.submit(&task_id).await {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "TASK_QUEUE_FULL",
-                    &format!("task queue unavailable: {e}"),
-                );
+            if let Some((code, msg)) = failure {
+                terminal_fail(
+                    &state.pool,
+                    &task_id,
+                    code,
+                    &format!("rollback failed: {msg}. {DATA_FORMAT_WARNING}"),
+                )
+                .await;
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "rollback.enqueue",
+                    "server",
+                    &id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "task_id": task_id, "error_code": code }),
+                )
+                .await;
+                return error(StatusCode::SERVICE_UNAVAILABLE, code, &msg);
             }
             audit::record(
                 &state.pool,
@@ -1946,6 +2052,8 @@ mod tests {
                 bind_address TEXT NOT NULL DEFAULT '0.0.0.0',
                 desired_state TEXT NOT NULL DEFAULT 'stopped',
                 observed_state TEXT NOT NULL DEFAULT 'created',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 deleted_at TEXT
             )",
         )
@@ -2345,6 +2453,8 @@ mod tests {
                 bind_address TEXT NOT NULL DEFAULT '0.0.0.0',
                 desired_state TEXT NOT NULL DEFAULT 'stopped',
                 observed_state TEXT NOT NULL DEFAULT 'created',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 deleted_at TEXT
             )",
         )
@@ -2552,5 +2662,388 @@ mod tests {
                 .await
                 .expect("readback");
         assert_eq!(cur, "ghcr.io/pumpkin-mc/pumpkin:master");
+    }
+
+    // --- final-review fix wave (each test fails before its fix) ---
+
+    fn test_owner() -> AuthUser {
+        AuthUser {
+            id: "u-owner".to_string(),
+            username: "owner".to_string(),
+            role: crate::auth::Role::Owner,
+        }
+    }
+
+    /// Orphan task: the handler creates the task row, then finds no runner.
+    /// The row must end `failed` (honest code), never `queued` — a stuck
+    /// `queued` row wedges every later op behind SERVER_BUSY.
+    #[tokio::test]
+    async fn update_without_runner_fails_task_without_orphan() {
+        let pool = test_pool().await;
+        seed_server(
+            &pool,
+            "srv-orphan-upd",
+            25601,
+            "/tmp/pumpkin-test-orphan-upd",
+        )
+        .await;
+        let root = std::env::temp_dir().join(format!("pumpkin-orphan-upd-{}", Uuid::new_v4()));
+        let state = crate::AppState::for_tests(pool.clone(), root);
+        let resp = update_server(
+            State(state),
+            test_owner(),
+            AxumPath("srv-orphan-upd".to_string()),
+            Json(UpdateRequest {
+                image_reference: TARGET.to_string(),
+                image_digest: None,
+                allow_without_backup: true,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let row: (String, String, Option<String>) =
+            sqlx::query_as("SELECT id, state, error_code FROM tasks WHERE server_id = ?")
+                .bind("srv-orphan-upd")
+                .fetch_one(&pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(row.1, "failed", "task left orphaned in state {}", row.1);
+        assert_eq!(row.2.as_deref(), Some("RUNTIME_UNAVAILABLE"));
+        // Follow-up op is not SERVER_BUSY-stuck.
+        enqueue_update(&pool, None, "srv-orphan-upd", None, TARGET, None, true)
+            .await
+            .expect("follow-up update must not be busy-stuck");
+    }
+
+    /// Rollback twin of the orphan-task test.
+    #[tokio::test]
+    async fn rollback_without_runner_fails_task_without_orphan() {
+        let pool = test_pool().await;
+        seed_server(&pool, "srv-orphan-rb", 25602, "/tmp/pumpkin-test-orphan-rb").await;
+        sqlx::query(
+            "UPDATE servers SET previous_image_reference = 'ghcr.io/pumpkin-mc/pumpkin:v1'
+              WHERE id = 'srv-orphan-rb'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed previous");
+        let root = std::env::temp_dir().join(format!("pumpkin-orphan-rb-{}", Uuid::new_v4()));
+        let state = crate::AppState::for_tests(pool.clone(), root);
+        let resp = rollback_server(
+            State(state),
+            test_owner(),
+            AxumPath("srv-orphan-rb".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let row: (String, String, Option<String>) =
+            sqlx::query_as("SELECT id, state, error_code FROM tasks WHERE server_id = ?")
+                .bind("srv-orphan-rb")
+                .fetch_one(&pool)
+                .await
+                .expect("orphan row");
+        assert_eq!(row.1, "failed", "task left orphaned in state {}", row.1);
+        assert_eq!(row.2.as_deref(), Some("RUNTIME_UNAVAILABLE"));
+        enqueue_rollback(&pool, None, "srv-orphan-rb", None)
+            .await
+            .expect("follow-up rollback must not be busy-stuck");
+    }
+
+    /// Op-claim leak: `mark_running` fails after `op_claim` succeeded. The
+    /// per-server worker lock must be released before the error propagates.
+    #[tokio::test]
+    async fn op_lock_released_when_update_claim_fails() {
+        let pool = test_pool().await;
+        seed_server(&pool, "srv-claim-upd", 25603, "/tmp/pumpkin-test-claim-upd").await;
+        let task_id = enqueue_update(&pool, None, "srv-claim-upd", None, TARGET, None, true)
+            .await
+            .expect("enqueue");
+        sqlx::query(
+            "CREATE TRIGGER abort_update_claim BEFORE UPDATE ON tasks
+             WHEN NEW.message = 'update in progress'
+             BEGIN SELECT RAISE(ABORT, 'boom at claim'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger");
+        execute_update(&pool, &NoDaemon, &task_id)
+            .await
+            .expect_err("mark_running failure must propagate");
+        assert!(
+            op_claim("srv-claim-upd").await,
+            "op lock leaked after mark_running failure"
+        );
+        op_release("srv-claim-upd").await;
+    }
+
+    /// Rollback twin of the op-claim leak test.
+    #[tokio::test]
+    async fn op_lock_released_when_rollback_claim_fails() {
+        let pool = test_pool().await;
+        seed_server(&pool, "srv-claim-rb", 25604, "/tmp/pumpkin-test-claim-rb").await;
+        sqlx::query(
+            "UPDATE servers SET previous_image_reference = 'ghcr.io/pumpkin-mc/pumpkin:v1'
+              WHERE id = 'srv-claim-rb'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed previous");
+        let task_id = enqueue_rollback(&pool, None, "srv-claim-rb", None)
+            .await
+            .expect("enqueue");
+        sqlx::query(
+            "CREATE TRIGGER abort_rollback_claim BEFORE UPDATE ON tasks
+             WHEN NEW.message = 'rollback in progress'
+             BEGIN SELECT RAISE(ABORT, 'boom at claim'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("trigger");
+        execute_rollback(&pool, &NoDaemon, &task_id)
+            .await
+            .expect_err("mark_running failure must propagate");
+        assert!(
+            op_claim("srv-claim-rb").await,
+            "op lock leaked after mark_running failure"
+        );
+        op_release("srv-claim-rb").await;
+    }
+
+    /// Truncation must not amputate the mandatory one-way rollback warning:
+    /// a >500-char error still carries the full warning within the cap.
+    #[tokio::test]
+    async fn long_rollback_error_keeps_warning() {
+        let pool = test_pool().await;
+        seed_server(&pool, "srv-trunc", 25605, "/tmp/pumpkin-test-trunc").await;
+        sqlx::query(
+            "UPDATE servers SET previous_image_reference = 'ghcr.io/pumpkin-mc/pumpkin:v1'
+              WHERE id = 'srv-trunc'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed previous");
+        let task_id = enqueue_rollback(&pool, None, "srv-trunc", None)
+            .await
+            .expect("enqueue");
+        let long = format!(
+            "rollback failed: cannot recreate container with ghcr.io/pumpkin-mc/pumpkin:v1: {}. {DATA_FORMAT_WARNING}",
+            "x".repeat(800)
+        );
+        assert!(long.chars().count() > 500);
+        terminal_fail(&pool, &task_id, "ROLLBACK_FAILED", &long).await;
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(
+            task.message.contains(DATA_FORMAT_WARNING),
+            "one-way warning amputated: {}",
+            task.message.chars().take(80).collect::<String>()
+        );
+        assert!(
+            task.message.chars().count() <= 500,
+            "message exceeds 500-char cap: {}",
+            task.message.chars().count()
+        );
+    }
+
+    /// Short rollback messages pass through byte-identical.
+    #[tokio::test]
+    async fn short_rollback_error_unchanged() {
+        let pool = test_pool().await;
+        seed_server(&pool, "srv-trunc2", 25606, "/tmp/pumpkin-test-trunc2").await;
+        sqlx::query(
+            "UPDATE servers SET previous_image_reference = 'ghcr.io/pumpkin-mc/pumpkin:v1'
+              WHERE id = 'srv-trunc2'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed previous");
+        let task_id = enqueue_rollback(&pool, None, "srv-trunc2", None)
+            .await
+            .expect("enqueue");
+        let short = format!("rollback failed: boom. {DATA_FORMAT_WARNING}");
+        terminal_fail(&pool, &task_id, "ROLLBACK_FAILED", &short).await;
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(task.message, short);
+    }
+
+    /// Fake adapter recording call order; pull succeeds.
+    struct RecordingAdapter {
+        log: std::sync::Mutex<Vec<String>>,
+        pull_ok: bool,
+    }
+
+    #[allow(clippy::manual_async_fn)] // trait declares `-> impl Future`; async fn can't express it here
+    impl RuntimeAdapter for RecordingAdapter {
+        fn create(
+            &self,
+            _spec: &ValidatedServerSpec,
+        ) -> impl std::future::Future<Output = Result<crate::runtime::RuntimeHandle, RuntimeError>> + Send
+        {
+            self.log.lock().expect("log").push("create".to_string());
+            async {
+                Ok(crate::runtime::RuntimeHandle {
+                    container_id: "c-rb-test".to_string(),
+                    container_name: "pumpkin-test".to_string(),
+                })
+            }
+        }
+        fn start(
+            &self,
+            _container_id: &str,
+        ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn stop(
+            &self,
+            _container_id: &str,
+            _timeout_secs: u32,
+        ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn restart(
+            &self,
+            _container_id: &str,
+        ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn remove(
+            &self,
+            _container_id: &str,
+        ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn inspect(
+            &self,
+            _container_id: &str,
+        ) -> impl std::future::Future<Output = Result<crate::runtime::RuntimeSnapshot, RuntimeError>>
+               + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn logs(
+            &self,
+            _container_id: &str,
+            _tail: usize,
+        ) -> impl std::future::Future<Output = Result<Vec<String>, RuntimeError>> + Send {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn stats(
+            &self,
+            _container_id: &str,
+        ) -> impl std::future::Future<Output = Result<crate::runtime::RuntimeStats, RuntimeError>> + Send
+        {
+            async { Err(RuntimeError::InvalidConfiguration("no daemon".into())) }
+        }
+        fn pull_image(
+            &self,
+            reference: &str,
+        ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send {
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("pull:{reference}"));
+            let ok = self.pull_ok;
+            async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::InvalidConfiguration("pruned".into()))
+                }
+            }
+        }
+    }
+
+    const RB_PREV: &str = "ghcr.io/pumpkin-mc/pumpkin:v1.0";
+
+    async fn seed_rollback_server(pool: &SqlitePool, id: &str, port: i64) {
+        seed_server(pool, id, port, "/tmp/pumpkin-test-rb-pull").await;
+        sqlx::query("UPDATE servers SET previous_image_reference = ? WHERE id = ?")
+            .bind(RB_PREV)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("seed previous");
+    }
+
+    /// Rollback must pull the previous image BEFORE recreating the container.
+    #[tokio::test]
+    async fn rollback_pulls_previous_image_before_recreate() {
+        let pool = test_pool().await;
+        // build_spec requires a UUID server id on the recreate path.
+        let server_id = Uuid::new_v4().to_string();
+        seed_rollback_server(&pool, &server_id, 25607).await;
+        let task_id = enqueue_rollback(&pool, None, &server_id, None)
+            .await
+            .expect("enqueue");
+        let fake = RecordingAdapter {
+            log: std::sync::Mutex::new(Vec::new()),
+            pull_ok: true,
+        };
+        task_runner::dispatch_task(&pool, &fake, &task_id)
+            .await
+            .expect("dispatch");
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            task.state,
+            task_runner::TaskState::Succeeded,
+            "rollback failed: {}",
+            task.message
+        );
+        assert!(
+            task.message.contains("one-way"),
+            "rollback success must carry the warning, got: {}",
+            task.message
+        );
+        let log = fake.log.lock().expect("log").clone();
+        assert_eq!(
+            log,
+            vec![format!("pull:{RB_PREV}"), "create".to_string()],
+            "rollback must pull the previous image before recreate, got: {log:?}"
+        );
+    }
+
+    /// A failed previous-image pull is best-effort: rollback proceeds and a
+    /// truly-gone image still fails honestly at create, not at pull.
+    #[tokio::test]
+    async fn rollback_proceeds_when_previous_pull_fails() {
+        let pool = test_pool().await;
+        let server_id = Uuid::new_v4().to_string();
+        seed_rollback_server(&pool, &server_id, 25608).await;
+        let task_id = enqueue_rollback(&pool, None, &server_id, None)
+            .await
+            .expect("enqueue");
+        let fake = RecordingAdapter {
+            log: std::sync::Mutex::new(Vec::new()),
+            pull_ok: false,
+        };
+        task_runner::dispatch_task(&pool, &fake, &task_id)
+            .await
+            .expect("dispatch");
+        let task = task_runner::get(&pool, &task_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            task.state,
+            task_runner::TaskState::Succeeded,
+            "best-effort pull failure must not block rollback: {}",
+            task.message
+        );
+        let log = fake.log.lock().expect("log").clone();
+        assert!(
+            log.first().is_some_and(|e| e.starts_with("pull:")),
+            "previous-image pull must still be attempted, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|e| e == "create"),
+            "rollback must proceed to recreate after a failed pull, got: {log:?}"
+        );
     }
 }

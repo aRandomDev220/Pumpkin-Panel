@@ -403,16 +403,57 @@ pub async fn delete_user(
         }
     }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let _ =
-        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
-            .bind(&now)
-            .bind(&id)
-            .execute(&state.pool)
-            .await;
-    let _ = sqlx::query("DELETE FROM users WHERE id = ?")
+    // Session revocation and the row delete must both succeed: a swallowed DB
+    // error here must surface as 5xx with a `failed` audit, never 204 + `ok`.
+    if sqlx::query("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+        .bind(&now)
         .bind(&id)
         .execute(&state.pool)
+        .await
+        .is_err()
+    {
+        audit::record(
+            &state.pool,
+            Some(&actor.id),
+            "users.delete",
+            "user",
+            &id,
+            "failed",
+            &request_id,
+            serde_json::json!({ "stage": "revoke" }),
+        )
         .await;
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to revoke user sessions",
+        );
+    }
+    match sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() == 1 => {}
+        _ => {
+            audit::record(
+                &state.pool,
+                Some(&actor.id),
+                "users.delete",
+                "user",
+                &id,
+                "failed",
+                &request_id,
+                serde_json::json!({ "stage": "delete" }),
+            )
+            .await;
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to delete user",
+            );
+        }
+    }
     audit::record(
         &state.pool,
         Some(&actor.id),
@@ -1488,5 +1529,53 @@ mod tests {
             "unexpected filename: {disposition}"
         );
         assert!(res.as_bytes().as_ref().starts_with(b"SQLite format 3\0"));
+    }
+
+    /// Delete-error swallow: a DB failure in `DELETE FROM users` must surface
+    /// as 5xx with a `failed` audit — never 204 + `ok`.
+    #[tokio::test]
+    async fn delete_user_db_failure_is_500_without_success_audit() {
+        let fx = admin_fixture().await;
+        let viewer: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer1'")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        // Forced DB error exactly at the DELETE (the lookup + revoke above it
+        // still succeed, pinning the reported defect).
+        sqlx::query(
+            "CREATE TRIGGER no_user_delete BEFORE DELETE ON users
+             BEGIN SELECT RAISE(ABORT, 'boom-delete'); END;",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let res = fx
+            .server
+            .delete(&format!("/api/v1/users/{viewer}"))
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 500, "body: {}", res.text());
+        // The user is still there (nothing was deleted).
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+            .bind(&viewer)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "failed delete must not remove the user");
+        // Failed audit recorded, never a success audit.
+        let ok: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'users.delete' AND outcome = 'ok'",
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(ok, 0, "failed delete must not audit ok");
+        let failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'users.delete' AND outcome = 'failed'",
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert!(failed >= 1, "failed delete must audit failed");
     }
 }
