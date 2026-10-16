@@ -45,44 +45,64 @@ export default function Setup() {
   }
 
   return (
-    <section>
-      <h2>First-time setup</h2>
-      <p className="muted">Create the initial admin account. This runs once.</p>
-      <form onSubmit={onSubmit}>
-        <label>
-          Admin username
-          <input
+    <section className="auth-page">
+      <div className="auth-card">
+        <div className="auth-heading">
+          <span className="auth-kicker">PUMPKIN CONTROL PLANE</span>
+          <h2>Set up your panel</h2>
+          <p className="muted">Create the owner account. This runs once.</p>
+        </div>
+        {window.location.protocol === "http:" && (
+          <p className="auth-notice" role="status">
+            This LAN install is using HTTP. Keep non-secure cookies enabled, or
+            place the panel behind HTTPS before exposing it outside your network.
+          </p>
+        )}
+        <form className="auth-form" onSubmit={onSubmit}>
+          <label className="field">
+            <span>Admin username</span>
+            <input
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             autoComplete="username"
             required
           />
-        </label>
-        <label>
-          Password (min 8 chars)
-          <input
-            type="password"
-            value={password}
+          </label>
+          <label className="field">
+            <span>Password (min 8 chars) <small>8 characters minimum</small></span>
+            <input
+              type="password"
+              aria-label="Password (min 8 chars)"
+              value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="new-password"
             required
           />
-        </label>
-        <label>
-          Confirm password
-          <input
+          </label>
+          <label className="field">
+            <span>Confirm password</span>
+            <input
             type="password"
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
             autoComplete="new-password"
             required
           />
-        </label>
-        {(error ?? setupError) && <p className="err">{error ?? setupError}</p>}
-        <button type="submit" disabled={setupPending || needsSetupLoading}>
-          {setupPending ? "Creating…" : "Create admin"}
-        </button>
-      </form>
+          </label>
+          {(error ?? setupError) && (
+            <p className="err auth-error" role="alert">{error ?? setupError}</p>
+          )}
+          <button
+            className="auth-submit"
+            type="submit"
+            aria-label="Create admin"
+            disabled={setupPending || needsSetupLoading}
+          >
+            {setupPending ? "Creating account…" : "Create owner account"}
+          </button>
+        </form>
+        <p className="auth-switch muted">Already configured? <Link to="/login">Sign in</Link>.</p>
+      </div>
     </section>
   );
 }

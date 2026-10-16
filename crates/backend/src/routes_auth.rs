@@ -201,7 +201,12 @@ pub async fn setup(
                 username: username.clone(),
                 role: "owner".to_string(),
             };
-            session_response(app.session_ttl_secs, app.secure_cookies, &token, user)
+            session_response(
+                app.session_ttl_secs,
+                cookie_secure(app.secure_cookies, &headers),
+                &token,
+                user,
+            )
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     }
@@ -284,7 +289,12 @@ pub async fn login(
                 username,
                 role,
             };
-            session_response(app.session_ttl_secs, app.secure_cookies, &token, user)
+            session_response(
+                app.session_ttl_secs,
+                cookie_secure(app.secure_cookies, &headers),
+                &token,
+                user,
+            )
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     }
@@ -307,7 +317,7 @@ pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> R
     .bind(&token_hash)
     .execute(&pool)
     .await;
-    clear_session_cookies(app.secure_cookies)
+    clear_session_cookies(cookie_secure(app.secure_cookies, &headers))
 }
 
 /// GET /api/v1/auth/me — returns the authenticated user.
@@ -468,6 +478,34 @@ fn build_cookie(name: &str, value: &str, max_age: i64, secure: bool, http_only: 
     cookie
 }
 
+/// Cookies need to match the browser transport. A direct LAN install commonly
+/// serves HTTP, while a production reverse proxy serves HTTPS to the browser
+/// and HTTP to this process. The browser supplies Origin/Referer on these
+/// mutations, so use that signal without trusting arbitrary forwarded headers.
+/// The configured secure default remains the fallback for non-browser clients.
+fn cookie_secure(configured_secure: bool, headers: &HeaderMap) -> bool {
+    if !configured_secure {
+        return false;
+    }
+    let source = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::REFERER)
+                .and_then(|value| value.to_str().ok())
+        });
+    match source {
+        Some(value) if value.starts_with("http://") => false,
+        Some(value) if value.starts_with("https://") => true,
+        _ => headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.eq_ignore_ascii_case("https"))
+            .unwrap_or(configured_secure),
+    }
+}
+
 fn clear_cookie(name: &str, secure: bool, http_only: bool) -> String {
     let mut cookie =
         format!("{name}=; Path=/; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
@@ -610,4 +648,30 @@ fn error(status: StatusCode, code: &'static str) -> Response {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::cookie_secure;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn browser_http_origin_disables_secure_cookie_for_lan_install() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("http://192.168.1.41:8080"),
+        );
+        assert!(!cookie_secure(true, &headers));
+    }
+
+    #[test]
+    fn browser_https_origin_keeps_secure_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://panel.example.test"),
+        );
+        assert!(cookie_secure(true, &headers));
+    }
 }

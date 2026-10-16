@@ -4,8 +4,9 @@
   not expose the Docker Engine socket over TCP.
 - The first release is single-node and SQLite-backed; it is not a clustered
   control plane.
-- The application does not terminate TLS. Use a trusted HTTPS reverse proxy for
-  remote access. `PUMPKIN_INSECURE_COOKIES=1` is only for local HTTP development.
+- The application does not terminate TLS. The bundled Compose/CasaOS setup uses
+  `PUMPKIN_INSECURE_COOKIES=1` for trusted-LAN HTTP; use a trusted HTTPS reverse
+  proxy and set it to `0` before exposing the panel remotely.
 - Pumpkin image rollback restores the old image/container but cannot reverse a
   newer build's one-way world-data migration.
 - Manager database restore is staged and requires a restart.

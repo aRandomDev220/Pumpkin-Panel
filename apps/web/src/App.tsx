@@ -24,6 +24,7 @@ function HealthBadge() {
 
 function Nav() {
   const { user } = useAuth();
+  if (!user) return null;
   const privileged = isPrivilegedRole(user?.role);
   return (
     <nav>

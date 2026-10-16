@@ -21,7 +21,10 @@ services:
       PUMPKIN_MANAGER_BACKUP_DIR: /data/backups
       PUMPKIN_MANAGER_LOG_LEVEL: ${PUMPKIN_MANAGER_LOG_LEVEL:-info}
       PUMPKIN_MANAGER_DATABASE_URL: sqlite:/data/pumpkin-manager.db?mode=rwc
-      PUMPKIN_INSECURE_COOKIES: ${PUMPKIN_INSECURE_COOKIES:-0}
+      # The bundled Compose deployment serves plain HTTP by default. Secure
+      # cookies cannot be sent by browsers over http:// LAN addresses.
+      # Set PUMPKIN_INSECURE_COOKIES=0 when TLS is provided by a reverse proxy.
+      PUMPKIN_INSECURE_COOKIES: ${PUMPKIN_INSECURE_COOKIES:-1}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
