@@ -4,9 +4,12 @@ Self-hosted control plane for [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin)
 Minecraft servers. Single Docker image (Rust Axum API + embedded Vite UI),
 one child container per game server, SQLite, Docker Compose + CasaOS friendly.
 
-Status: **Phase 1 scaffold** — health endpoints, config, migrations, Compose.
-Lifecycle/auth/config/files/backups land in Phases 2-5 per
-`pumpkin-manager-implementation-plan.md`.
+Status: **Phases 1–7 complete** — auth + RBAC, server lifecycle with
+readiness-gated status, version-aware config with revisions, sandboxed
+files, verified backups + restore, metrics/alerts/scheduler, image updates
+with rollback, user admin, audit trail, and manager DB recovery. See
+`docs/phase2.md` … `docs/phase7.md` for per-phase logs, or
+`pumpkin-manager-implementation-plan.md` for the full spec.
 
 ## Quick start (dev)
 
