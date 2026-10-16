@@ -5,8 +5,6 @@
 //! truthful `state` for dead/stopped/unreachable ones (never zeros).
 //! [`prune_samples`] then enforces the 7-day / 50k-row bounds.
 
-#![allow(dead_code)] // Tasks 2-4 + controller consume this API next; drop then.
-
 use sqlx::SqlitePool;
 
 use crate::readiness::ping_java;
@@ -168,9 +166,14 @@ pub async fn prune_samples(pool: &SqlitePool) {
 }
 
 /// Newest-first history for one server since `since` (inclusive),
-/// capped at [`HISTORY_LIMIT`] rows.
-pub async fn server_samples(pool: &SqlitePool, server_id: &str, since: &str) -> Vec<SampleRow> {
-    sqlx::query_as::<
+/// capped at [`HISTORY_LIMIT`] rows. DB errors propagate: the history
+/// handler maps them to 500 so "database broken" never reads as empty.
+pub async fn server_samples(
+    pool: &SqlitePool,
+    server_id: &str,
+    since: &str,
+) -> Result<Vec<SampleRow>, sqlx::Error> {
+    Ok(sqlx::query_as::<
         _,
         (
             String,
@@ -189,8 +192,7 @@ pub async fn server_samples(pool: &SqlitePool, server_id: &str, since: &str) -> 
     .bind(server_id)
     .bind(since)
     .fetch_all(pool)
-    .await
-    .unwrap_or_default()
+    .await?
     .into_iter()
     .map(
         |(sampled_at, cpu_percent, memory_bytes, players_online, latency_ms, state)| SampleRow {
@@ -202,7 +204,7 @@ pub async fn server_samples(pool: &SqlitePool, server_id: &str, since: &str) -> 
             state,
         },
     )
-    .collect()
+    .collect())
 }
 
 /// Map a raw Docker status to the manager's observed-state vocabulary
@@ -275,7 +277,9 @@ mod tests {
 
         // Daemon gone (no adapter): one row, NULL metrics, truthful state.
         sample_all::<DockerAdapter>(&pool, None).await;
-        let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z").await;
+        let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z")
+            .await
+            .expect("history reads succeed");
         assert_eq!(rows.len(), 1, "exactly one row per sample_all call");
         assert_eq!(rows[0].state, "missing");
         assert!(
@@ -346,9 +350,8 @@ mod tests {
                 &self,
                 _container_id: &str,
                 _tail: usize,
-            ) -> impl std::future::Future<
-                Output = Result<Vec<String>, crate::runtime::RuntimeError>,
-            > + Send {
+            ) -> impl std::future::Future<Output = Result<Vec<String>, crate::runtime::RuntimeError>>
+                   + Send {
                 async { panic!("must not run") }
             }
             fn stats(
@@ -361,7 +364,9 @@ mod tests {
             }
         }
         sample_all(&pool, Some(&Unreachable)).await;
-        let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z").await;
+        let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z")
+            .await
+            .expect("history reads succeed");
         assert_eq!(rows.len(), 2, "exactly one row per server per call");
         for r in &rows {
             assert_eq!(r.state, "missing");
@@ -455,7 +460,9 @@ mod tests {
         }
         tx.commit().await.expect("commit");
 
-        let rows = server_samples(&pool, "hist-1", "1970-01-01T00:00:00.000Z").await;
+        let rows = server_samples(&pool, "hist-1", "1970-01-01T00:00:00.000Z")
+            .await
+            .expect("history reads succeed");
         assert_eq!(rows.len(), 1000, "history capped at 1000");
         for w in rows.windows(2) {
             assert!(

@@ -86,8 +86,19 @@ pub async fn server_metrics(
     }
     // History reads go through Task 1's canonical `server_samples`
     // (newest-first, 1000-capped, NULL-preserving) — no second query here.
+    // A history-query failure is 500, never an empty 200: the operator must
+    // be able to tell "no data yet" from "database broken".
     let since = utc_cutoff(window);
-    let rows = server_samples(&state.pool, &id, &since).await;
+    let rows = match server_samples(&state.pool, &id, &since).await {
+        Ok(rows) => rows,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to load metrics history",
+            );
+        }
+    };
     let samples: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -594,7 +605,9 @@ mod tests {
 
         // Canonical rows for the same window, recomputed independently.
         let since = super::utc_cutoff(3600);
-        let rows = crate::metrics_collector::server_samples(&pool, &id, &since).await;
+        let rows = crate::metrics_collector::server_samples(&pool, &id, &since)
+            .await
+            .expect("history reads succeed");
         assert_eq!(samples.len(), rows.len(), "handler mirrors canonical rows");
         for (json_row, row) in samples.iter().zip(rows.iter()) {
             assert_eq!(json_row["sampled_at"], json!(row.sampled_at));
@@ -606,6 +619,24 @@ mod tests {
         }
         // NULLs preserved end-to-end, never 0-filled.
         assert!(samples.iter().any(|s| s["cpu_percent"] == json!(null)));
+    }
+
+    #[tokio::test]
+    async fn history_db_failure_is_500() {
+        let (server, pool) = test_router_server().await;
+        let t = owner_token(&server).await;
+        let id = seed_server(&pool, "dbfail", 25569, PINNED_IMAGE, &ts_ago(0)).await;
+        sqlx::query("DROP TABLE metrics_samples")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let res = server
+            .get(&format!("/api/v1/servers/{id}/metrics?range=1h"))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(res.status_code(), 500, "body: {}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(body["error_code"], json!("INTERNAL"));
     }
 
     #[tokio::test]
