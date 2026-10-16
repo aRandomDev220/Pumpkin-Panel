@@ -1,0 +1,14 @@
+Pumpkin Manager 0.1.0 release-candidate manifest
+
+Source commit: 0ed0f4bd0e8329eb0fabb0578ab456a5c7c7fc06
+Database migrations: 0001 through 0009
+Docker image tag: pumpkin-manager:phase8
+Docker image manifest digest: sha256:ea945857573625a141ee69432cf05832c5fc27c194b8c268af8af6cae137238a
+Dockerfile base images: pinned by digest in deploy/Dockerfile
+Tested manager platform: linux/amd64
+Tested Pumpkin image: ghcr.io/pumpkin-mc/pumpkin:master
+Tested Pumpkin digest: sha256:675adcf4f351ed8656385346bf514584b0bb34826f06b553cd16094196d79099
+
+Artifacts:
+- pumpkin-manager-0.1.0-source.tar.gz
+- pumpkin-manager-0.1.0-source.tar.gz.sha256
