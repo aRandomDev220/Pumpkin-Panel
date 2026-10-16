@@ -168,7 +168,7 @@ pub async fn prune_samples(pool: &SqlitePool) {
 }
 
 /// Newest-first history for one server since `since` (inclusive),
-/// capped at 1000 rows.
+/// capped at [`HISTORY_LIMIT`] rows.
 pub async fn server_samples(pool: &SqlitePool, server_id: &str, since: &str) -> Vec<SampleRow> {
     sqlx::query_as::<
         _,
@@ -180,12 +180,12 @@ pub async fn server_samples(pool: &SqlitePool, server_id: &str, since: &str) -> 
             Option<i64>,
             String,
         ),
-    >(
+    >(&format!(
         "SELECT sampled_at, cpu_percent, memory_usage_bytes, players_online, latency_ms, state \
-         FROM metrics_samples \
-         WHERE server_id = ? AND sampled_at >= ? \
-         ORDER BY sampled_at DESC, rowid DESC LIMIT 1000",
-    )
+             FROM metrics_samples \
+             WHERE server_id = ? AND sampled_at >= ? \
+             ORDER BY sampled_at DESC, rowid DESC LIMIT {HISTORY_LIMIT}",
+    ))
     .bind(server_id)
     .bind(since)
     .fetch_all(pool)
@@ -211,16 +211,13 @@ fn normalize_state(status: &str) -> String {
     match status.to_lowercase().as_str() {
         "running" => "running",
         "created" => "created",
+        "paused" => "paused",
         "restarting" => "starting",
         "removing" => "stopping",
-        _ => "exited",
+        "exited" | "dead" => "exited",
+        _ => "unknown",
     }
     .to_string()
-}
-
-#[allow(dead_code)]
-fn history_limit() -> i64 {
-    HISTORY_LIMIT
 }
 
 #[cfg(test)]
@@ -349,8 +346,9 @@ mod tests {
                 &self,
                 _container_id: &str,
                 _tail: usize,
-            ) -> impl std::future::Future<Output = Result<Vec<String>, crate::runtime::RuntimeError>>
-                   + Send {
+            ) -> impl std::future::Future<
+                Output = Result<Vec<String>, crate::runtime::RuntimeError>,
+            > + Send {
                 async { panic!("must not run") }
             }
             fn stats(
@@ -467,6 +465,12 @@ mod tests {
                 w[1].sampled_at
             );
         }
+    }
+
+    #[tokio::test]
+    async fn normalize_state_truthful_mapping() {
+        assert_eq!(normalize_state("paused"), "paused");
+        assert_eq!(normalize_state("weird-state"), "unknown");
     }
 
     #[tokio::test]
