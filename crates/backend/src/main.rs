@@ -13,9 +13,9 @@ mod readiness;
 mod routes_admin;
 mod routes_auth;
 mod routes_backup;
-mod routes_metrics;
 mod routes_config;
 mod routes_files;
+mod routes_metrics;
 mod routes_servers;
 mod runtime;
 mod scheduler;
@@ -138,6 +138,42 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/metrics/summary",
             get(metrics::metrics_summary).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/metrics",
+            get(routes_metrics::server_metrics).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/alerts",
+            get(routes_metrics::list_alerts).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/scheduled-tasks",
+            get(scheduler::list_scheduled_tasks).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerLifecycle),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/scheduled-tasks",
+            post(scheduler::create_scheduled_task).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerLifecycle),
+            )),
+        )
+        .route(
+            "/api/v1/scheduled-tasks/:id",
+            delete(scheduler::delete_scheduled_task).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerLifecycle),
+            )),
+        )
+        .route(
+            "/api/v1/admin/diagnostics",
+            get(routes_admin::export_diagnostics).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::SettingsManage),
             )),
         )
         .route(
@@ -471,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 scheduler::tick_once(&pool, adapter.as_deref(), &backup_root).await;
+                metrics_collector::sample_all(&pool, adapter.as_deref()).await;
             }
         });
     }
