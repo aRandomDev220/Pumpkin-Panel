@@ -20,6 +20,7 @@ mod routes_servers;
 mod runtime;
 mod scheduler;
 mod task_runner;
+mod update_service;
 #[cfg(test)]
 mod tests_concurrency;
 #[cfg(test)]
