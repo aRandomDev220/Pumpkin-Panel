@@ -1,14 +1,14 @@
 # Single-image manager: Rust API serves Vite build + /api/v1.
 # Phase 1 scaffold. Child Pumpkin containers are created at runtime via /var/run/docker.sock.
 
-FROM node:24-alpine AS webbuild
+FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS webbuild
 WORKDIR /web
 COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci
 COPY apps/web/ ./
 RUN npm run build
 
-FROM rust:1.90-alpine AS apibuild
+FROM rust:1.90-alpine@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS apibuild
 RUN apk add --no-cache musl-dev sqlite-dev pkgconfig
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
@@ -16,7 +16,7 @@ COPY crates/ ./crates/
 COPY migrations/ ./migrations/
 RUN cargo build --release -p pumpkin-manager-backend
 
-FROM alpine:3.21
+FROM alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507
 RUN apk add --no-cache ca-certificates sqlite-libs su-exec \
  && addgroup -S app && adduser -S app -G app
 WORKDIR /app
