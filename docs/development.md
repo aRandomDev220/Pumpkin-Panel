@@ -8,7 +8,8 @@
 
 ```sh
 cp deploy/.env.example deploy/.env
-PUMPKIN_MANAGER_DATABASE_URL='sqlite:./dev.db?mode=rwc' cargo run -p pumpkin-manager-backend
+# Direct local HTTP needs the explicit development cookie override.
+PUMPKIN_INSECURE_COOKIES=1 PUMPKIN_MANAGER_DATABASE_URL='sqlite:./dev.db?mode=rwc' cargo run -p pumpkin-manager-backend
 curl localhost:8080/api/v1/health/live
 ```
 

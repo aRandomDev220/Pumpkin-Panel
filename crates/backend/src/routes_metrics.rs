@@ -284,6 +284,7 @@ mod tests {
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0005_backups.sql"),
+            include_str!("../../../migrations/0009_app_settings.sql"),
             METRICS_SQL,
         ] {
             // Strip full-line `--` comments first: some carry `;` inside
@@ -334,7 +335,8 @@ mod tests {
             .json(&json!({"username": "owner", "password": "supersecret1"}))
             .await;
         assert_eq!(res.status_code(), 200, "setup failed: {}", res.text());
-        res.json::<Value>()["token"].as_str().unwrap().to_string()
+        crate::auth::session_token_from_set_cookie(res.headers())
+            .expect("pm_session cookie after setup")
     }
 
     async fn seed_server(

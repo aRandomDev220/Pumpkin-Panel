@@ -137,24 +137,19 @@ pub fn select_for_deletion(
         .collect()
 }
 
-/// Validate a 5-field standard cron expression (`minute hour dom month dow`).
+/// Validate a standard 5-field cron expression (`minute hour dom month dow`).
 ///
-/// Uses the `cron` crate parser; 5-field expressions are parsed with an
-/// implicit `seconds = 0` prefix.
+/// Only exactly five whitespace-separated fields are accepted; the `cron`
+/// crate parser wants a leading seconds field, so a `0` prefix is shimmed in.
+/// Six/seven-field (seconds/year) forms and named aliases (`@daily`) are
+/// rejected: the scheduler stores and evaluates 5-field expressions only.
 pub fn cron_is_valid(expr: &str) -> bool {
     use std::str::FromStr;
-    let expr = expr.trim();
-    if expr.is_empty() {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
         return false;
     }
-    if cron::Schedule::from_str(expr).is_ok() {
-        return true;
-    }
-    if expr.split_whitespace().count() == 5 {
-        let with_seconds = format!("0 {expr}");
-        return cron::Schedule::from_str(&with_seconds).is_ok();
-    }
-    false
+    cron::Schedule::from_str(&format!("0 {}", fields.join(" "))).is_ok()
 }
 
 /// Create a full tar.gz backup of `data_dir` at `dest_file`.

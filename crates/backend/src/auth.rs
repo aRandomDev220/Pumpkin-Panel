@@ -8,7 +8,14 @@
 //!   `{error_code:"AUTH_REQUIRED"}`; missing permissions yield 403
 //!   `{error_code:"PERMISSION_DENIED"}`.
 
-use std::{future::Future, pin::Pin};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
+};
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -16,7 +23,7 @@ use argon2::{
 };
 use axum::{
     extract::{FromRequestParts, State},
-    http::{header, request::Parts, HeaderMap, StatusCode},
+    http::{header, request::Parts, HeaderMap, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -26,6 +33,26 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 pub const SESSION_COOKIE_NAME: &str = "pm_session";
+
+/// Readable by JS on purpose: double-submit CSRF pairs this cookie with the
+/// `X-CSRF-Token` header. Never marked `HttpOnly`.
+pub const CSRF_COOKIE_NAME: &str = "pm_csrf";
+
+/// Request header the SPA copies the `pm_csrf` cookie into.
+pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+/// Counts dummy Argon2id verifications run for unknown usernames. Test-only
+/// seam proving the timing-equalizing path executed (never gates behavior).
+pub(crate) static DUMMY_HASH_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Which credential carrier `extract_token_with_source` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    /// `Authorization: Bearer <token>` — immune to CSRF (not auto-sent).
+    Bearer,
+    /// `pm_session` cookie — auto-sent by browsers, so mutations need CSRF.
+    Cookie,
+}
 
 // ---------------------------------------------------------------------------
 // Roles & permissions (spec 12.2)
@@ -174,6 +201,24 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
         .is_ok())
 }
 
+/// A fixed, valid Argon2id hash used to equalize login timing for unknown
+/// usernames. Computed once per process from a throwaway password; the value
+/// never matches a real credential.
+pub fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        hash_password("timing-equalizer-not-a-real-password").unwrap_or_else(|_| String::new())
+    })
+}
+
+/// Burn the same Argon2id work a real verification costs, without revealing
+/// whether the account exists. The `DUMMY_HASH_CHECKS` counter is the seam
+/// tests use instead of flaky wall-clock assertions.
+pub fn verify_dummy(password: &str) {
+    DUMMY_HASH_CHECKS.fetch_add(1, Ordering::Relaxed);
+    let _ = verify_password(password, dummy_hash());
+}
+
 // ---------------------------------------------------------------------------
 // Session tokens (opaque bearer, SHA-256 at rest)
 // ---------------------------------------------------------------------------
@@ -263,6 +308,12 @@ fn forbidden() -> Response {
 
 /// Pulls the bearer token: `Authorization: Bearer` first, then cookie.
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
+    extract_token_with_source(headers).map(|(token, _)| token)
+}
+
+/// Like [`extract_token`], but reports which carrier supplied the token so the
+/// middleware can decide whether CSRF applies.
+pub fn extract_token_with_source(headers: &HeaderMap) -> Option<(String, TokenSource)> {
     if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -270,17 +321,22 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
         if let Some(token) = auth.strip_prefix("Bearer ") {
             let token = token.trim().to_owned();
             if !token.is_empty() {
-                return Some(token);
+                return Some((token, TokenSource::Bearer));
             }
         }
     }
+    cookie_value(headers, SESSION_COOKIE_NAME).map(|token| (token, TokenSource::Cookie))
+}
+
+/// Read one cookie value out of a `Cookie` header (first match wins).
+pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
             cookies.split(';').find_map(|pair| {
                 let (k, v) = pair.split_once('=')?;
-                if k.trim() == SESSION_COOKIE_NAME {
+                if k.trim() == name {
                     let v = v.trim().to_owned();
                     (!v.is_empty()).then_some(v)
                 } else {
@@ -290,11 +346,88 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// Double-submit CSRF: the `pm_csrf` cookie must equal the `X-CSRF-Token`
+/// header. Both must be non-empty. Compared in constant time.
+pub fn csrf_ok(headers: &HeaderMap) -> bool {
+    let Some(cookie) = cookie_value(headers, CSRF_COOKIE_NAME) else {
+        return false;
+    };
+    let Some(header) = headers
+        .get(CSRF_HEADER_NAME)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    else {
+        return false;
+    };
+    !header.is_empty() && constant_time_eq(cookie.as_bytes(), header.as_bytes())
+}
+
+/// `true` for methods that change state and therefore need CSRF protection.
+pub fn is_unsafe_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Test-only helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a cookie's value from a response's `Set-Cookie` headers (test-only:
+/// the token is no longer returned in the response body).
+#[cfg(test)]
+pub fn session_token_from_set_cookie(headers: &HeaderMap) -> Option<String> {
+    set_cookie_value(headers, SESSION_COOKIE_NAME)
+}
+
+/// Extract the `pm_csrf` cookie from a response's `Set-Cookie` headers.
+#[cfg(test)]
+pub fn csrf_token_from_set_cookie(headers: &HeaderMap) -> Option<String> {
+    set_cookie_value(headers, CSRF_COOKIE_NAME)
+}
+
+#[cfg(test)]
+fn set_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|raw| {
+            let (pair, _attrs) = raw.split_once(';').unwrap_or((raw, ""));
+            let (k, v) = pair.split_once('=')?;
+            (k.trim() == name && !v.trim().is_empty()).then(|| v.trim().to_owned())
+        })
+}
+
 /// Validates the session against the DB: unknown, revoked, or expired
 /// sessions and inactive users are rejected. Refreshes `last_seen_at`
 /// best-effort. Times in `sessions` are RFC 3339 UTC strings.
+#[allow(dead_code)] // thin wrapper kept for callers that don't need the source
 pub async fn authenticate(pool: &SqlitePool, headers: &HeaderMap) -> Option<AuthUser> {
-    let token = extract_token(headers)?;
+    authenticate_with_source(pool, headers)
+        .await
+        .map(|(user, _)| user)
+}
+
+/// Like [`authenticate`], but also reports the credential carrier so callers
+/// can enforce CSRF for cookie-authenticated mutations.
+pub async fn authenticate_with_source(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Option<(AuthUser, TokenSource)> {
+    let (token, source) = extract_token_with_source(headers)?;
     let token_hash = hash_token(&token);
     let row = sqlx::query(
         "SELECT s.user_id, s.expires_at, s.revoked_at,
@@ -333,7 +466,7 @@ pub async fn authenticate(pool: &SqlitePool, headers: &HeaderMap) -> Option<Auth
         .execute(pool)
         .await;
     tracing::debug!(user_id = %user.id, "authenticated request");
-    Some(user)
+    Some((user, source))
 }
 
 fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -342,20 +475,35 @@ fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// Axum middleware: attaches [`AuthUser`] or rejects 401.
+/// Axum middleware: attaches [`AuthUser`] or rejects 401. Cookie-authenticated
+/// unsafe methods must also present a matching `X-CSRF-Token` header, else 403
+/// `CSRF_FAILED` (bearer tokens are exempt: browsers do not auto-send them).
 /// Usage: `.route_layer(axum::middleware::from_fn_with_state(pool, auth_middleware))`.
 pub async fn auth_middleware(
     State(pool): State<SqlitePool>,
     mut req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    match authenticate(&pool, req.headers()).await {
-        Some(user) => {
+    let method = req.method().clone();
+    let csrf_ok = csrf_ok(req.headers());
+    match authenticate_with_source(&pool, req.headers()).await {
+        Some((_user, TokenSource::Cookie)) if is_unsafe_method(&method) && !csrf_ok => {
+            csrf_failed()
+        }
+        Some((user, _)) => {
             req.extensions_mut().insert(user);
             next.run(req).await
         }
         None => unauthorized(),
     }
+}
+
+fn csrf_failed() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error_code": "CSRF_FAILED" })),
+    )
+        .into_response()
 }
 
 /// Middleware factory enforcing one permission (after [`auth_middleware`]).
@@ -400,13 +548,27 @@ async fn check_permission(
 // First-run setup guard
 // ---------------------------------------------------------------------------
 
-/// True when no users exist yet (fresh install → allow `/auth/setup`).
+/// True when first-run setup has not completed and no users exist.
+///
+/// `setup_complete` (persisted in `app_settings`) is authoritative: once set,
+/// setup stays disabled even if the `users` table is later emptied.
 pub async fn needs_setup(pool: &SqlitePool) -> Result<bool, AuthError> {
+    if setup_complete(pool).await? {
+        return Ok(false);
+    }
     let row = sqlx::query("SELECT COUNT(*) AS count FROM users")
         .fetch_one(pool)
         .await?;
     use sqlx::Row as _;
     Ok(row.get::<i64, _>("count") == 0)
+}
+
+/// True once the one-shot `setup_complete` flag is persisted.
+pub async fn setup_complete(pool: &SqlitePool) -> Result<bool, AuthError> {
+    let row = sqlx::query("SELECT 1 FROM app_settings WHERE key = 'setup_complete' LIMIT 1")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -502,5 +664,82 @@ mod tests {
 
         let empty = HeaderMap::new();
         assert_eq!(extract_token(&empty), None);
+    }
+
+    #[test]
+    fn extract_token_reports_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}=cookie-token")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_token_with_source(&headers),
+            Some(("cookie-token".to_string(), TokenSource::Cookie))
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer bearer-token".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_token_with_source(&headers),
+            Some(("bearer-token".to_string(), TokenSource::Bearer))
+        );
+    }
+
+    #[test]
+    fn csrf_ok_requires_matching_header_and_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{CSRF_COOKIE_NAME}=abc123").parse().unwrap(),
+        );
+        assert!(!csrf_ok(&headers), "header absent → not ok");
+        headers.insert(CSRF_HEADER_NAME, "wrong".parse().unwrap());
+        assert!(!csrf_ok(&headers), "header mismatch → not ok");
+        headers.insert(CSRF_HEADER_NAME, "abc123".parse().unwrap());
+        assert!(csrf_ok(&headers), "matching header → ok");
+
+        let mut no_cookie = HeaderMap::new();
+        no_cookie.insert(CSRF_HEADER_NAME, "abc123".parse().unwrap());
+        assert!(!csrf_ok(&no_cookie), "cookie absent → not ok");
+    }
+
+    #[test]
+    fn unsafe_methods_are_flagged() {
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(is_unsafe_method(&method), "{method} is unsafe");
+        }
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(!is_unsafe_method(&method), "{method} is safe");
+        }
+    }
+
+    #[test]
+    fn set_cookie_value_reads_named_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::SET_COOKIE,
+            format!("{SESSION_COOKIE_NAME}=tok; HttpOnly; Secure")
+                .parse()
+                .unwrap(),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            format!("{CSRF_COOKIE_NAME}=csrfvalue; Path=/")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            session_token_from_set_cookie(&headers).as_deref(),
+            Some("tok")
+        );
+        assert_eq!(
+            csrf_token_from_set_cookie(&headers).as_deref(),
+            Some("csrfvalue")
+        );
+        assert_eq!(session_token_from_set_cookie(&HeaderMap::new()), None);
     }
 }

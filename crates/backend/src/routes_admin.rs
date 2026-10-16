@@ -1021,6 +1021,7 @@ mod tests {
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
+            include_str!("../../../migrations/0009_app_settings.sql"),
         ] {
             for stmt in file.split(";\n") {
                 let stmt = stmt.trim();
@@ -1159,6 +1160,7 @@ mod tests {
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
+            include_str!("../../../migrations/0009_app_settings.sql"),
         ] {
             let stripped: String = file
                 .lines()
@@ -1249,10 +1251,8 @@ mod tests {
             .json(&json!({"username": "owner", "password": "supersecret1"}))
             .await;
         assert_eq!(res.status_code(), 200, "setup: {}", res.text());
-        let token = res.json::<serde_json::Value>()["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let token = crate::auth::session_token_from_set_cookie(res.headers())
+            .expect("pm_session cookie after setup");
         let res = server
             .post("/api/v1/users")
             .authorization_bearer(&token)
@@ -1264,10 +1264,8 @@ mod tests {
             .json(&json!({"username": "viewer1", "password": "supersecret1"}))
             .await;
         assert_eq!(res.status_code(), 200, "viewer login: {}", res.text());
-        let viewer_token = res.json::<serde_json::Value>()["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let viewer_token = crate::auth::session_token_from_set_cookie(res.headers())
+            .expect("pm_session cookie after login");
         let live_db = dir.join("pumpkin-manager.db");
         AdminFixture {
             server,

@@ -15,11 +15,11 @@ import Audit from "./pages/Audit";
 import Settings from "./pages/Settings";
 
 function RequireAuth({ children }: { children: ReactNode }) {
-  const { token, isLoading, needsSetupLoading, needsSetup } = useAuth();
+  const { isAuthenticated, isLoading, needsSetupLoading, needsSetup } = useAuth();
   if (needsSetupLoading) return <p>Loading…</p>;
   if (needsSetup === true) return <Navigate to="/setup" replace />;
-  if (!token) return <Navigate to="/login" replace />;
   if (isLoading) return <p>Loading…</p>;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
 

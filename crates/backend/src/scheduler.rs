@@ -46,41 +46,10 @@ use crate::AppState;
 /// Returned in policy responses whenever `timezone != "UTC"`.
 pub const TIMEZONE_NOTE_UTC: &str = "interpreted as UTC";
 
-/// `backup_policies` DDL, verbatim from the Phase 5 plan (Task 2 migration
-/// text), plus `IF NOT EXISTS` so `tick_once` and handlers are safe to run in
-/// any order relative to that migration.
-const BACKUP_POLICIES_DDL: &str = "CREATE TABLE IF NOT EXISTS backup_policies (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name TEXT NOT NULL DEFAULT '', schedule TEXT NOT NULL DEFAULT '', timezone TEXT NOT NULL DEFAULT 'UTC', retention_count INTEGER NOT NULL DEFAULT 7, max_age_days INTEGER NOT NULL DEFAULT 30, enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT, next_run_at TEXT, created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))";
-
-/// `backups` DDL, verbatim from the Phase 5 plan (Task 2 migration text),
-/// plus `IF NOT EXISTS` for the same ordering safety.
-const BACKUPS_DDL: &str = "CREATE TABLE IF NOT EXISTS backups (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, type TEXT NOT NULL DEFAULT 'full', state TEXT NOT NULL DEFAULT 'in_progress' CHECK (state IN ('in_progress','completed','failed')), storage_path TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0, checksum_algorithm TEXT NOT NULL DEFAULT 'sha256', checksum TEXT NOT NULL DEFAULT '', consistency_method TEXT NOT NULL DEFAULT 'stopped', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), completed_at TEXT, created_by TEXT REFERENCES users(id), error_summary TEXT, protected INTEGER NOT NULL DEFAULT 0)";
-
-/// `scheduled_tasks` DDL, verbatim from the Phase 6 plan (Task 1 migration
-/// text), plus `IF NOT EXISTS` so `tick_restarts` and handlers are safe to
-/// run in any order relative to that migration. Backup schedules stay in
-/// `backup_policies`; only `restart` lives here in Phase 6.
-///
-/// NOTE: the plan text shows `CHECK (kind IN ('restart',))`; the trailing
-/// comma is not valid SQLite (syntax error) so it is `IN ('restart')` here.
-/// Task 1's migration must use this exact corrected form.
-const SCHEDULED_TASKS_DDL: &str = "CREATE TABLE IF NOT EXISTS scheduled_tasks (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('restart')), schedule TEXT NOT NULL DEFAULT '', timezone TEXT NOT NULL DEFAULT 'UTC', enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT, next_run_at TEXT, created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))";
-
-/// Ensure the tables this module reads/writes exist. Idempotent; safe to call
-/// on every tick and from every handler.
-async fn ensure_tables(pool: &SqlitePool) {
-    for ddl in [BACKUP_POLICIES_DDL, BACKUPS_DDL, SCHEDULED_TASKS_DDL] {
-        if let Err(e) = sqlx::query(ddl).execute(pool).await {
-            tracing::warn!(error = %e, "scheduler table ensure failed");
-        }
-    }
-    if let Err(e) =
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_backups_server ON backups(server_id)")
-            .execute(pool)
-            .await
-    {
-        tracing::warn!(error = %e, "scheduler index ensure failed");
-    }
-}
+// Schema note: `backup_policies`, `backups` (0005_backups.sql) and
+// `scheduled_tasks` (0006_metrics.sql, rebuilt by 0008_integrity.sql) are
+// created by migrations. This module deliberately performs NO runtime DDL:
+// the schema's single source of truth is the migration set.
 
 // ---------------------------------------------------------------------------
 // Cron helpers (validation is canonical `backup_service::cron_is_valid`)
@@ -214,7 +183,6 @@ pub async fn list_policies(
     _user: AuthUser,
     HttpPath(server_id): HttpPath<String>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
@@ -274,7 +242,6 @@ pub async fn create_policy(
     HttpPath(server_id): HttpPath<String>,
     Json(body): Json<CreatePolicyBody>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
@@ -375,7 +342,6 @@ pub async fn update_policy(
     HttpPath(policy_id): HttpPath<String>,
     Json(body): Json<UpdatePolicyBody>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     let Some(existing) = fetch_policy(&state.pool, &policy_id).await else {
         return error(
             StatusCode::NOT_FOUND,
@@ -489,7 +455,6 @@ pub async fn delete_policy(
     user: AuthUser,
     HttpPath(policy_id): HttpPath<String>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     let Some(existing) = fetch_policy(&state.pool, &policy_id).await else {
         return error(
             StatusCode::NOT_FOUND,
@@ -557,8 +522,9 @@ async fn load_completed_inputs(pool: &SqlitePool, server_id: &str) -> (Vec<Reten
 
 /// Evaluate one retention rule over the server's completed backups with the
 /// canonical Task 1 decision fn. Pure read path for the preview handler
-/// (post-backup prune/audit is owned by Task 2's worker).
-async fn preview_for(
+/// (post-backup prune/audit is owned by Task 2's worker). `pub(crate)` so the
+/// worker's prune and this preview can be asserted to agree in tests.
+pub(crate) async fn preview_for(
     pool: &SqlitePool,
     server_id: &str,
     keep: usize,
@@ -599,7 +565,6 @@ pub async fn retention_preview(
     HttpPath(server_id): HttpPath<String>,
     body: Option<Json<PreviewDraft>>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
@@ -696,7 +661,6 @@ pub async fn list_scheduled_tasks(
     _user: AuthUser,
     HttpPath(server_id): HttpPath<String>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
@@ -738,7 +702,6 @@ pub async fn create_scheduled_task(
     HttpPath(server_id): HttpPath<String>,
     Json(body): Json<CreateScheduledTaskBody>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     if !server_exists(&state.pool, &server_id).await {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
@@ -826,7 +789,6 @@ pub async fn delete_scheduled_task(
     user: AuthUser,
     HttpPath(row_id): HttpPath<String>,
 ) -> Response {
-    ensure_tables(&state.pool).await;
     let Some(existing) = fetch_scheduled_task(&state.pool, &row_id).await else {
         return error(
             StatusCode::NOT_FOUND,
@@ -863,14 +825,15 @@ pub async fn delete_scheduled_task(
 /// One restart-scheduler pass, called from [`tick_once`] (same 60s loop, no
 /// signature change there).
 ///
-/// For each enabled due `restart` row: enqueue one `restart`-type task,
-/// claim it like dispatch (`mark_running`), and execute `adapter.restart`
-/// inline. Missing container → honest `MISSING_CONTAINER` failure; no
-/// runtime → `RUNTIME_UNAVAILABLE`; never a silent success. `next_run_at` is
-/// always recomputed strictly after now (single catch-up), so a manager
-/// reboot with a stale `next_run_at` runs exactly once.
+/// For each enabled due `restart` row: atomically claim the run slot
+/// (`next_run_at` CAS), enqueue one `restart`-type task, claim it exactly once
+/// (`claim_task` CAS), and execute `adapter.restart` inline. A busy server is
+/// SKIPPED (audited) rather than wedged. Missing container → honest
+/// `MISSING_CONTAINER` failure; no runtime → `RUNTIME_UNAVAILABLE`; never a
+/// silent success. `next_run_at` is always recomputed strictly after now
+/// (single catch-up), so a manager reboot with a stale `next_run_at` runs
+/// exactly once and concurrent ticks cannot double-enqueue.
 pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
-    ensure_tables(pool).await;
     let now = Utc::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -921,6 +884,30 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
             continue;
         }
 
+        // Atomic claim of this run slot: advance `next_run_at` with a CAS so
+        // two concurrent ticks cannot both enqueue for the same occurrence.
+        // Losing the race means another tick already owns the run.
+        if !claim_restart_slot(pool, &fresh, &now, &now_str).await {
+            continue;
+        }
+
+        // A busy server is SKIPPED (with the outcome recorded), never wedged.
+        // The run slot is already advanced, so the next tick tries the next one.
+        if server_busy(pool, &fresh.server_id).await {
+            audit::record(
+                pool,
+                fresh.created_by.as_deref(),
+                "restart.schedule.skipped",
+                "scheduled_task",
+                &fresh.id,
+                "skipped",
+                &audit::request_id(),
+                serde_json::json!({ "server_id": fresh.server_id, "reason": "SERVER_BUSY" }),
+            )
+            .await;
+            continue;
+        }
+
         let requested_by = fresh.created_by.clone();
         let record = match task_runner::enqueue(
             pool,
@@ -932,7 +919,6 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
         {
             Ok(record) => record,
             Err(e) => {
-                push_restart_next_run(pool, &fresh, &now).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -944,15 +930,22 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
                     serde_json::json!({
                         "server_id": fresh.server_id,
                         "error_code": "TASK_QUEUE_FULL",
-                        "error": e.to_string().chars().take(300).collect::<String>(),
+                        "error": task_runner::sanitize_summary(&e.to_string()),
                     }),
                 )
                 .await;
                 continue;
             }
         };
-        // Claim like dispatch so nothing double-executes the row.
-        let _ = task_runner::mark_running(pool, &record.id, "scheduled restart in progress").await;
+        // Atomic task claim (CAS queued→running): exactly one worker runs it.
+        if task_runner::claim_task(pool, &record.id)
+            .await
+            .unwrap_or(None)
+            .is_none()
+        {
+            // Already claimed or cancelled elsewhere: nothing to run.
+            continue;
+        }
 
         // Resolve the container before touching the runtime: every failure
         // below lands on the task row with an honest code, never silently.
@@ -983,10 +976,7 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
                 ),
                 Some(a) => match a.restart(container_id).await {
                     Ok(()) => Outcome::Ok,
-                    Err(e) => Outcome::Fail(
-                        e.code(),
-                        e.to_string().chars().take(500).collect::<String>(),
-                    ),
+                    Err(e) => Outcome::Fail(e.code(), e.to_string()),
                 },
             },
         };
@@ -996,7 +986,6 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
             .bind(&fresh.id)
             .execute(pool)
             .await;
-        push_restart_next_run(pool, &fresh, &now).await;
         match outcome {
             Outcome::Ok => {
                 let _ = task_runner::mark_succeeded(pool, &record.id, "server restarted").await;
@@ -1024,7 +1013,11 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
                 .await;
             }
             Outcome::Fail(code, summary) => {
-                let _ = task_runner::mark_failed(pool, &record.id, code, &summary).await;
+                // Full runtime detail to the log; only the sanitized summary
+                // reaches the task row and the audit metadata.
+                tracing::error!(task_id = %record.id, code, detail = %summary, "scheduled restart failed");
+                let safe = task_runner::sanitize_summary(&summary);
+                let _ = task_runner::mark_failed(pool, &record.id, code, &safe).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1037,7 +1030,7 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
                         "server_id": fresh.server_id,
                         "scheduled_task_id": fresh.id,
                         "error_code": code,
-                        "error": summary.chars().take(300).collect::<String>(),
+                        "error": safe,
                     }),
                 )
                 .await;
@@ -1062,25 +1055,67 @@ async fn push_restart_next_run(pool: &SqlitePool, row: &ScheduledTaskRow, now: &
         .await;
 }
 
+/// Atomically claim a due restart row by advancing `next_run_at` strictly
+/// after `now`, but only if it is still due. Returns `true` when this caller
+/// won the claim. Two concurrent ticks therefore enqueue for a given
+/// occurrence at most once.
+async fn claim_restart_slot(
+    pool: &SqlitePool,
+    row: &ScheduledTaskRow,
+    now: &DateTime<Utc>,
+    now_str: &str,
+) -> bool {
+    let next = next_run_after(&row.schedule, *now)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| {
+            (*now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+    sqlx::query(
+        "UPDATE scheduled_tasks SET next_run_at = ?
+          WHERE id = ? AND (next_run_at IS NULL OR next_run_at <= ?)",
+    )
+    .bind(&next)
+    .bind(&row.id)
+    .bind(now_str)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false)
+}
+
+/// Is any task queued/running (or cancellation-pending) for `server_id`? Used
+/// to SKIP a scheduled run instead of racing an in-flight operation.
+async fn server_busy(pool: &SqlitePool, server_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM tasks
+          WHERE server_id = ? AND state IN ('queued', 'running', 'cancel_requested')",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler tick
 // ---------------------------------------------------------------------------
 
 /// One scheduler pass. The controller calls this every 60s.
 ///
-/// For each enabled policy with `next_run_at <= now` (or `NULL`): trigger one
-/// backup via Task 2's `enqueue_backup` (single catch-up when overdue,
-/// audited), recompute `next_run_at` from cron, and skip with reason when
-/// disabled mid-flight / server deleted / the worker reports `SERVER_BUSY`.
-/// Concurrency, stop/resume consistency, prune, and worker audit are owned by
-/// Task 2's worker — the tick never runs backups itself.
+/// For each enabled policy with `next_run_at <= now` (or `NULL`): atomically
+/// claim the run slot (advance `next_run_at`), trigger one backup via Task 2's
+/// `enqueue_backup` (single catch-up when overdue, audited), and skip with a
+/// recorded reason when disabled mid-flight / server deleted / the worker
+/// reports `SERVER_BUSY`. Concurrency, stop/resume consistency, prune, and
+/// worker audit are owned by Task 2's worker — the tick never runs backups
+/// itself. Concurrent ticks cannot double-enqueue thanks to the slot CAS.
 ///
 /// Scheduled restarts (`scheduled_tasks`, Phase 6 Task 3) run at the end of
 /// the same pass via [`tick_restarts`].
 pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backup_root: &Path) {
     // Archive storage is the configured backup dir, threaded into Task 2's
     // worker via `enqueue_backup` (single source of truth: `AppState::backup_dir`).
-    ensure_tables(pool).await;
     let now = Utc::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -1141,6 +1176,12 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
             .and_then(parse_time)
             .is_some_and(|t| (now - t).num_seconds() > 120);
 
+        // Atomic claim of this run slot: advance `next_run_at` with a CAS so
+        // two concurrent ticks cannot both enqueue for the same occurrence.
+        if !claim_policy_slot(pool, &fresh, &now, &now_str).await {
+            continue;
+        }
+
         let requested_by = fresh.created_by.clone();
         match enqueue_backup(
             pool,
@@ -1158,7 +1199,6 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                     .bind(&fresh.id)
                     .execute(pool)
                     .await;
-                push_next_run(pool, &fresh, &now).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1177,7 +1217,7 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                 .await;
             }
             Err(BackupError::ServerBusy) => {
-                push_next_run(pool, &fresh, &now).await;
+                // Busy: SKIP and record (the run slot is already advanced).
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1192,7 +1232,6 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
             }
             Err(BackupError::ServerNotFound) => {
                 // Lost a race with server deletion after the pre-check.
-                push_next_run(pool, &fresh, &now).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1211,7 +1250,6 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                     .bind(&fresh.id)
                     .execute(pool)
                     .await;
-                push_next_run(pool, &fresh, &now).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1224,7 +1262,7 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                         "server_id": fresh.server_id,
                         "catch_up": catch_up,
                         "error_code": e.code(),
-                        "error": e.to_string().chars().take(300).collect::<String>(),
+                        "error": task_runner::sanitize_summary(&e.to_string()),
                     }),
                 )
                 .await;
@@ -1233,6 +1271,33 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
     }
 
     tick_restarts(pool, adapter).await;
+}
+
+/// Atomically claim a due backup-policy row by advancing `next_run_at`
+/// strictly after `now`, but only if it is still due. See
+/// [`claim_restart_slot`].
+async fn claim_policy_slot(
+    pool: &SqlitePool,
+    policy: &PolicyRow,
+    now: &DateTime<Utc>,
+    now_str: &str,
+) -> bool {
+    let next = next_run_after(&policy.schedule, *now)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| {
+            (*now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+    sqlx::query(
+        "UPDATE backup_policies SET next_run_at = ?
+          WHERE id = ? AND (next_run_at IS NULL OR next_run_at <= ?)",
+    )
+    .bind(&next)
+    .bind(&policy.id)
+    .bind(now_str)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false)
 }
 
 /// Recompute `next_run_at` strictly after `now`. On an unparseable schedule
@@ -1264,31 +1329,21 @@ mod tests {
     use std::path::PathBuf;
 
     async fn test_pool() -> SqlitePool {
+        // Schema comes from the real embedded migration set, exactly as on
+        // boot — the scheduler performs no runtime DDL.
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0007_update.sql"),
-        ] {
-            for stmt in file.split(";\n") {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                if !stmt.to_uppercase().contains("CREATE")
-                    && !stmt.to_uppercase().contains("INDEX")
-                    && !stmt.to_uppercase().contains("ALTER")
-                {
-                    continue;
-                }
-                sqlx::query(stmt).execute(&pool).await.unwrap();
-            }
-        }
-        ensure_tables(&pool).await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("embedded migrations");
         pool
     }
 
@@ -1319,7 +1374,8 @@ mod tests {
             .json(&json!({"username": "owner", "password": "supersecret1"}))
             .await;
         assert_eq!(res.status_code(), 200, "body: {}", res.text());
-        res.json::<Value>()["token"].as_str().unwrap().to_string()
+        crate::auth::session_token_from_set_cookie(res.headers())
+            .expect("pm_session cookie after setup")
     }
 
     async fn make_server(server: &TestServer, token: &str, name: &str, port: u16) -> String {
@@ -2118,5 +2174,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(backups, 0);
+    }
+
+    #[test]
+    fn cron_requires_exactly_five_fields() {
+        // Ranges and step/list forms are valid 5-field crontabs.
+        assert!(cron_is_valid("*/5 * * * *"));
+        assert!(cron_is_valid("0 2 * * 1-5"));
+        assert!(cron_is_valid("0 2 1,15 * *"));
+        // Exactly five fields required: six/seven-field (seconds/year) forms,
+        // aliases, truncated and garbage expressions are all rejected.
+        assert!(!cron_is_valid("0 0 2 * * *"));
+        assert!(!cron_is_valid("0 0 0 2 * * *"));
+        assert!(!cron_is_valid("0 2 * *"));
+        assert!(!cron_is_valid("@daily"));
+        assert!(!cron_is_valid("sometimes"));
+        assert!(!cron_is_valid(""));
+    }
+
+    #[tokio::test]
+    async fn restart_skips_when_server_busy() {
+        // FIX 8: a due restart whose server already has an operation in flight
+        // is SKIPPED (audited) rather than racing it — and the run slot is
+        // still advanced so the next occurrence can run.
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "restart-busy", 25584).await;
+        let row_id = insert_due_restart(&pool, &id, 1).await;
+        sqlx::query(
+            "INSERT INTO tasks (id, type, server_id, state) VALUES (?, 'backup', ?, 'queued')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        tick_once(&pool, None, &backup_root).await;
+
+        let restarts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(restarts, 0, "busy server must skip the scheduled restart");
+
+        let skipped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events
+              WHERE action = 'restart.schedule.skipped' AND metadata LIKE '%SERVER_BUSY%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(skipped, 1, "busy skip must be audited");
+
+        let next: String =
+            sqlx::query_scalar("SELECT next_run_at FROM scheduled_tasks WHERE id = ?")
+                .bind(&row_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            parse_time(&next).unwrap() > Utc::now(),
+            "run slot not advanced: {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_tables_come_from_migrations() {
+        // FIX 10: the scheduler performs no runtime DDL. A pool built purely
+        // from the embedded migration set already satisfies every column the
+        // scheduler queries (a renamed/missing column would fail at prepare).
+        let pool = test_pool().await;
+        sqlx::query(
+            "SELECT id, server_id, kind, schedule, timezone, enabled,
+                    last_run_at, next_run_at, created_by, created_at, updated_at
+               FROM scheduled_tasks LIMIT 0",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("scheduled_tasks columns come from migrations");
+        sqlx::query(
+            "SELECT id, server_id, name, schedule, timezone, retention_count,
+                    max_age_days, enabled, last_run_at, next_run_at, created_by,
+                    created_at, updated_at
+               FROM backup_policies LIMIT 0",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("backup_policies columns come from migrations");
+        let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tasks, 0);
+        let policies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_policies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(policies, 0);
     }
 }

@@ -11,25 +11,50 @@ with rollback, user admin, audit trail, and manager DB recovery. See
 `docs/phase2.md` … `docs/phase7.md` for per-phase logs, or
 `pumpkin-manager-implementation-plan.md` for the full spec.
 
+## Prerequisites
+
+- Rustup with the repository-pinned toolchain from `rust-toolchain.toml`.
+- Node.js `24.22.0` from `.nvmrc`.
+- Docker Engine and Docker Compose for packaged deployment and E2E tests.
+
+## Setup
+
+```sh
+cp deploy/.env.example deploy/.env
+cargo build --workspace
+npm ci --prefix apps/web
+```
+
 ## Quick start (dev)
 
 ```sh
 cp deploy/.env.example deploy/.env
 cargo run -p pumpkin-manager-backend
 # API: http://127.0.0.1:8080/api/v1/health/live
-cd apps/web && npm install && npm run dev
+npm --prefix apps/web run dev
 ```
 
-## Docker (self-host)
+## Test
+
+The default test command is offline after setup and runs formatting, strict
+linting, the backend test suite, and the frontend production build:
+
+```sh
+make test
+```
+
+The browser lifecycle suite requires a running Docker daemon and a local
+Playwright browser installation:
+
+```sh
+npm --prefix apps/web run test:e2e
+```
+
+## Deploy with Docker Compose
 
 ```sh
 cp deploy/.env.example deploy/.env
-docker build -f deploy/Dockerfile -t pumpkin-manager:0.1.0 .
-docker run -d --name pumpkin-manager \
-  -p 8080:8080 \
-  -v pumpkin-data:/data \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  pumpkin-manager:0.1.0
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 Open `http://<host>:8080`. See `docs/compatibility/pumpkin-runtime.md`

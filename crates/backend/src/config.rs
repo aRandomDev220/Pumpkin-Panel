@@ -61,6 +61,13 @@ impl Settings {
     pub fn bind_addr(&self) -> SocketAddr {
         SocketAddr::from(([0, 0, 0, 0], self.http_port))
     }
+
+    /// Session lifetime in seconds (cookie `Max-Age` + session expiry).
+    /// Floors at one minute so a misconfigured `0` cannot create
+    /// immediately-dead sessions.
+    pub fn session_ttl_secs(&self) -> i64 {
+        (self.session_ttl_minutes.max(1) as i64) * 60
+    }
 }
 
 #[cfg(test)]

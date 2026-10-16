@@ -9,6 +9,11 @@ mod file_service;
 mod health;
 mod metrics;
 mod metrics_collector;
+// The RAII op-lock API is the frozen foundation Tasks 3-9 migrate onto; until
+// those land it has no non-test caller in the binary.
+#[allow(dead_code)]
+mod op_lock;
+mod ratelimit;
 mod readiness;
 mod routes_admin;
 mod routes_auth;
@@ -31,6 +36,7 @@ mod tests_phase3;
 mod update_service;
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,7 +65,19 @@ pub struct AppState {
     /// `settings.backup_dir`, which itself honors `PUMPKIN_MANAGER_BACKUP_DIR`).
     /// All backup routes/workers must use this, never a derived heuristic.
     pub backup_dir: PathBuf,
+    /// Root of the bundled SPA build. Requests that miss the API are served
+    /// from here (with traversal rejected). Production default is `/app/web`;
+    /// tests point it at a temp dir.
+    pub web_root: PathBuf,
     pub op_locks: Arc<Mutex<HashSet<String>>>,
+    /// Session lifetime in seconds (cookie `Max-Age` + session expiry),
+    /// derived from `settings.session_ttl_minutes`.
+    pub session_ttl_secs: i64,
+    /// When false (env `PUMPKIN_INSECURE_COOKIES=1`), cookies omit `Secure` and
+    /// HSTS is suppressed. Intended only for local HTTP development.
+    pub secure_cookies: bool,
+    /// In-process brute-force limiter for `/auth/login` and `/auth/setup`.
+    pub rate_limiter: Arc<std::sync::Mutex<ratelimit::RateLimiter>>,
 }
 
 impl AppState {
@@ -68,11 +86,30 @@ impl AppState {
             pool,
             adapter: None,
             runner: None,
-            server_root: server_root.clone(),
             backup_dir: server_root.join("backups"),
+            web_root: server_root.join("web"),
+            server_root,
             op_locks: Arc::new(Mutex::new(HashSet::new())),
+            session_ttl_secs: 12 * 60 * 60,
+            secure_cookies: true,
+            rate_limiter: new_rate_limiter(),
         }
     }
+
+    /// Test-only: exercise the insecure-cookie development mode without
+    /// mutating the process environment (which is shared across tests).
+    #[cfg(test)]
+    pub fn with_insecure_cookies(mut self) -> Self {
+        self.secure_cookies = false;
+        self
+    }
+}
+
+fn new_rate_limiter() -> Arc<std::sync::Mutex<ratelimit::RateLimiter>> {
+    Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new(
+        ratelimit::AUTH_ATTEMPTS,
+        ratelimit::AUTH_WINDOW,
+    )))
 }
 
 /// Assemble the full API router. Public routes first; everything else sits
@@ -428,6 +465,15 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024));
 
+    // Public auth routes carry no session yet, so they enforce a same-origin
+    // `Origin` check plus rate limiting in-handler. Bodies are tiny (username +
+    // password), so cap them well below the default to blunt body-based DoS.
+    let public_auth = Router::new()
+        .route("/api/v1/auth/setup-status", get(routes_auth::setup_status))
+        .route("/api/v1/auth/setup", post(routes_auth::setup))
+        .route("/api/v1/auth/login", post(routes_auth::login))
+        .layer(RequestBodyLimitLayer::new(64 * 1024));
+
     // Readiness reflects boot-time checks; Docker loss at runtime degrades
     // per-endpoint (503), never the process liveness probe.
     let readiness = health::ReadinessState {
@@ -440,14 +486,62 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/health/ready",
             get(health::readiness).with_state(readiness),
         )
-        .route("/api/v1/auth/setup-status", get(routes_auth::setup_status))
-        .route("/api/v1/auth/setup", post(routes_auth::setup))
-        .route("/api/v1/auth/login", post(routes_auth::login))
+        .merge(public_auth)
         .merge(protected)
         .merge(protected_uploads)
-        .layer(TraceLayer::new_for_http())
+        // Register the fallback BEFORE the layers: `Router::layer` only wraps
+        // endpoints present at call time, and a later `.fallback()` would
+        // replace the layered default endpoint — leaving static/SPA responses
+        // (index.html, JS, CSS) without security headers.
         .fallback(static_handler)
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .with_state(state)
+}
+
+/// Adds baseline security headers to every response (including the SPA
+/// fallback). HSTS is only emitted when cookies are secure (i.e. not in the
+/// explicit local-HTTP development mode).
+async fn security_headers(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderName, HeaderValue};
+
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
+             base-uri 'self'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    if state.secure_cookies {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    res
 }
 
 #[tokio::main]
@@ -547,6 +641,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // Web root: bundled SPA build, overridable for non-images deployments.
+    let web_root = std::env::var_os("PUMPKIN_MANAGER_WEB_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/app/web"));
     let server_root = settings.data_dir.clone();
     // Backup storage has one source of truth: `settings.backup_dir` (env
     // `PUMPKIN_MANAGER_BACKUP_DIR` feeds `Settings`, never the routes).
@@ -571,13 +669,24 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    let insecure_cookies = std::env::var("PUMPKIN_INSECURE_COOKIES").as_deref() == Ok("1");
+    if insecure_cookies {
+        tracing::warn!(
+            "PUMPKIN_INSECURE_COOKIES=1: session cookies omit Secure and HSTS is disabled; \
+             use only for local HTTP development"
+        );
+    }
     let state = AppState {
         pool,
         adapter,
         runner,
         server_root,
         backup_dir: backup_root,
+        web_root,
         op_locks: Arc::new(Mutex::new(HashSet::new())),
+        session_ttl_secs: settings.session_ttl_secs(),
+        secure_cookies: !insecure_cookies,
+        rate_limiter: new_rate_limiter(),
     };
     let docker_ok = state.adapter.is_some();
     tracing::info!(
@@ -590,7 +699,11 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     let addr = settings.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -624,33 +737,93 @@ async fn sync_observed(pool: &SqlitePool, adapter: &DockerAdapter) {
 }
 
 /// Serves the Vite build (`apps/web/dist`) when bundled in the single
-/// Docker image, otherwise returns 404 JSON so the API still works in dev.
-async fn static_handler(req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+/// Docker image. Unknown non-API paths fall back to `index.html` for
+/// client-side routing; traversal attempts are rejected with 404.
+async fn static_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    let dist = state.web_root.clone();
+    serve_static(&dist, req.uri().path())
+}
+
+fn serve_static(dist: &std::path::Path, raw_path: &str) -> axum::response::Response {
     use axum::http::StatusCode;
 
-    let path = req.uri().path().to_owned();
     // Never shadow API routes.
-    if path.starts_with("/api/") {
+    if raw_path.starts_with("/api/") {
         return (StatusCode::NOT_FOUND, "{\"error_code\":\"NOT_FOUND\"}").into_response();
     }
-    let dist = PathBuf::from("/app/web");
-    let file = if path == "/" {
-        dist.join("index.html")
-    } else {
-        dist.join(path.trim_start_matches('/'))
+
+    // Percent-decode once, then reject any `..` component. `Path::starts_with`
+    // does NOT resolve `..`, so it must never be the containment check.
+    let Some(decoded) = percent_decode(raw_path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    // Path traversal guard.
-    if !file.starts_with(&dist) || !file.is_file() {
-        let index = dist.join("index.html");
-        if index.is_file() {
-            let body = std::fs::read(&index).unwrap_or_default();
-            return ([("content-type", "text/html")], body).into_response();
-        }
+    if decoded.contains('\0') || has_parent_component(&decoded) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let body = std::fs::read(&file).unwrap_or_default();
-    let ct = mime_for(&file);
-    ([("content-type", ct)], body).into_response()
+
+    let candidate = if decoded == "/" {
+        dist.join("index.html")
+    } else {
+        dist.join(decoded.trim_start_matches('/'))
+    };
+    // Belt-and-braces containment: canonicalize both sides (resolves `..` and
+    // symlinks) and require the file to resolve inside the web root.
+    if let (Ok(root), Ok(file)) = (dist.canonicalize(), candidate.canonicalize()) {
+        if file.starts_with(&root) && file.is_file() {
+            let body = std::fs::read(&file).unwrap_or_default();
+            let ct = mime_for(&file);
+            return ([("content-type", ct)], body).into_response();
+        }
+    }
+
+    // SPA fallback: unknown, non-traversing routes get index.html.
+    let index = dist.join("index.html");
+    if index.is_file() {
+        let body = std::fs::read(&index).unwrap_or_default();
+        return ([("content-type", "text/html")], body).into_response();
+    }
+    (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// True if any `/`-separated component is exactly `..`.
+fn has_parent_component(path: &str) -> bool {
+    path.split('/').any(|c| c == "..")
+}
+
+/// Minimal one-pass percent-decoder for a request path. Returns `None` on a
+/// malformed escape or invalid UTF-8. `%2f`/`%2e` are decoded so an encoded
+/// traversal cannot slip past [`has_parent_component`].
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn mime_for(p: &std::path::Path) -> &'static str {
@@ -685,4 +858,63 @@ fn db_path_parent(url: &str) -> Option<PathBuf> {
         return None;
     }
     PathBuf::from(path).parent().map(|p| p.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AppState;
+    use sqlx::SqlitePool;
+
+    async fn empty_pool() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool")
+    }
+
+    /// Unauthenticated path traversal in the SPA fallback must 404 and must
+    /// never read a file outside the web root.
+    #[tokio::test]
+    async fn spa_fallback_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!("pm-spa-{}", uuid::Uuid::new_v4()));
+        let web = root.join("web");
+        std::fs::create_dir_all(&web).expect("web root");
+        std::fs::write(web.join("index.html"), "<html>SPA-INDEX-MARKER</html>").expect("index");
+        let secret = "TOP-SECRET-OUTSIDE-WEB-ROOT";
+        std::fs::write(root.join("Cargo.toml"), secret).expect("secret file");
+
+        let state = AppState::for_tests(empty_pool().await, root.clone());
+        let app = crate::build_router(state);
+
+        // `axum_test` normalizes `..` via the `url` crate before dispatch, so
+        // drive the real router directly to send the path verbatim (the
+        // production case: `curl --path-as-is` / hyper do not normalize).
+        use tower::ServiceExt as _;
+        for path in ["/../Cargo.toml", "/..%2fCargo.toml", "/%2e%2e/Cargo.toml"] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let res = app.clone().oneshot(req).await.expect("router call");
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, 404, "path {path} body: {body}");
+            assert!(
+                !body.contains(secret),
+                "path {path} leaked file contents outside the web root"
+            );
+        }
+
+        // The SPA is still served for genuine client-side routes.
+        let server = axum_test::TestServer::new(app).expect("server");
+        let res = server.get("/servers/abc/overview").await;
+        assert_eq!(res.status_code(), 200);
+        assert!(res.text().contains("SPA-INDEX-MARKER"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

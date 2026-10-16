@@ -28,6 +28,7 @@ async fn apply_migrations(pool: &SqlitePool) {
         include_str!("../../../migrations/0001_init.sql"),
         include_str!("../../../migrations/0002_sessions_audit.sql"),
         include_str!("../../../migrations/0007_update.sql"),
+        include_str!("../../../migrations/0009_app_settings.sql"),
     ] {
         for stmt in file.split(";\n") {
             let stmt = stmt.trim();
@@ -55,8 +56,8 @@ async fn test_server() -> (TestServer, SqlitePool) {
     (server, pool)
 }
 
-fn token(body: &Value) -> String {
-    body["token"].as_str().unwrap().to_string()
+fn session_token(res: &axum_test::TestResponse) -> String {
+    auth::session_token_from_set_cookie(res.headers()).expect("pm_session cookie")
 }
 
 async fn setup_owner(server: &TestServer) -> String {
@@ -65,7 +66,7 @@ async fn setup_owner(server: &TestServer) -> String {
         .json(&json!({"username": "owner", "password": "supersecret1"}))
         .await;
     assert_eq!(res.status_code(), 200);
-    token(&res.json())
+    session_token(&res)
 }
 
 async fn make_user(pool: &SqlitePool, username: &str, role: &str, password: &str) {
@@ -89,7 +90,7 @@ async fn login(server: &TestServer, username: &str, password: &str) -> String {
         .json(&json!({"username": username, "password": password}))
         .await;
     assert_eq!(res.status_code(), 200, "login failed: {:?}", res.text());
-    token(&res.json())
+    session_token(&res)
 }
 
 #[tokio::test]
@@ -391,4 +392,450 @@ async fn last_owner_guard() {
         .json(&json!({"role": "viewer"}))
         .await;
     assert_eq!(res.status_code(), 409);
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: cookie sessions, CSRF, rate limiting, atomic setup, headers
+// ---------------------------------------------------------------------------
+
+fn csrf_token(res: &axum_test::TestResponse) -> String {
+    auth::csrf_token_from_set_cookie(res.headers()).expect("pm_csrf cookie")
+}
+
+fn set_cookie(res: &axum_test::TestResponse, name: &str) -> String {
+    res.headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|raw| raw.starts_with(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} Set-Cookie header"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn login_does_not_return_token_in_body() {
+    let (server, _) = test_server().await;
+    let res = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "owner", "password": "supersecret1"}))
+        .await;
+    assert_eq!(res.status_code(), 200, "setup: {}", res.text());
+    let body = res.json::<Value>();
+    assert!(
+        body.get("token").is_none(),
+        "response body must not carry a session token: {body}"
+    );
+    assert!(body["user"]["id"].is_string());
+    assert_eq!(body["user"]["username"], json!("owner"));
+    assert_eq!(body["user"]["role"], json!("owner"));
+    // The token still reaches the client, via the Set-Cookie header.
+    assert!(auth::session_token_from_set_cookie(res.headers()).is_some());
+}
+
+#[tokio::test]
+async fn cookie_is_httponly_and_secure() {
+    let (server, _) = test_server().await;
+    let res = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "owner", "password": "supersecret1"}))
+        .await;
+    assert_eq!(res.status_code(), 200);
+
+    let session = set_cookie(&res, "pm_session");
+    assert!(session.contains("HttpOnly"), "session cookie: {session}");
+    assert!(
+        session.contains("SameSite=Lax"),
+        "session cookie: {session}"
+    );
+    assert!(session.contains("Path=/"), "session cookie: {session}");
+    assert!(session.contains("Secure"), "session cookie: {session}");
+
+    let csrf = set_cookie(&res, "pm_csrf");
+    assert!(
+        !csrf.contains("HttpOnly"),
+        "csrf cookie must be JS-readable: {csrf}"
+    );
+    assert!(csrf.contains("Secure"), "csrf cookie: {csrf}");
+}
+
+#[tokio::test]
+async fn insecure_cookie_mode_omits_secure_and_hsts() {
+    let pool = test_pool().await;
+    let root = std::env::temp_dir().join(format!("pm-insecure-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let state = AppState::for_tests(pool, root).with_insecure_cookies();
+    let server = TestServer::new(build_router(state)).unwrap();
+
+    let res = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "owner", "password": "supersecret1"}))
+        .await;
+    assert_eq!(res.status_code(), 200);
+    assert!(!set_cookie(&res, "pm_session").contains("Secure"));
+    assert!(!set_cookie(&res, "pm_csrf").contains("Secure"));
+
+    let live = server.get("/api/v1/health/live").await;
+    assert!(
+        live.headers().get("strict-transport-security").is_none(),
+        "HSTS must be suppressed in insecure-cookie mode"
+    );
+}
+
+async fn setup_and_cookies(server: &TestServer) -> (String, String) {
+    let res = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "owner", "password": "supersecret1"}))
+        .await;
+    assert_eq!(res.status_code(), 200, "setup: {}", res.text());
+    (session_token(&res), csrf_token(&res))
+}
+
+fn cookie_header(token: &str, csrf: &str) -> String {
+    format!("pm_session={token}; pm_csrf={csrf}")
+}
+
+#[tokio::test]
+async fn mutation_without_csrf_403() {
+    let (server, _) = test_server().await;
+    let (token, csrf) = setup_and_cookies(&server).await;
+    let res = server
+        .post("/api/v1/servers")
+        .add_header("cookie", cookie_header(&token, &csrf))
+        .json(&json!({"name": "csrf-less", "game_port": 25590,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(res.status_code(), 403, "body: {}", res.text());
+    assert_eq!(res.json::<Value>()["error_code"], json!("CSRF_FAILED"));
+}
+
+#[tokio::test]
+async fn mutation_with_csrf_ok() {
+    let (server, _) = test_server().await;
+    let (token, csrf) = setup_and_cookies(&server).await;
+    let res = server
+        .post("/api/v1/servers")
+        .add_header("cookie", cookie_header(&token, &csrf))
+        .add_header("x-csrf-token", &csrf)
+        .json(&json!({"name": "csrf-ok", "game_port": 25591,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(res.status_code(), 201, "body: {}", res.text());
+}
+
+#[tokio::test]
+async fn bearer_mutation_needs_no_csrf() {
+    let (server, _) = test_server().await;
+    let token = setup_owner(&server).await;
+    let res = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&token)
+        .json(&json!({"name": "bearer-mut", "game_port": 25592,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(res.status_code(), 201, "body: {}", res.text());
+}
+
+#[tokio::test]
+async fn login_rejects_cross_origin_origin_header() {
+    let (server, pool) = test_server().await;
+    make_user(&pool, "originuser", "admin", "originpw123").await;
+    let res = server
+        .post("/api/v1/auth/login")
+        .add_header("origin", "https://evil.example")
+        .json(&json!({"username": "originuser", "password": "originpw123"}))
+        .await;
+    assert_eq!(res.status_code(), 403, "body: {}", res.text());
+    assert_eq!(res.json::<Value>()["error_code"], json!("CSRF_FAILED"));
+}
+
+#[tokio::test]
+async fn login_rate_limited() {
+    let (server, pool) = test_server().await;
+    make_user(&pool, "rluser", "admin", "rlsecret123").await;
+
+    let mut statuses = Vec::new();
+    for _ in 0..6 {
+        let res = server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": "rluser", "password": "wrongpass1"}))
+            .await;
+        statuses.push(res.status_code().as_u16());
+        if res.status_code() == 429 {
+            assert_eq!(res.json::<Value>()["error_code"], json!("RATE_LIMITED"));
+            assert!(
+                res.headers().get("retry-after").is_some(),
+                "429 must carry Retry-After"
+            );
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec![401, 401, 401, 401, 401, 429],
+        "5 attempts allowed, 6th limited"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_setup_single_owner() {
+    let (server, pool) = test_server().await;
+    let req_a = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "ownerA", "password": "supersecret1"}));
+    let req_b = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "ownerB", "password": "supersecret1"}));
+    let (ra, rb) = tokio::join!(req_a, req_b);
+
+    let codes = [ra.status_code().as_u16(), rb.status_code().as_u16()];
+    assert_eq!(
+        codes.iter().filter(|c| **c == 200).count(),
+        1,
+        "exactly one setup may win: {codes:?}"
+    );
+    assert_eq!(
+        codes.iter().filter(|c| **c == 409).count(),
+        1,
+        "the loser must get 409: {codes:?}"
+    );
+
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 1, "only one owner may be created");
+    let status = server.get("/api/v1/auth/setup-status").await;
+    assert_eq!(status.json::<Value>()["needs_setup"], json!(false));
+}
+
+#[tokio::test]
+async fn setup_disabled_after_complete() {
+    let (server, pool) = test_server().await;
+    let _ = setup_owner(&server).await;
+
+    // Emptied users table must not re-enable setup: the flag is authoritative.
+    sqlx::query("DELETE FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let status = server.get("/api/v1/auth/setup-status").await;
+    assert_eq!(status.json::<Value>()["needs_setup"], json!(false));
+
+    let again = server
+        .post("/api/v1/auth/setup")
+        .json(&json!({"username": "owner2", "password": "supersecret1"}))
+        .await;
+    assert_eq!(again.status_code(), 409);
+    assert_eq!(
+        again.json::<Value>()["error_code"],
+        json!("SETUP_ALREADY_COMPLETE")
+    );
+}
+
+#[tokio::test]
+async fn unknown_user_runs_dummy_hash() {
+    use std::sync::atomic::Ordering;
+    let (server, _) = test_server().await;
+    let before = auth::DUMMY_HASH_CHECKS.load(Ordering::Relaxed);
+    let res = server
+        .post("/api/v1/auth/login")
+        .json(&json!({"username": "ghost-user", "password": "whatever123"}))
+        .await;
+    assert_eq!(res.status_code(), 401);
+    assert_eq!(
+        res.json::<Value>()["error_code"],
+        json!("INVALID_CREDENTIALS")
+    );
+    let after = auth::DUMMY_HASH_CHECKS.load(Ordering::Relaxed);
+    assert!(
+        after > before,
+        "unknown-user login must burn a dummy Argon2id verification"
+    );
+}
+
+#[tokio::test]
+async fn security_headers_present() {
+    let (server, _) = test_server().await;
+    let res = server.get("/api/v1/health/live").await;
+    let headers = res.headers();
+    let csp = headers
+        .get("content-security-policy")
+        .expect("CSP")
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("default-src 'self'"), "csp: {csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+    assert!(
+        !csp.contains("unsafe-eval"),
+        "csp must not allow eval: {csp}"
+    );
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    assert!(headers.get("permissions-policy").is_some());
+    assert!(headers.get("strict-transport-security").is_some());
+}
+
+#[tokio::test]
+async fn security_headers_present_on_static_asset() {
+    let pool = test_pool().await;
+    let root = std::env::temp_dir().join(format!("pm-static-{}", uuid::Uuid::new_v4()));
+    let web = root.join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(web.join("index.html"), "<html>STATIC-MARKER</html>").unwrap();
+    let state = AppState::for_tests(pool, root.clone());
+    let server = TestServer::new(build_router(state)).unwrap();
+
+    let res = server.get("/").await;
+    assert_eq!(res.status_code(), 200, "body: {}", res.text());
+    assert!(res.text().contains("STATIC-MARKER"));
+    let headers = res.headers();
+    assert!(
+        headers.get("content-security-policy").is_some(),
+        "CSP missing on static asset response"
+    );
+    assert_eq!(
+        headers.get("x-content-type-options").unwrap(),
+        "nosniff",
+        "nosniff missing on static asset response"
+    );
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert!(headers.get("strict-transport-security").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn logout_clears_both_cookies() {
+    let (server, _) = test_server().await;
+    let (token, csrf) = setup_and_cookies(&server).await;
+    let res = server
+        .post("/api/v1/auth/logout")
+        .add_header("cookie", cookie_header(&token, &csrf))
+        .add_header("x-csrf-token", &csrf)
+        .await;
+    assert_eq!(res.status_code(), 204, "body: {}", res.text());
+    let session = set_cookie(&res, "pm_session");
+    let csrf_cookie = set_cookie(&res, "pm_csrf");
+    assert!(
+        session.contains("pm_session=;"),
+        "value not cleared: {session}"
+    );
+    assert!(session.contains("Max-Age=0"), "not expired: {session}");
+    assert!(
+        csrf_cookie.contains("pm_csrf=;"),
+        "value not cleared: {csrf_cookie}"
+    );
+    assert!(
+        csrf_cookie.contains("Max-Age=0"),
+        "not expired: {csrf_cookie}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: delete busy guard + op-lock release, unknown-field rejection
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_refuses_busy_and_releases_op_lock() {
+    let pool = test_pool().await;
+    let root = std::env::temp_dir().join(format!("pm-busy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let state = AppState::for_tests(pool.clone(), root);
+    let locks = state.op_locks.clone();
+    let server = TestServer::new(build_router(state)).unwrap();
+    let t = setup_owner(&server).await;
+
+    let created = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "busy-del", "game_port": 25610,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(created.status_code(), 201, "body: {}", created.text());
+    let id = created.json::<Value>()["server"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A conflicting queued task must make DELETE fail safe with 409.
+    sqlx::query("INSERT INTO tasks (id, type, server_id, state) VALUES (?, 'stop', ?, 'queued')")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let busy = server
+        .delete(&format!("/api/v1/servers/{id}"))
+        .authorization_bearer(&t)
+        .await;
+    assert_eq!(busy.status_code(), 409, "body: {}", busy.text());
+    assert_eq!(busy.json::<Value>()["error_code"], json!("SERVER_BUSY"));
+
+    // Once the task is terminal the delete proceeds and the op-lock release
+    // is observable (guards against a leaked lock on a rejected/accepted op).
+    sqlx::query("UPDATE tasks SET state = 'failed' WHERE server_id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let del = server
+        .delete(&format!("/api/v1/servers/{id}"))
+        .authorization_bearer(&t)
+        .await;
+    assert_eq!(del.status_code(), 204, "body: {}", del.text());
+
+    // The handler released the per-server lock (deferred drop → `acquire`
+    // waits for the slot rather than racing it).
+    let freed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::op_lock::acquire(&locks, &id),
+    )
+    .await
+    .expect("delete handler must release the op-lock");
+    drop(freed);
+}
+
+#[tokio::test]
+async fn create_rejects_unknown_field() {
+    let (server, _) = test_server().await;
+    let t = setup_owner(&server).await;
+    let res = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "smuggle", "game_port": 25611,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master",
+                      "privileged": true}))
+        .await;
+    assert!(
+        matches!(res.status_code().as_u16(), 400 | 422),
+        "unknown field must be rejected, got {}: {}",
+        res.status_code(),
+        res.text()
+    );
+}
+
+#[tokio::test]
+async fn delete_rejects_unknown_query_field() {
+    let (server, _) = test_server().await;
+    let t = setup_owner(&server).await;
+    let created = server
+        .post("/api/v1/servers")
+        .authorization_bearer(&t)
+        .json(&json!({"name": "qfield", "game_port": 25612,
+                      "image_reference": "ghcr.io/pumpkin-mc/pumpkin:master"}))
+        .await;
+    assert_eq!(created.status_code(), 201);
+    let id = created.json::<Value>()["server"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = server
+        .delete(&format!("/api/v1/servers/{id}?evil=1"))
+        .authorization_bearer(&t)
+        .await;
+    assert!(
+        matches!(res.status_code().as_u16(), 400 | 422),
+        "unknown query field must be rejected, got {}: {}",
+        res.status_code(),
+        res.text()
+    );
 }

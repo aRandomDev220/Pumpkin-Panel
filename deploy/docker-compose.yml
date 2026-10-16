@@ -10,8 +10,9 @@ services:
     volumes:
       # Manager state (SQLite, server data roots, backups).
       - manager-data:/data
-      # Privileged boundary: backend-only Docker control. See docs/security.md.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Privileged boundary: backend-only Docker control. The adapter needs
+      # read/write Engine API access to create and manage child containers.
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
     environment:
@@ -20,11 +21,18 @@ services:
       PUMPKIN_MANAGER_BACKUP_DIR: /data/backups
       PUMPKIN_MANAGER_LOG_LEVEL: ${PUMPKIN_MANAGER_LOG_LEVEL:-info}
       PUMPKIN_MANAGER_DATABASE_URL: sqlite:/data/pumpkin-manager.db?mode=rwc
+      PUMPKIN_INSECURE_COOKIES: ${PUMPKIN_INSECURE_COOKIES:-0}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # The root-side entrypoint needs these capabilities to initialize a fresh
+    # named /data volume and drop to the unprivileged app user.
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
 
   # Pumpkins are NOT statically listed here in production — the manager
   # creates one container per server via the Docker API (see README).
