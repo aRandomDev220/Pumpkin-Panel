@@ -67,9 +67,11 @@ Trust boundaries (§5.3 of plan):
 3. **Low — CSP allows inline styles.** React scripts remain same-origin and
    `unsafe-eval` is not enabled; inline styles are currently required by the
    existing UI styling approach.
-4. **Low — dependency audit tooling is CI-gated.** The local environment does
-   not include `cargo-audit` or `cargo-deny`; CI now runs `cargo audit`, while
-   the local npm audit completed with zero high/critical vulnerabilities.
+ 4. **Low — dependency audit exception.** CI runs `cargo audit`, and the local
+    npm audit completed with zero high/critical vulnerabilities. The only RustSec
+    exception is `RUSTSEC-2023-0071`, confined to SQLx's unused optional MySQL
+    dependency metadata; this project activates SQLite only and SQLx has no
+    fixed upstream upgrade for the advisory.
 
 ## Evidence
 

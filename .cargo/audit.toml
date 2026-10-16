@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071 is in SQLx's optional MySQL dependency metadata. This
+# project disables SQLx default features and activates SQLite only; `cargo
+# tree` confirms rsa/sqlx-mysql are not in the compiled dependency graph.
+# SQLx has no fixed upgrade for this advisory, so keep the exception narrow
+# and revisit it if the database backend or SQLx feature set changes.
+ignore = ["RUSTSEC-2023-0071"]
