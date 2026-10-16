@@ -341,10 +341,17 @@ export default function Monitoring() {
   });
 
   return (
-    <section>
-      <h2>Monitoring</h2>
+    <section className="monitoring-page">
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">Operations</div>
+          <h2>Monitoring</h2>
+          <p>See host capacity, server history, and alerts without filling gaps in the data.</p>
+        </div>
+        <DiagnosticsButton />
+      </div>
 
-      <h3>Host</h3>
+      <div className="section-heading"><h3>Host capacity</h3><span className="muted">Current snapshot</span></div>
       {summaryQuery.isLoading && <p>Loading host stats…</p>}
       {summaryQuery.error && <p className="err">Failed to load host stats.</p>}
       {summaryQuery.data && (
@@ -374,7 +381,7 @@ export default function Monitoring() {
         </div>
       )}
 
-      <h3>Server history</h3>
+      <div className="section-heading"><h3>Server history</h3><span className="muted">Choose a range</span></div>
       <div className="row">
         <label>
           Range{" "}
@@ -404,7 +411,7 @@ export default function Monitoring() {
       {servers.map((s, i) => {
         const q = historyQueries[i];
         return (
-          <div key={s.id} className="card" style={{ margin: "12px 0" }}>
+          <div key={s.id} className="card monitoring-server">
             <h4 style={{ margin: "0 0 8px" }}>
               <Link to={`/servers/${encodeURIComponent(s.id)}`}>{s.name}</Link>{" "}
               <span className="muted">({range})</span>
@@ -416,17 +423,12 @@ export default function Monitoring() {
         );
       })}
 
-      <h3>Alerts</h3>
+      <div className="section-heading"><h3>Alerts</h3><span className="muted">Latest signals</span></div>
       {alertsQuery.isLoading && <p>Loading alerts…</p>}
       {alertsQuery.error && <p className="err">Failed to load alerts.</p>}
       {alertsQuery.data && <AlertsList alerts={alertsQuery.data.alerts} />}
 
-      <h3>Diagnostics</h3>
-      <p className="muted">
-        Requires admin access. The button hides itself if your account is
-        not permitted.
-      </p>
-      <DiagnosticsButton />
+      <p className="subtle-note">Diagnostics are available to admin accounts and exclude secret values.</p>
     </section>
   );
 }

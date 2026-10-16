@@ -249,12 +249,11 @@ export default function Config() {
 
   return (
     <section>
-      <p className="muted">
-        <Link to={`/servers/${encodeURIComponent(id)}`}>← Server</Link>
-        {" · "}
-        <Link to={`/servers/${encodeURIComponent(id)}/files`}>Files</Link>
-      </p>
-      <h2>Config</h2>
+      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Server workspace</Link> <span className="muted">/ Config</span></p>
+      <div className="page-heading">
+        <div><div className="eyebrow">Server configuration</div><h2>Config</h2><p>Use guided settings for common changes or edit the complete TOML when you need control over every key.</p></div>
+        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/files`}><button className="button-secondary" type="button">Open files</button></Link></div>
+      </div>
 
       {configQuery.isLoading && <p>Loading config…</p>}
       {configQuery.error && <p className="err">Failed to load config.</p>}
@@ -317,12 +316,12 @@ export default function Config() {
 
       {data && (
         <>
-          <p className="muted">
+            <p className="config-status">
             revision {data.revision} · hash <code>{data.hash}</code>
             {dirty ? " · unsaved changes" : " · no unsaved changes"}
           </p>
 
-          <h3>Guided settings</h3>
+           <div className="section-heading"><h3>Guided settings</h3><span className="muted">Common server controls</span></div>
           <p className="muted">
             Editing a guided field patches the raw TOML below. Top-level fields edit the
             document preamble; fields marked “Java + Bedrock” are written to both{" "}
@@ -444,8 +443,8 @@ export default function Config() {
             </label>
           </div>
 
-          <h3>Raw TOML</h3>
-          <label>
+           <div className="section-heading"><h3>Raw TOML</h3><span className="muted">Preserves unknown keys</span></div>
+           <label className="config-editor">
             <span className="muted">revision {data.revision} content</span>
             <textarea
               value={content}
@@ -497,7 +496,7 @@ export default function Config() {
             </div>
           )}
 
-          <h3>Revision history</h3>
+           <div className="section-heading"><h3>Revision history</h3><span className="muted">{revisionsQuery.data?.total ?? 0} revisions</span></div>
           {revisionsQuery.isLoading && <p>Loading revisions…</p>}
           {revisionsQuery.error && <p className="err">Failed to load revisions.</p>}
           {revisionsQuery.data && revisionsQuery.data.revisions.length === 0 && (

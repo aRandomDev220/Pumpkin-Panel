@@ -44,8 +44,11 @@ export default function Audit() {
 
   return (
     <section>
-      <h2>Audit log</h2>
-      <p className="muted">
+      <div className="page-heading">
+        <div><div className="eyebrow">Administration</div><h2>Audit log</h2><p>Review sensitive actions in newest-first order. Metadata is redacted server-side.</p></div>
+        <span className="badge">{events.length} visible</span>
+      </div>
+      <p className="subtle-note">
         Newest first. Metadata is redacted server-side — secrets never appear
         here.
       </p>

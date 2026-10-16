@@ -168,6 +168,39 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .create-panel > p { max-width: 650px; color: var(--muted); }
 .form-grid { display: grid; grid-template-columns: 1.15fr .65fr 1.5fr; gap: 14px; }
 .form-actions { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 18px; }
+.server-breadcrumb { margin-bottom: 12px; font-size: 13px; }
+.server-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 26px; border-bottom: 1px solid var(--line); }
+.server-hero h2 { margin-bottom: 8px; }
+.server-hero-meta { color: var(--muted); font-size: 13px; }
+.server-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.server-actions button { min-width: 82px; text-transform: capitalize; }
+.server-tabs { display: flex; flex-wrap: wrap; gap: 22px; margin: 20px 0 28px; border-bottom: 1px solid var(--line); }
+.server-tabs a, .server-tabs span { position: relative; display: inline-flex; align-items: center; min-height: 42px; color: var(--muted); font-size: 13px; font-weight: 600; text-decoration: none; }
+.server-tabs a:hover { color: var(--signal-strong); }
+.server-tabs .active { color: var(--signal-strong); }
+.server-tabs .active::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: var(--signal); content: ""; }
+.server-workspace > dl { margin-top: 0; }
+.server-workspace > h3 { padding-top: 8px; }
+.server-workspace > .row { margin-top: 10px; }
+.server-workspace .panel > h3:first-child { margin-top: 0; }
+.server-workspace .log { margin-top: 8px; }
+.subtle-note { padding: 11px 13px; border-left: 3px solid var(--line-strong); background: var(--canvas); color: var(--muted); font-size: 13px; }
+.monitoring-page .card { min-height: 112px; }
+.monitoring-server { margin: 16px 0; }
+.monitoring-server h4 { margin: 0; }
+.monitoring-server > p { margin-bottom: 16px; }
+.files-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); }
+.files-toolbar .row { margin: 0; }
+.path-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 15px 0; color: var(--muted); font-size: 13px; }
+.path-breadcrumb button { min-height: 32px; border-color: var(--line); background: var(--canvas); color: var(--muted-strong); padding: 0 9px; font-size: 12px; }
+.path-breadcrumb button:hover:not(:disabled) { border-color: var(--signal); background: var(--paper); color: var(--signal-strong); }
+.config-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 15px 0; color: var(--muted); font-size: 13px; }
+.config-editor { overflow: hidden; border: 1px solid #334247; border-radius: 7px; background: #202a2d; }
+.config-editor textarea { display: block; min-height: 380px; border: 0; border-radius: 0; background: transparent; color: #d5e2dd; padding: 18px; font-size: 13px; line-height: 1.6; }
+.config-editor textarea:focus-visible { outline-color: var(--focus); }
+.danger-zone { margin-top: 20px; border: 1px solid #dfbbb6; border-radius: 7px; background: #fff7f5; padding: 18px; }
+.danger-zone h3 { margin-top: 0; color: var(--danger); }
+.admin-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, .55fr); gap: 16px; align-items: start; }
 
 .auth-page { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 460px); gap: clamp(40px, 8vw, 140px); align-items: center; width: min(100%, 1120px); min-height: 100vh; margin: 0 auto; padding: 48px clamp(20px, 5vw, 64px); }
 .auth-aside { max-width: 500px; }

@@ -198,8 +198,11 @@ export default function Users() {
 
   return (
     <section>
-      <h2>Users</h2>
-      <p className="muted">
+      <div className="page-heading">
+        <div><div className="eyebrow">Administration</div><h2>Users</h2><p>Manage who can sign in and what they are allowed to do.</p></div>
+        <span className="badge">{users.length} accounts</span>
+      </div>
+      <p className="subtle-note">
         Manage who can sign in. Deactivating a user revokes their sessions
         immediately.
         {me && (
@@ -294,7 +297,7 @@ export default function Users() {
         </div>
       )}
 
-      <h3>New user</h3>
+      <div className="section-heading"><h3>New user</h3><span className="muted">Invite an operator or viewer</span></div>
       {createError && (
         <p className="err" role="alert">
           {createError}
@@ -341,16 +344,8 @@ export default function Users() {
         </div>
       </form>
 
-      <div
-        style={{
-          background: "#1c1214",
-          border: "1px solid #8a2f2f",
-          borderRadius: 8,
-          padding: "12px 16px",
-          marginTop: 16,
-        }}
-      >
-        <h3 style={{ marginTop: 0 }}>Danger zone</h3>
+      <div className="danger-zone">
+        <h3>Danger zone</h3>
         <p className="muted">
           Deleting a user cannot be undone. Deleting yourself signs you out
           immediately. The last active owner can never be demoted, deactivated,

@@ -192,17 +192,14 @@ export default function Files() {
 
   return (
     <section>
-      <p className="muted">
-        <Link to={`/servers/${encodeURIComponent(id)}`}>← Server</Link>
-        {" · "}
-        <Link to={`/servers/${encodeURIComponent(id)}/config`}>Config</Link>
-      </p>
-      <h2>Files</h2>
-      <p className="muted" title="Relative path">
-        path: <code>{displayPath(path)}</code>
-      </p>
+      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Servers / {serverQuery.data?.name ?? "server"}</Link> <span className="muted">/ Files</span></p>
+      <div className="page-heading">
+        <div><div className="eyebrow">Server files</div><h2>Files</h2><p>Browse the server data directory, move files safely, and import or export archives.</p></div>
+        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/config`}><button className="button-secondary" type="button">Open config</button></Link></div>
+      </div>
+      <div className="files-toolbar"><span className="muted" title="Relative path">Current path <code>{displayPath(path)}</code></span><div className="row"><button type="button" onClick={() => void onExport()}>Export current folder</button><label title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>Import archive<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing} /></label></div></div>
 
-      <nav aria-label="Breadcrumb" className="row">
+      <nav aria-label="Breadcrumb" className="path-breadcrumb">
         <button type="button" onClick={() => setPath("")}>
           /
         </button>
@@ -304,7 +301,7 @@ export default function Files() {
         </div>
       )}
 
-      <h3>Upload</h3>
+      <div className="section-heading"><h3>Upload</h3><span className="muted">Add a file to the current folder</span></div>
       <div className="row">
         <label>
           Upload file{" "}
@@ -313,7 +310,7 @@ export default function Files() {
         {uploading && <span className="muted">Uploading…</span>}
       </div>
 
-      <h3>New directory</h3>
+      <div className="section-heading"><h3>New directory</h3><span className="muted">Create a folder in the current path</span></div>
       <form onSubmit={onMkdir}>
         <label>
           Name <input value={mkdirName} onChange={(e) => setMkdirName(e.target.value)} placeholder="dirname" />
@@ -350,26 +347,12 @@ export default function Files() {
         </>
       )}
 
-      <h3>Import / Export</h3>
+      <div className="section-heading"><h3>Import / export</h3><span className="muted">Archive the current path</span></div>
       <p className="muted">
         server desired_state:{" "}
         {serverQuery.isLoading ? "loading…" : (desiredState ?? "unknown")}
       </p>
-      <div className="row">
-        <button type="button" onClick={() => void onExport()}>
-          Export (tar.gz)
-        </button>
-        <label title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>
-          Import tar.gz{" "}
-          <input
-            type="file"
-            accept=".tar.gz,.tgz,application/gzip"
-            onChange={(e) => void onImport(e)}
-            disabled={importBlocked || importing}
-          />
-        </label>
-        {importing && <span className="muted">Importing…</span>}
-      </div>
+      <div className="row">{importing && <span className="muted">Importing…</span>}</div>
       {importBlocked && (
         <p className="warn" role="note">
           Import is disabled while the server desired_state is “{desiredState}”. Stop the

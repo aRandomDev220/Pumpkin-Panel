@@ -515,40 +515,35 @@ export default function ServerDetail() {
   const opBusy = lifecycleMutation.isPending || activeTaskId !== null;
 
   return (
-    <section>
-      <p className="muted">
-        <Link to="/servers">← Servers</Link>
-      </p>
-      <h2>{s.name}</h2>
+    <section className="server-workspace">
+      <p className="server-breadcrumb"><Link to="/servers">Servers</Link> <span className="muted">/ {s.name}</span></p>
+      <div className="server-hero">
+        <div>
+          <div className="eyebrow">Server workspace</div>
+          <h2>{s.name}</h2>
+          <div className="server-hero-meta">Port {s.game_port} · {s.image_reference}</div>
+        </div>
+        <div className="server-actions" role="group" aria-label="Lifecycle controls">
+          {(["start", "stop", "restart"] as const).map((op) => (
+            <button
+              key={op}
+              type="button"
+              disabled={opBusy}
+              title={opBusy ? "An operation is already in flight" : `Set desired state via ${op}`}
+              onClick={() => runLifecycle(op)}
+            >
+              {lifecycleMutation.isPending && activeOp === null ? "Sending…" : activeTaskId && activeOp === op ? `${op}… polling` : op}
+            </button>
+          ))}
+        </div>
+      </div>
 
-      <nav className="row" aria-label="Server sections">
-        <span className="badge badge-ok">Overview</span>
+      <nav className="server-tabs" aria-label="Server sections">
+        <span className="active">Overview</span>
         <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Config</Link>
         <Link to={`/servers/${encodeURIComponent(s.id)}/files`}>Files</Link>
         <a href="#backups">Backups</a>
       </nav>
-
-      <div className="row" role="group" aria-label="Lifecycle controls">
-        {(["start", "stop", "restart"] as const).map((op) => (
-          <button
-            key={op}
-            type="button"
-            disabled={opBusy}
-            title={
-              opBusy
-                ? "An operation is already in flight"
-                : `Set desired state via ${op}`
-            }
-            onClick={() => runLifecycle(op)}
-          >
-            {lifecycleMutation.isPending && activeOp === null
-              ? "Sending…"
-              : activeTaskId && activeOp === op
-                ? `${op}… polling`
-                : op}
-          </button>
-        ))}
-      </div>
       {opFeedback && (
         <p className="muted" role="status">
           {opFeedback}
@@ -565,7 +560,7 @@ export default function ServerDetail() {
         </p>
       )}
 
-      <dl>
+      <dl className="panel">
         <dt>ID</dt>
         <dd>{s.id}</dd>
         <dt>Game port</dt>
@@ -650,7 +645,7 @@ export default function ServerDetail() {
         </dd>
       </dl>
 
-      <h3>Metrics history</h3>
+      <div className="section-heading"><h3>Metrics history</h3><Link className="section-link" to="/monitoring">Full monitoring</Link></div>
       <div className="row">
         <label>
           Range{" "}
@@ -669,7 +664,6 @@ export default function ServerDetail() {
             ))}
           </select>
         </label>
-        <Link to="/monitoring">Full monitoring →</Link>
       </div>
       {historyDetailQuery.isLoading && <p>Loading metrics history…</p>}
       {historyDetailQuery.error && (

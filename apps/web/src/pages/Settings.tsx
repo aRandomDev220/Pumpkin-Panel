@@ -63,8 +63,10 @@ export default function Settings() {
 
   return (
     <section>
-      <h2>Settings</h2>
-      <p className="muted">
+      <div className="page-heading">
+        <div><div className="eyebrow">Administration</div><h2>Settings</h2><p>Protect the manager database and stage recoveries without touching live data until restart.</p></div>
+      </div>
+      <p className="subtle-note">
         Manager database — the panel&apos;s own data (users, servers,
         schedules), not server worlds. For world backups, see a server&apos;s
         Backups section.
@@ -130,16 +132,8 @@ export default function Settings() {
         </form>
       </div>
 
-      <div
-        style={{
-          background: "#1c1214",
-          border: "1px solid #8a2f2f",
-          borderRadius: 8,
-          padding: "12px 16px",
-          marginTop: 12,
-        }}
-      >
-        <h3 style={{ marginTop: 0 }}>Danger zone</h3>
+      <div className="danger-zone">
+        <h3>Danger zone</h3>
         <p className="muted">
           Restoring replaces the live manager database on the next restart.
           Download a backup first and keep it somewhere safe. If the manager
