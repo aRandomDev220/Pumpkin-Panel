@@ -39,7 +39,8 @@ use crate::audit;
 use crate::auth::AuthUser;
 use crate::backup_service::{cron_is_valid, select_for_deletion, RetentionInput};
 use crate::routes_backup::{enqueue_backup, BackupError};
-use crate::runtime::DockerAdapter;
+use crate::runtime::{DockerAdapter, RuntimeAdapter};
+use crate::task_runner;
 use crate::AppState;
 
 /// Returned in policy responses whenever `timezone != "UTC"`.
@@ -54,10 +55,20 @@ const BACKUP_POLICIES_DDL: &str = "CREATE TABLE IF NOT EXISTS backup_policies (i
 /// plus `IF NOT EXISTS` for the same ordering safety.
 const BACKUPS_DDL: &str = "CREATE TABLE IF NOT EXISTS backups (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, type TEXT NOT NULL DEFAULT 'full', state TEXT NOT NULL DEFAULT 'in_progress' CHECK (state IN ('in_progress','completed','failed')), storage_path TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0, checksum_algorithm TEXT NOT NULL DEFAULT 'sha256', checksum TEXT NOT NULL DEFAULT '', consistency_method TEXT NOT NULL DEFAULT 'stopped', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), completed_at TEXT, created_by TEXT REFERENCES users(id), error_summary TEXT, protected INTEGER NOT NULL DEFAULT 0)";
 
+/// `scheduled_tasks` DDL, verbatim from the Phase 6 plan (Task 1 migration
+/// text), plus `IF NOT EXISTS` so `tick_restarts` and handlers are safe to
+/// run in any order relative to that migration. Backup schedules stay in
+/// `backup_policies`; only `restart` lives here in Phase 6.
+///
+/// NOTE: the plan text shows `CHECK (kind IN ('restart',))`; the trailing
+/// comma is not valid SQLite (syntax error) so it is `IN ('restart')` here.
+/// Task 1's migration must use this exact corrected form.
+const SCHEDULED_TASKS_DDL: &str = "CREATE TABLE IF NOT EXISTS scheduled_tasks (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('restart')), schedule TEXT NOT NULL DEFAULT '', timezone TEXT NOT NULL DEFAULT 'UTC', enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT, next_run_at TEXT, created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))";
+
 /// Ensure the tables this module reads/writes exist. Idempotent; safe to call
 /// on every tick and from every handler.
 async fn ensure_tables(pool: &SqlitePool) {
-    for ddl in [BACKUP_POLICIES_DDL, BACKUPS_DDL] {
+    for ddl in [BACKUP_POLICIES_DDL, BACKUPS_DDL, SCHEDULED_TASKS_DDL] {
         if let Err(e) = sqlx::query(ddl).execute(pool).await {
             tracing::warn!(error = %e, "scheduler table ensure failed");
         }
@@ -629,6 +640,429 @@ pub async fn retention_preview(
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled restarts (Phase 6, Task 3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ScheduledTaskRow {
+    id: String,
+    server_id: String,
+    kind: String,
+    schedule: String,
+    timezone: String,
+    enabled: i64,
+    last_run_at: Option<String>,
+    next_run_at: Option<String>,
+    created_by: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn scheduled_task_json(t: &ScheduledTaskRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": t.id,
+        "server_id": t.server_id,
+        "kind": t.kind,
+        "schedule": t.schedule,
+        "timezone": t.timezone,
+        "timezone_note": timezone_note(&t.timezone),
+        "enabled": t.enabled != 0,
+        "last_run_at": t.last_run_at,
+        "next_run_at": t.next_run_at,
+        "created_by": t.created_by,
+        "created_at": t.created_at,
+        "updated_at": t.updated_at,
+    })
+}
+
+async fn fetch_scheduled_task(pool: &SqlitePool, row_id: &str) -> Option<ScheduledTaskRow> {
+    sqlx::query_as::<_, ScheduledTaskRow>(
+        "SELECT id, server_id, kind, schedule, timezone, enabled,
+                last_run_at, next_run_at, created_by, created_at, updated_at
+          FROM scheduled_tasks WHERE id = ?",
+    )
+    .bind(row_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+}
+
+/// `GET /servers/:id/scheduled-tasks` → `{scheduled_tasks}`. Route wiring +
+/// permission gates are the controller's job (controller applies
+/// `ServerLifecycle` to the write routes, `ServerRead` here).
+#[allow(dead_code)] // controller wires routes in main.rs; drop then
+pub async fn list_scheduled_tasks(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    HttpPath(server_id): HttpPath<String>,
+) -> Response {
+    ensure_tables(&state.pool).await;
+    if !server_exists(&state.pool, &server_id).await {
+        return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
+    }
+    let rows = sqlx::query_as::<_, ScheduledTaskRow>(
+        "SELECT id, server_id, kind, schedule, timezone, enabled,
+                last_run_at, next_run_at, created_by, created_at, updated_at
+          FROM scheduled_tasks WHERE server_id = ? ORDER BY created_at ASC",
+    )
+    .bind(&server_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let tasks: Vec<serde_json::Value> = rows.iter().map(scheduled_task_json).collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "scheduled_tasks": tasks })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // controller wires routes in main.rs; drop then
+pub struct CreateScheduledTaskBody {
+    /// Only `"restart"` exists in Phase 6.
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub schedule: String,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// `POST /servers/:id/scheduled-tasks` → `201 {scheduled_task}`.
+#[allow(dead_code)] // controller wires routes in main.rs; drop then
+pub async fn create_scheduled_task(
+    State(state): State<AppState>,
+    user: AuthUser,
+    HttpPath(server_id): HttpPath<String>,
+    Json(body): Json<CreateScheduledTaskBody>,
+) -> Response {
+    ensure_tables(&state.pool).await;
+    if !server_exists(&state.pool, &server_id).await {
+        return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
+    }
+    if body.kind.as_deref() != Some("restart") {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_KIND",
+            "kind must be \"restart\" (only restart schedules exist in Phase 6)",
+        );
+    }
+    if !cron_is_valid(&body.schedule) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_SCHEDULE",
+            "schedule is not a valid 5-field cron expression",
+        );
+    }
+    let timezone = body.timezone.trim();
+    if timezone.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_TIMEZONE",
+            "timezone must be a non-empty string (interpreted as UTC)",
+        );
+    }
+    let now = Utc::now();
+    let next_run_at = next_run_after(body.schedule.trim(), now)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let id = uuid::Uuid::new_v4().to_string();
+    let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let insert = sqlx::query(
+        "INSERT INTO scheduled_tasks
+            (id, server_id, kind, schedule, timezone, enabled,
+             next_run_at, created_by, created_at, updated_at)
+          VALUES (?, ?, 'restart', ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&server_id)
+    .bind(body.schedule.trim())
+    .bind(timezone)
+    .bind(if body.enabled { 1 } else { 0 })
+    .bind(&next_run_at)
+    .bind(&user.id)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(&state.pool)
+    .await;
+    if let Err(e) = insert {
+        tracing::warn!(error = %e, "create_scheduled_task insert failed");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to create scheduled task",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&user.id),
+        "restart.schedule.create",
+        "scheduled_task",
+        &id,
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({ "server_id": server_id, "schedule": body.schedule.trim() }),
+    )
+    .await;
+    match fetch_scheduled_task(&state.pool, &id).await {
+        Some(row) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "scheduled_task": scheduled_task_json(&row) })),
+        )
+            .into_response(),
+        None => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "scheduled task created but not readable",
+        ),
+    }
+}
+
+/// `DELETE /scheduled-tasks/:id` → `204`.
+#[allow(dead_code)] // controller wires routes in main.rs; drop then
+pub async fn delete_scheduled_task(
+    State(state): State<AppState>,
+    user: AuthUser,
+    HttpPath(row_id): HttpPath<String>,
+) -> Response {
+    ensure_tables(&state.pool).await;
+    let Some(existing) = fetch_scheduled_task(&state.pool, &row_id).await else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "SCHEDULED_TASK_NOT_FOUND",
+            "no such scheduled task",
+        );
+    };
+    if let Err(e) = sqlx::query("DELETE FROM scheduled_tasks WHERE id = ?")
+        .bind(&row_id)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::warn!(error = %e, "delete_scheduled_task failed");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to delete scheduled task",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&user.id),
+        "restart.schedule.delete",
+        "scheduled_task",
+        &row_id,
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({ "server_id": existing.server_id }),
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// One restart-scheduler pass, called from [`tick_once`] (same 60s loop, no
+/// signature change there).
+///
+/// For each enabled due `restart` row: enqueue one `restart`-type task,
+/// claim it like dispatch (`mark_running`), and execute `adapter.restart`
+/// inline. Missing container → honest `MISSING_CONTAINER` failure; no
+/// runtime → `RUNTIME_UNAVAILABLE`; never a silent success. `next_run_at` is
+/// always recomputed strictly after now (single catch-up), so a manager
+/// reboot with a stale `next_run_at` runs exactly once.
+pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
+    ensure_tables(pool).await;
+    let now = Utc::now();
+    let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let due = sqlx::query_as::<_, ScheduledTaskRow>(
+        "SELECT id, server_id, kind, schedule, timezone, enabled,
+                last_run_at, next_run_at, created_by, created_at, updated_at
+          FROM scheduled_tasks
+          WHERE kind = 'restart' AND enabled != 0 AND (next_run_at IS NULL OR next_run_at <= ?)
+          ORDER BY next_run_at ASC",
+    )
+    .bind(&now_str)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for row in due {
+        // Re-check liveness mid-flight: disabled or server gone → skip.
+        let Some(fresh) = fetch_scheduled_task(pool, &row.id).await else {
+            continue;
+        };
+        if fresh.enabled == 0 {
+            audit::record(
+                pool,
+                fresh.created_by.as_deref(),
+                "restart.schedule.skipped",
+                "scheduled_task",
+                &fresh.id,
+                "skipped",
+                &audit::request_id(),
+                serde_json::json!({ "server_id": fresh.server_id, "reason": "RESTART_DISABLED" }),
+            )
+            .await;
+            continue;
+        }
+        if !server_exists(pool, &fresh.server_id).await {
+            push_restart_next_run(pool, &fresh, &now).await;
+            audit::record(
+                pool,
+                fresh.created_by.as_deref(),
+                "restart.schedule.skipped",
+                "scheduled_task",
+                &fresh.id,
+                "skipped",
+                &audit::request_id(),
+                serde_json::json!({ "server_id": fresh.server_id, "reason": "SERVER_DELETED" }),
+            )
+            .await;
+            continue;
+        }
+
+        let requested_by = fresh.created_by.clone();
+        let record = match task_runner::enqueue(
+            pool,
+            "restart",
+            Some(&fresh.server_id),
+            requested_by.as_deref(),
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(e) => {
+                push_restart_next_run(pool, &fresh, &now).await;
+                audit::record(
+                    pool,
+                    requested_by.as_deref(),
+                    "restart.scheduled",
+                    "scheduled_task",
+                    &fresh.id,
+                    "failed",
+                    &audit::request_id(),
+                    serde_json::json!({
+                        "server_id": fresh.server_id,
+                        "error_code": "TASK_QUEUE_FULL",
+                        "error": e.to_string().chars().take(300).collect::<String>(),
+                    }),
+                )
+                .await;
+                continue;
+            }
+        };
+        // Claim like dispatch so nothing double-executes the row.
+        let _ = task_runner::mark_running(pool, &record.id, "scheduled restart in progress").await;
+
+        // Resolve the container before touching the runtime: every failure
+        // below lands on the task row with an honest code, never silently.
+        let container: Option<String> = sqlx::query_scalar(
+            "SELECT container_id FROM servers WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(&fresh.server_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        enum Outcome {
+            Ok,
+            Fail(&'static str, String),
+        }
+        let outcome = match container.as_deref() {
+            None => Outcome::Fail(
+                "SERVER_NOT_FOUND",
+                format!("server {} not found", fresh.server_id),
+            ),
+            Some("") => Outcome::Fail(
+                "MISSING_CONTAINER",
+                format!("server {} has no container", fresh.server_id),
+            ),
+            Some(container_id) => match adapter {
+                None => Outcome::Fail(
+                    "RUNTIME_UNAVAILABLE",
+                    "no runtime attached; restart unavailable".to_string(),
+                ),
+                Some(a) => match a.restart(container_id).await {
+                    Ok(()) => Outcome::Ok,
+                    Err(e) => Outcome::Fail(
+                        e.code(),
+                        e.to_string().chars().take(500).collect::<String>(),
+                    ),
+                },
+            },
+        };
+
+        let _ = sqlx::query("UPDATE scheduled_tasks SET last_run_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(&fresh.id)
+            .execute(pool)
+            .await;
+        push_restart_next_run(pool, &fresh, &now).await;
+        match outcome {
+            Outcome::Ok => {
+                let _ = task_runner::mark_succeeded(pool, &record.id, "server restarted").await;
+                // Eager observed-state sync, mirroring dispatch.
+                let _ = sqlx::query(
+                    "UPDATE servers SET observed_state = 'running',
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                )
+                .bind(&fresh.server_id)
+                .execute(pool)
+                .await;
+                audit::record(
+                    pool,
+                    requested_by.as_deref(),
+                    "restart.scheduled",
+                    "task",
+                    &record.id,
+                    "ok",
+                    &audit::request_id(),
+                    serde_json::json!({
+                        "server_id": fresh.server_id,
+                        "scheduled_task_id": fresh.id,
+                    }),
+                )
+                .await;
+            }
+            Outcome::Fail(code, summary) => {
+                let _ = task_runner::mark_failed(pool, &record.id, code, &summary).await;
+                audit::record(
+                    pool,
+                    requested_by.as_deref(),
+                    "restart.scheduled",
+                    "task",
+                    &record.id,
+                    "failed",
+                    &audit::request_id(),
+                    serde_json::json!({
+                        "server_id": fresh.server_id,
+                        "scheduled_task_id": fresh.id,
+                        "error_code": code,
+                        "error": summary.chars().take(300).collect::<String>(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Recompute a restart row's `next_run_at` strictly after `now`. On an
+/// unparseable schedule (should not happen — validated at write time) push
+/// one hour out so one bad row cannot spin the tick loop.
+async fn push_restart_next_run(pool: &SqlitePool, row: &ScheduledTaskRow, now: &DateTime<Utc>) {
+    let next = next_run_after(&row.schedule, *now)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let next = next.unwrap_or_else(|| {
+        (*now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    });
+    let _ = sqlx::query("UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ?")
+        .bind(&next)
+        .bind(&row.id)
+        .execute(pool)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler tick
 // ---------------------------------------------------------------------------
 
@@ -640,6 +1074,9 @@ pub async fn retention_preview(
 /// disabled mid-flight / server deleted / the worker reports `SERVER_BUSY`.
 /// Concurrency, stop/resume consistency, prune, and worker audit are owned by
 /// Task 2's worker — the tick never runs backups itself.
+///
+/// Scheduled restarts (`scheduled_tasks`, Phase 6 Task 3) run at the end of
+/// the same pass via [`tick_restarts`].
 pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backup_root: &Path) {
     // Archive storage is the configured backup dir, threaded into Task 2's
     // worker via `enqueue_backup` (single source of truth: `AppState::backup_dir`).
@@ -794,6 +1231,8 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
             }
         }
     }
+
+    tick_restarts(pool, adapter).await;
 }
 
 /// Recompute `next_run_at` strictly after `now`. On an unparseable schedule
@@ -1225,6 +1664,264 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("backup task did not reach a terminal state");
+    }
+
+    async fn insert_due_restart(pool: &SqlitePool, server_id: &str, enabled: i64) -> String {
+        let past = (Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO scheduled_tasks
+                (id, server_id, kind, schedule, timezone, enabled, next_run_at, created_at, updated_at)
+              VALUES (?, ?, 'restart', '0 3 * * *', 'UTC', ?, ?, ?, ?)",
+        )
+        .bind(&row_id)
+        .bind(server_id)
+        .bind(enabled)
+        .bind(&past)
+        .bind(&past)
+        .bind(&past)
+        .execute(pool)
+        .await
+        .unwrap();
+        row_id
+    }
+
+    // -- scheduled restart tests (Task 3) -----------------------------------
+
+    /// Due restart row on a containerless, daemonless server: one `restart`
+    /// task row is enqueued and failed honestly (never silent), `next_run_at`
+    /// is recomputed into the future, and a second tick adds no duplicate.
+    #[tokio::test]
+    async fn restart_fires_and_reschedules() {
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "restart1", 25580).await;
+        insert_due_restart(&pool, &id, 1).await;
+
+        tick_once(&pool, None, &backup_root).await;
+
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT type, state, error_code FROM tasks WHERE server_id = ?")
+                .bind(&id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one restart task");
+        assert_eq!(rows[0].0, "restart");
+        // Containerless + daemonless: honest failure, never a silent success.
+        assert_eq!(rows[0].1, "failed");
+        assert_eq!(rows[0].2.as_deref(), Some("MISSING_CONTAINER"));
+
+        let next: String =
+            sqlx::query_scalar("SELECT next_run_at FROM scheduled_tasks WHERE server_id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            parse_time(&next).unwrap() > Utc::now(),
+            "next_run_at not pushed: {next}"
+        );
+
+        tick_once(&pool, None, &backup_root).await;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "second tick must not duplicate the restart");
+    }
+
+    /// Container-backed but daemonless: the restart task fails honestly with
+    /// `RUNTIME_UNAVAILABLE` (mirrors the backup SWAP-3 pin).
+    #[tokio::test]
+    async fn restart_without_runtime_fails_honest() {
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "restart-noruntime", 25581).await;
+        sqlx::query("UPDATE servers SET container_id = ? WHERE id = ?")
+            .bind("cid-without-daemon")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_due_restart(&pool, &id, 1).await;
+
+        tick_once(&pool, None, &backup_root).await;
+
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, error_code FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let (state, code) = row.expect("restart task row missing");
+        assert_eq!(state, "failed");
+        assert_eq!(code.as_deref(), Some("RUNTIME_UNAVAILABLE"));
+    }
+
+    /// Reboot with an overdue `last_run_at` and stale `next_run_at`: exactly
+    /// one task row, `next_run_at` pushed into the future, second tick adds
+    /// none (single catch-up, no chaining — same rule as backup policies).
+    #[tokio::test]
+    async fn reboot_runs_once() {
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "restart-reboot", 25582).await;
+        let stale = (Utc::now() - chrono::Duration::days(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO scheduled_tasks
+                (id, server_id, kind, schedule, timezone, enabled,
+                 last_run_at, next_run_at, created_at, updated_at)
+              VALUES (?, ?, 'restart', '0 3 * * *', 'UTC', 1, ?, ?, ?, ?)",
+        )
+        .bind(&row_id)
+        .bind(&id)
+        .bind(&stale)
+        .bind(&stale)
+        .bind(&stale)
+        .bind(&stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        tick_once(&pool, None, &backup_root).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "overdue restart must run exactly once");
+        let next: String =
+            sqlx::query_scalar("SELECT next_run_at FROM scheduled_tasks WHERE id = ?")
+                .bind(&row_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            parse_time(&next).unwrap() > Utc::now(),
+            "next_run_at not pushed: {next}"
+        );
+
+        tick_once(&pool, None, &backup_root).await;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "post-reboot tick must not duplicate the restart");
+    }
+
+    #[tokio::test]
+    async fn disabled_restart_never_fires() {
+        let (server, pool, _root, backup_root) = test_server_with_roots().await;
+        let t = owner_token(&server).await;
+        let id = make_server(&server, &t, "restart-disabled", 25583).await;
+        insert_due_restart(&pool, &id, 0).await;
+
+        tick_once(&pool, None, &backup_root).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "disabled restart row must never fire");
+    }
+
+    /// `POST`-equivalent direct handler call: garbage cron → 422, and a
+    /// non-`restart` kind → 422. (Route wiring + permission gates are the
+    /// controller's job; handlers are tested standalone.)
+    #[tokio::test]
+    async fn scheduled_restart_bad_cron_422() {
+        use crate::auth::{AuthUser, Role};
+
+        let pool = test_pool().await;
+        let root = std::env::temp_dir().join(format!("pm-restart-422-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let state = AppState::for_tests(pool.clone(), root);
+        let server_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO servers (id, name, slug, game_port) VALUES (?, 'r422', 'r422', 25622)",
+        )
+        .bind(&server_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user = AuthUser {
+            id: "u1".to_string(),
+            username: "owner".to_string(),
+            role: Role::Owner,
+        };
+        // `created_by` references users(id) and FKs are enforced: the actor
+        // row must exist.
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ('u1', 'owner', 'x', 'owner')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mk_body = |kind: &str, schedule: &str| CreateScheduledTaskBody {
+            kind: Some(kind.to_string()),
+            schedule: schedule.to_string(),
+            timezone: "UTC".to_string(),
+            enabled: true,
+        };
+        let resp = create_scheduled_task(
+            State(state.clone()),
+            user.clone(),
+            HttpPath(server_id.clone()),
+            Json(mk_body("restart", "sometimes")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error_code"], json!("INVALID_SCHEDULE"));
+
+        let resp = create_scheduled_task(
+            State(state.clone()),
+            user.clone(),
+            HttpPath(server_id.clone()),
+            Json(mk_body("backup", "0 3 * * *")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error_code"], json!("INVALID_KIND"));
+
+        // The documented example schedule is accepted (201).
+        let resp = create_scheduled_task(
+            State(state.clone()),
+            user.clone(),
+            HttpPath(server_id.clone()),
+            Json(mk_body("restart", "0 3 * * *")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "body: {:?}",
+            resp_json(resp).await
+        );
+    }
+
+    async fn resp_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     async fn insert_due_policy(pool: &SqlitePool, server_id: &str) -> String {
