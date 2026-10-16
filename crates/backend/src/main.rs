@@ -13,6 +13,7 @@ mod metrics_collector;
 // those land it has no non-test caller in the binary.
 #[allow(dead_code)]
 mod op_lock;
+mod ratelimit;
 mod readiness;
 mod routes_admin;
 mod routes_auth;
@@ -35,6 +36,7 @@ mod tests_phase3;
 mod update_service;
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -52,6 +54,10 @@ use auth::Permission;
 use runtime::{DockerAdapter, RuntimeAdapter};
 use task_runner::RunnerHandle;
 
+/// Auth attempts allowed per client/user within [`AUTH_RATE_WINDOW`].
+const AUTH_RATE_ATTEMPTS: u32 = 5;
+const AUTH_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Shared application state (all cheaply cloneable handles).
 #[derive(Clone)]
 pub struct AppState {
@@ -68,6 +74,14 @@ pub struct AppState {
     /// tests point it at a temp dir.
     pub web_root: PathBuf,
     pub op_locks: Arc<Mutex<HashSet<String>>>,
+    /// Session lifetime in seconds (cookie `Max-Age` + session expiry),
+    /// derived from `settings.session_ttl_minutes`.
+    pub session_ttl_secs: i64,
+    /// When false (env `PUMPKIN_INSECURE_COOKIES=1`), cookies omit `Secure` and
+    /// HSTS is suppressed. Intended only for local HTTP development.
+    pub secure_cookies: bool,
+    /// In-process brute-force limiter for `/auth/login` and `/auth/setup`.
+    pub rate_limiter: Arc<std::sync::Mutex<ratelimit::RateLimiter>>,
 }
 
 impl AppState {
@@ -80,8 +94,26 @@ impl AppState {
             web_root: server_root.join("web"),
             server_root,
             op_locks: Arc::new(Mutex::new(HashSet::new())),
+            session_ttl_secs: 12 * 60 * 60,
+            secure_cookies: true,
+            rate_limiter: new_rate_limiter(),
         }
     }
+
+    /// Test-only: exercise the insecure-cookie development mode without
+    /// mutating the process environment (which is shared across tests).
+    #[cfg(test)]
+    pub fn with_insecure_cookies(mut self) -> Self {
+        self.secure_cookies = false;
+        self
+    }
+}
+
+fn new_rate_limiter() -> Arc<std::sync::Mutex<ratelimit::RateLimiter>> {
+    Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new(
+        AUTH_RATE_ATTEMPTS,
+        AUTH_RATE_WINDOW,
+    )))
 }
 
 /// Assemble the full API router. Public routes first; everything else sits
@@ -437,6 +469,15 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024));
 
+    // Public auth routes carry no session yet, so they enforce a same-origin
+    // `Origin` check plus rate limiting in-handler. Bodies are tiny (username +
+    // password), so cap them well below the default to blunt body-based DoS.
+    let public_auth = Router::new()
+        .route("/api/v1/auth/setup-status", get(routes_auth::setup_status))
+        .route("/api/v1/auth/setup", post(routes_auth::setup))
+        .route("/api/v1/auth/login", post(routes_auth::login))
+        .layer(RequestBodyLimitLayer::new(64 * 1024));
+
     // Readiness reflects boot-time checks; Docker loss at runtime degrades
     // per-endpoint (503), never the process liveness probe.
     let readiness = health::ReadinessState {
@@ -449,14 +490,58 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/health/ready",
             get(health::readiness).with_state(readiness),
         )
-        .route("/api/v1/auth/setup-status", get(routes_auth::setup_status))
-        .route("/api/v1/auth/setup", post(routes_auth::setup))
-        .route("/api/v1/auth/login", post(routes_auth::login))
+        .merge(public_auth)
         .merge(protected)
         .merge(protected_uploads)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .fallback(static_handler)
         .with_state(state)
+}
+
+/// Adds baseline security headers to every response (including the SPA
+/// fallback). HSTS is only emitted when cookies are secure (i.e. not in the
+/// explicit local-HTTP development mode).
+async fn security_headers(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderName, HeaderValue};
+
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
+             base-uri 'self'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    if state.secure_cookies {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    res
 }
 
 #[tokio::main]
@@ -584,6 +669,13 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    let insecure_cookies = std::env::var("PUMPKIN_INSECURE_COOKIES").as_deref() == Ok("1");
+    if insecure_cookies {
+        tracing::warn!(
+            "PUMPKIN_INSECURE_COOKIES=1: session cookies omit Secure and HSTS is disabled; \
+             use only for local HTTP development"
+        );
+    }
     let state = AppState {
         pool,
         adapter,
@@ -592,6 +684,9 @@ async fn main() -> anyhow::Result<()> {
         backup_dir: backup_root,
         web_root,
         op_locks: Arc::new(Mutex::new(HashSet::new())),
+        session_ttl_secs: settings.session_ttl_secs(),
+        secure_cookies: !insecure_cookies,
+        rate_limiter: new_rate_limiter(),
     };
     let docker_ok = state.adapter.is_some();
     tracing::info!(
@@ -604,7 +699,11 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     let addr = settings.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

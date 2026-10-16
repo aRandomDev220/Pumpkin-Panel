@@ -31,6 +31,7 @@ async fn apply_migrations(pool: &SqlitePool) {
         include_str!("../../../migrations/0001_init.sql"),
         include_str!("../../../migrations/0002_sessions_audit.sql"),
         include_str!("../../../migrations/0007_update.sql"),
+        include_str!("../../../migrations/0009_app_settings.sql"),
     ] {
         for stmt in file.split(";\n") {
             let stmt = stmt.trim();
@@ -64,7 +65,8 @@ async fn setup_owner(server: &TestServer) -> String {
         .json(&json!({"username": "owner", "password": "supersecret1"}))
         .await;
     assert_eq!(res.status_code(), 200);
-    res.json::<Value>()["token"].as_str().unwrap().to_string()
+    crate::auth::session_token_from_set_cookie(res.headers())
+        .expect("pm_session cookie after setup")
 }
 
 async fn server_task_count(pool: &SqlitePool, server_id: &str) -> i64 {

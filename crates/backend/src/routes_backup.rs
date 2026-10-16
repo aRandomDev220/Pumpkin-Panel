@@ -1814,6 +1814,7 @@ mod tests {
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0005_backups.sql"),
             include_str!("../../../migrations/0007_update.sql"),
+            include_str!("../../../migrations/0009_app_settings.sql"),
         ] {
             // Strip `--` comment lines first: headers may contain `;`
             // (e.g. 0002's "immutable; new tables only"), which would split
@@ -1933,7 +1934,8 @@ mod tests {
             .json(&json!({"username": "owner", "password": "supersecret1"}))
             .await;
         assert_eq!(res.status_code(), 200, "setup: {}", res.text());
-        let token = res.json::<Value>()["token"].as_str().unwrap().to_string();
+        let token = crate::auth::session_token_from_set_cookie(res.headers())
+            .expect("pm_session cookie after setup");
         Fixture {
             server,
             pool,

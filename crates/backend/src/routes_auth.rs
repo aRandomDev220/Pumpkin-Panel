@@ -1,11 +1,23 @@
 //! Auth HTTP handlers: setup-status, setup, login, logout, me,
-//! change-password. Standalone functions; router wiring (including
-//! `auth_middleware` layering and rate limits) lands in a later workstream.
+//! change-password.
+//!
+//! Session transport (Task 2):
+//! - The `pm_session` cookie is the sole session carrier returned to the
+//!   browser. It is `HttpOnly` and, unless `PUMPKIN_INSECURE_COOKIES=1`,
+//!   `Secure`. The raw token is **not** included in the response body.
+//! - A readable `pm_csrf` cookie is issued alongside it; unsafe cookie-
+//!   authenticated mutations must echo it in `X-CSRF-Token` (enforced in
+//!   [`crate::auth::auth_middleware`]).
+//! - `/auth/setup` and `/auth/login` are public (no session yet) so they use a
+//!   same-origin `Origin`/`Referer` check plus an in-process token-bucket
+//!   limiter instead.
+
+use std::net::SocketAddr;
 
 use axum::{
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    extract::{ConnectInfo, FromRequestParts, State},
+    http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode},
+    response::{AppendHeaders, IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -13,31 +25,15 @@ use sqlx::SqlitePool;
 
 use crate::auth::{self, AuthUser};
 
-// Expected `sessions` table (to be created by migration `0002_sessions.sql`):
-//
-// ```sql
-// CREATE TABLE sessions (
-//     id TEXT PRIMARY KEY,
-//     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-//     token_hash TEXT NOT NULL UNIQUE,
-//     created_at TEXT NOT NULL
-//         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-//     expires_at TEXT NOT NULL,
-//     last_seen_at TEXT,
-//     revoked_at TEXT
-// );
-// CREATE INDEX idx_sessions_user ON sessions(user_id);
-// ```
-//
-// `token_hash` holds `auth::hash_token(raw_token)` (SHA-256 hex).
-// Times are RFC 3339 UTC strings, matching `migrations/0001_init.sql`
-// conventions.
-
-// Sessions live 12h by default; router wiring should pass the configured
-// `session_ttl_minutes` here in a later workstream.
-pub(crate) const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
-
 const SESSION_COOKIE: &str = "pm_session";
+const CSRF_COOKIE: &str = "pm_csrf";
+
+const MIN_PASSWORD_LEN: usize = 8;
+const MAX_PASSWORD_LEN: usize = 1024;
+const MAX_USERNAME_LEN: usize = 64;
+
+/// Auth attempts allowed per client/user within [`RATE_LIMIT_WINDOW_SECS`].
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Request/response models
@@ -74,14 +70,40 @@ pub struct SessionUser {
     pub role: String,
 }
 
+/// Login/setup 200 body. Deliberately carries no token: the session lives in
+/// the `pm_session` cookie (frozen contract for the SPA, Task 10).
 #[derive(Debug, Serialize)]
 pub struct SessionResponse {
-    pub token: String,
     pub user: SessionUser,
 }
 
 // ---------------------------------------------------------------------------
-// Handlers (wired to routes by a later workstream)
+// Peer address (rate-limit fallback key)
+// ---------------------------------------------------------------------------
+
+/// Optional peer address pulled from `ConnectInfo`, which the production
+/// server installs via `into_make_service_with_connect_info`. Absent in tests
+/// and behind some proxies, where the key falls back to a shared bucket.
+pub struct PeerAddr(pub Option<SocketAddr>);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for PeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let addr = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(PeerAddr(addr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
 // ---------------------------------------------------------------------------
 
 /// GET /api/v1/auth/setup-status — public, reports first-run state.
@@ -93,16 +115,41 @@ pub async fn setup_status(State(app): State<crate::AppState>) -> impl IntoRespon
 }
 
 /// POST /api/v1/auth/setup — creates the first `owner` account.
-/// Only valid when no users exist; otherwise 409.
+///
+/// One-shot and atomic: the insert only fires while `users` is empty **and**
+/// `setup_complete` is unset, inside a transaction that also persists the flag.
+/// Only the caller whose insert affects one row becomes owner; everyone else
+/// gets `409 SETUP_ALREADY_COMPLETE`.
 #[allow(dead_code)]
-pub async fn setup(State(app): State<crate::AppState>, Json(body): Json<SetupRequest>) -> Response {
+pub async fn setup(
+    State(app): State<crate::AppState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    Json(body): Json<SetupRequest>,
+) -> Response {
+    if !same_origin_ok(&headers) {
+        return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
+    }
+    let username = match validate_username(&body.username) {
+        Ok(u) => u,
+        Err(code) => return error(StatusCode::BAD_REQUEST, code),
+    };
+    if let Err(code) = validate_password(&body.password, true) {
+        return error(StatusCode::BAD_REQUEST, code);
+    }
+    if let Err(retry) = check_rate_limit(
+        &app,
+        &[
+            client_key(&headers, peer.as_ref()),
+            user_key("setup", &username),
+        ],
+    ) {
+        return rate_limited(retry);
+    }
+
     let pool: SqlitePool = app.pool.clone();
     if !auth::needs_setup(&pool).await.unwrap_or(false) {
         return error(StatusCode::CONFLICT, "SETUP_ALREADY_COMPLETE");
-    }
-    let username = body.username.trim().to_owned();
-    if username.is_empty() || body.password.len() < 8 {
-        return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS");
     }
     let password_hash = match auth::hash_password(&body.password) {
         Ok(h) => h,
@@ -110,32 +157,56 @@ pub async fn setup(State(app): State<crate::AppState>, Json(body): Json<SetupReq
     };
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
-    let created = sqlx::query(
+
+    // Single transaction: the guarded INSERT and the persistent flag either
+    // both land or neither does. A concurrent loser inserts zero rows.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+    };
+    let inserted = sqlx::query(
         "INSERT INTO users (id, username, password_hash, role, is_active, created_at, updated_at)
-         VALUES (?, ?, ?, 'owner', 1, ?, ?)",
+         SELECT ?, ?, ?, 'owner', 1, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM users)
+           AND NOT EXISTS (SELECT 1 FROM app_settings WHERE key = 'setup_complete')",
     )
     .bind(&id)
     .bind(&username)
     .bind(&password_hash)
     .bind(&now)
     .bind(&now)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await;
-    if created.is_err() {
-        // Race with a concurrent setup call: re-check before failing.
-        if !auth::needs_setup(&pool).await.unwrap_or(false) {
-            return error(StatusCode::CONFLICT, "SETUP_ALREADY_COMPLETE");
+    let inserted = match inserted {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = tx.rollback().await;
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL");
         }
+    };
+    if inserted.rows_affected() != 1 {
+        let _ = tx.rollback().await;
+        return error(StatusCode::CONFLICT, "SETUP_ALREADY_COMPLETE");
+    }
+    let flag = sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('setup_complete', '1', ?)
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(&now)
+    .execute(&mut *tx)
+    .await;
+    if flag.is_err() || tx.commit().await.is_err() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL");
     }
-    match issue_session(&pool, &id).await {
+
+    match issue_session(&pool, &id, app.session_ttl_secs).await {
         Ok(token) => {
             let user = SessionUser {
                 id: id.clone(),
                 username: username.clone(),
                 role: "owner".to_string(),
             };
-            session_response(&token, user)
+            session_response(app.session_ttl_secs, app.secure_cookies, &token, user)
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     }
@@ -143,22 +214,48 @@ pub async fn setup(State(app): State<crate::AppState>, Json(body): Json<SetupReq
 
 /// POST /api/v1/auth/login — verifies credentials and issues a session.
 ///
-/// NOTE: brute-force throttling is enforced by a rate-limit layer applied
-/// at router wiring time (per-IP + per-account); this handler stays
-/// dependency-free so it can be unit-tested in isolation.
+/// Throttled per client and per submitted username. Unknown usernames run the
+/// dummy Argon2id hash so response timing does not reveal existence.
 #[allow(dead_code)]
-pub async fn login(State(app): State<crate::AppState>, Json(body): Json<LoginRequest>) -> Response {
+pub async fn login(
+    State(app): State<crate::AppState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    if !same_origin_ok(&headers) {
+        return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
+    }
+    let username = match validate_username(&body.username) {
+        Ok(u) => u,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS"),
+    };
+    if validate_password(&body.password, false).is_err() {
+        return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS");
+    }
+    if let Err(retry) = check_rate_limit(
+        &app,
+        &[
+            client_key(&headers, peer.as_ref()),
+            user_key("login", &username),
+        ],
+    ) {
+        return rate_limited(retry);
+    }
+
     let pool: SqlitePool = app.pool.clone();
     let row = sqlx::query("SELECT id, password_hash, is_active FROM users WHERE username = ?")
-        .bind(body.username.trim())
+        .bind(&username)
         .fetch_optional(&pool)
         .await;
     let row = match row {
         Ok(Some(r)) => r,
-        Ok(None) | Err(_) => {
-            // Same code as bad password: no user enumeration.
+        Ok(None) => {
+            // Equalize timing with a real verification before the generic error.
+            auth::verify_dummy(&body.password);
             return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
         }
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     };
     use sqlx::Row as _;
     let user_id: String = row.get("id");
@@ -170,6 +267,8 @@ pub async fn login(State(app): State<crate::AppState>, Json(body): Json<LoginReq
     if !auth::verify_password(&body.password, &stored_hash).unwrap_or(false) {
         return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
     }
+    // A legitimate login clears the username bucket (typos forgiven).
+    reset_rate_limit(&app, &user_key("login", &username));
     let user_row: Option<(String, String)> =
         sqlx::query_as("SELECT username, role FROM users WHERE id = ?")
             .bind(&user_id)
@@ -185,20 +284,21 @@ pub async fn login(State(app): State<crate::AppState>, Json(body): Json<LoginReq
         .bind(&user_id)
         .execute(&pool)
         .await;
-    match issue_session(&pool, &user_id).await {
+    match issue_session(&pool, &user_id, app.session_ttl_secs).await {
         Ok(token) => {
             let user = SessionUser {
                 id: user_id.clone(),
                 username,
                 role,
             };
-            session_response(&token, user)
+            session_response(app.session_ttl_secs, app.secure_cookies, &token, user)
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     }
 }
 
-/// POST /api/v1/auth/logout — revokes the calling session.
+/// POST /api/v1/auth/logout — revokes the calling session and clears both
+/// session cookies.
 #[allow(dead_code)]
 pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> Response {
     let pool: SqlitePool = app.pool.clone();
@@ -214,7 +314,7 @@ pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> R
     .bind(&token_hash)
     .execute(&pool)
     .await;
-    StatusCode::NO_CONTENT.into_response()
+    clear_session_cookies(app.secure_cookies)
 }
 
 /// GET /api/v1/auth/me — returns the authenticated user.
@@ -233,8 +333,11 @@ pub async fn change_password(
     Json(body): Json<ChangePasswordRequest>,
 ) -> Response {
     let pool: SqlitePool = app.pool.clone();
-    if body.new_password.len() < 8 {
+    if body.new_password.len() < MIN_PASSWORD_LEN || body.new_password.len() > MAX_PASSWORD_LEN {
         return error(StatusCode::BAD_REQUEST, "WEAK_PASSWORD");
+    }
+    if body.current_password.len() > MAX_PASSWORD_LEN {
+        return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
     }
     let row = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
         .bind(&auth_user.id)
@@ -299,14 +402,18 @@ pub async fn change_password(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Inserts a session row and returns the raw token (shown only once).
-async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<String, sqlx::Error> {
+/// Inserts a session row (TTL from config) and returns the raw token.
+async fn issue_session(
+    pool: &SqlitePool,
+    user_id: &str,
+    ttl_secs: i64,
+) -> Result<String, sqlx::Error> {
     let token = auth::generate_session_token();
     let token_hash = auth::hash_token(&token);
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let created_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let expires_at = (now + chrono::Duration::seconds(SESSION_TTL_SECS))
+    let expires_at = (now + chrono::Duration::seconds(ttl_secs))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     sqlx::query(
         "INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at)
@@ -322,20 +429,176 @@ async fn issue_session(pool: &SqlitePool, user_id: &str) -> Result<String, sqlx:
     Ok(token)
 }
 
-/// 200 JSON `{token, user}` plus `Set-Cookie: pm_session=...`.
-fn session_response(token: &str, user: SessionUser) -> Response {
-    let cookie = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
+/// 200 JSON `{user}` plus `pm_session` (HttpOnly) and `pm_csrf` cookies.
+fn session_response(ttl_secs: i64, secure: bool, token: &str, user: SessionUser) -> Response {
+    let csrf = auth::generate_session_token();
     (
         StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
-        Json(SessionResponse {
-            token: token.to_owned(),
-            user,
-        }),
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                build_cookie(SESSION_COOKIE, token, ttl_secs, secure, true),
+            ),
+            (
+                header::SET_COOKIE,
+                build_cookie(CSRF_COOKIE, &csrf, ttl_secs, secure, false),
+            ),
+        ]),
+        Json(SessionResponse { user }),
     )
         .into_response()
+}
+
+/// 204 plus expired `pm_session` / `pm_csrf` cookies.
+fn clear_session_cookies(secure: bool) -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                clear_cookie(SESSION_COOKIE, secure, true),
+            ),
+            (header::SET_COOKIE, clear_cookie(CSRF_COOKIE, secure, false)),
+        ]),
+    )
+        .into_response()
+}
+
+fn build_cookie(name: &str, value: &str, max_age: i64, secure: bool, http_only: bool) -> String {
+    let mut cookie = format!("{name}={value}; Path=/; SameSite=Lax; Max-Age={max_age}");
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn clear_cookie(name: &str, secure: bool, http_only: bool) -> String {
+    let mut cookie =
+        format!("{name}=; Path=/; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Reject cross-origin setup/login when a browser supplies `Origin` (or, as a
+/// fallback, `Referer`). Requests without either (non-browser clients) pass:
+/// they carry no ambient cookie to abuse.
+fn same_origin_ok(headers: &HeaderMap) -> bool {
+    let source = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get(header::REFERER).and_then(|v| v.to_str().ok()));
+    let Some(source) = source else {
+        return true;
+    };
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    origin_authority(source).is_some_and(|authority| authority.eq_ignore_ascii_case(host))
+}
+
+/// `https://host:port/path` → `host:port`; scheme-relative `//host` honored.
+fn origin_authority(url: &str) -> Option<&str> {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .or_else(|| url.strip_prefix("//"))?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    (!authority.is_empty()).then_some(authority)
+}
+
+/// Rate-limit key for the calling client: first `X-Forwarded-For` hop, else the
+/// peer address, else a shared "global" bucket.
+fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
+    if let Some(hop) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|xff| xff.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("ip:{hop}");
+    }
+    match peer {
+        Some(addr) => format!("ip:{addr}"),
+        None => "ip:global".to_string(),
+    }
+}
+
+fn user_key(endpoint: &str, username: &str) -> String {
+    format!("{endpoint}:user:{}", username.to_lowercase())
+}
+
+/// Consume one token for each key. Returns `Err(retry_after_secs)` if any key
+/// is exhausted (the largest wait among them).
+fn check_rate_limit(app: &crate::AppState, keys: &[String]) -> Result<(), u64> {
+    let mut limiter = lock_limiter(app);
+    let mut retry = 0u64;
+    let now = std::time::Instant::now();
+    // Best-effort opportunistic cleanup so the map stays bounded.
+    limiter.prune(
+        std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS * 10),
+        now,
+    );
+    for key in keys {
+        if let Err(secs) = limiter.check(key) {
+            retry = retry.max(secs);
+        }
+    }
+    if retry > 0 {
+        Err(retry)
+    } else {
+        Ok(())
+    }
+}
+
+fn reset_rate_limit(app: &crate::AppState, key: &str) {
+    lock_limiter(app).reset(key);
+}
+
+fn lock_limiter(app: &crate::AppState) -> std::sync::MutexGuard<'_, crate::ratelimit::RateLimiter> {
+    app.rate_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn rate_limited(retry_after_secs: u64) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        Json(serde_json::json!({ "error_code": "RATE_LIMITED" })),
+    )
+        .into_response()
+}
+
+fn validate_username(raw: &str) -> Result<String, &'static str> {
+    let username = raw.trim().to_owned();
+    if username.is_empty()
+        || username.chars().count() > MAX_USERNAME_LEN
+        || username.chars().any(char::is_control)
+    {
+        return Err("INVALID_USERNAME");
+    }
+    Ok(username)
+}
+
+fn validate_password(password: &str, enforce_min: bool) -> Result<(), &'static str> {
+    if password.len() > MAX_PASSWORD_LEN || (enforce_min && password.len() < MIN_PASSWORD_LEN) {
+        return Err("INVALID_CREDENTIALS");
+    }
+    Ok(())
 }
 
 fn error(status: StatusCode, code: &'static str) -> Response {
