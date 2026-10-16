@@ -18,4 +18,17 @@ nav a { color: #7dd8a8; text-decoration: none; margin-right: 12px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0; }
 .log { background: #0a0f0d; border: 1px solid #22332b; border-radius: 8px; padding: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
 button, select { font: inherit; }
-button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid #7dd8a8; outline-offset: 2px; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: 2px solid #7dd8a8; outline-offset: 2px; }
+
+/* Primary-action touch targets (≥40px). */
+button, select { min-height: 40px; min-width: 40px; }
+input[type="checkbox"] { min-height: 20px; min-width: 20px; }
+
+/* Narrow-viewport guard: tables scroll inside their wrapper, never the page. */
+.table-scroll { max-width: 100%; overflow-x: auto; }
+.table-scroll > .table { margin: 12px 0; }
+code { overflow-wrap: anywhere; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

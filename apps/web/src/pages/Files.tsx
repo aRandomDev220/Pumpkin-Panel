@@ -238,14 +238,15 @@ export default function Files() {
         <p className="muted">Empty directory.</p>
       )}
       {filesQuery.data && filesQuery.data.entries.length > 0 && (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>Size</th>
-              <th>Modified</th>
-              <th>Actions</th>
+              <th scope="col">Name</th>
+              <th scope="col">Type</th>
+              <th scope="col">Size</th>
+              <th scope="col">Modified</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -300,6 +301,7 @@ export default function Files() {
             })}
           </tbody>
         </table>
+        </div>
       )}
 
       <h3>Upload</h3>

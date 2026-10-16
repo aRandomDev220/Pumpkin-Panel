@@ -99,6 +99,7 @@ export default function Audit() {
         <p className="muted">No audit events match this filter.</p>
       )}
       {visible.length > 0 && (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
@@ -152,6 +153,7 @@ export default function Audit() {
             ))}
           </tbody>
         </table>
+        </div>
       )}
 
       <div className="row">

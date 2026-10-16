@@ -756,7 +756,7 @@ export default function ServerDetail() {
       {taskQuery.isLoading && <p>Loading task…</p>}
       {taskQuery.error && <p className="err">Task not found or failed to load.</p>}
       {taskQuery.data && (
-        <dl>
+        <dl role="status">
           <dt>Task</dt>
           <dd>{taskQuery.data.id}</dd>
           <dt>Kind</dt>

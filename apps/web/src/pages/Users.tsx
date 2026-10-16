@@ -231,6 +231,7 @@ export default function Users() {
         <p className="muted">No users found.</p>
       )}
       {users.length > 0 && (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
@@ -290,6 +291,7 @@ export default function Users() {
             })}
           </tbody>
         </table>
+        </div>
       )}
 
       <h3>New user</h3>

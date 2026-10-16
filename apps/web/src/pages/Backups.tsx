@@ -366,16 +366,17 @@ export default function BackupsSection({
         <p className="muted">No backups yet.</p>
       )}
       {backups.length > 0 && (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
-              <th>Created</th>
-              <th>Size</th>
-              <th>Checksum</th>
-              <th>Consistency</th>
-              <th>State</th>
-              <th>Errors</th>
-              <th>Actions</th>
+              <th scope="col">Created</th>
+              <th scope="col">Size</th>
+              <th scope="col">Checksum</th>
+              <th scope="col">Consistency</th>
+              <th scope="col">State</th>
+              <th scope="col">Errors</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -428,6 +429,7 @@ export default function BackupsSection({
             ))}
           </tbody>
         </table>
+        </div>
       )}
       {!stopped && (
         <p className="muted" role="note">
@@ -470,15 +472,16 @@ export default function BackupsSection({
         </p>
       )}
       {policies.length > 0 && (
+        <div className="table-scroll">
         <table className="table">
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Schedule</th>
-              <th>Retention</th>
-              <th>Enabled</th>
-              <th>Next run</th>
-              <th>Actions</th>
+              <th scope="col">Name</th>
+              <th scope="col">Schedule</th>
+              <th scope="col">Retention</th>
+              <th scope="col">Enabled</th>
+              <th scope="col">Next run</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -520,6 +523,7 @@ export default function BackupsSection({
             ))}
           </tbody>
         </table>
+        </div>
       )}
       {policiesQuery.data && policies.length === 0 && (
         <p className="muted">No backup policies yet.</p>
