@@ -40,15 +40,13 @@ impl Drop for OpGuard {
             handle.spawn(async move {
                 locks.lock().await.remove(&key);
             });
-        } else if let Ok(mut set) = self.locks.try_lock() {
-            // No runtime (e.g. process teardown): release synchronously when
-            // the mutex is uncontended, which it is outside async execution.
-            set.remove(&key);
+        } else {
+            // No runtime (e.g. process teardown): release synchronously.
+            // `blocking_lock` (valid only outside an async context, which is
+            // exactly here) waits for the mutex rather than `try_lock`, which
+            // could silently drop the key if another thread held it.
+            self.locks.blocking_lock().remove(&key);
         }
-        // Otherwise the guard leaks its key; this only happens if a guard is
-        // dropped outside the runtime while another holder is mid-release, an
-        // impossible interleaving in this process model. `acquire` would then
-        // block; that failure mode is loud, never silent corruption.
     }
 }
 

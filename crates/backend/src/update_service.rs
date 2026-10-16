@@ -657,7 +657,15 @@ async fn terminal_fail(pool: &SqlitePool, task_id: &str, code: &str, summary: &s
         .bind(task_id)
         .execute(pool)
         .await;
-    let _ = task_runner::mark_failed(pool, task_id, code, &summary).await;
+    // `message` keeps the full story (Task 8's contract); `error_summary` is a
+    // client-facing field, so it goes through the Task 1 sanitizer (Finding 7).
+    let _ = task_runner::mark_failed(
+        pool,
+        task_id,
+        code,
+        &task_runner::sanitize_summary(&summary),
+    )
+    .await;
 }
 
 fn audit_update(

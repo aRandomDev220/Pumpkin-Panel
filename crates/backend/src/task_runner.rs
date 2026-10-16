@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::runtime::{DockerAdapter, RuntimeError};
 
 // ---------------------------------------------------------------------------
@@ -330,15 +331,128 @@ pub async fn requeue_interrupted(pool: &sqlx::SqlitePool) -> Result<u64, TaskErr
 // Worker
 // ---------------------------------------------------------------------------
 
-/// Record a task failure, truncating the summary to a sane length.
+// ---------------------------------------------------------------------------
+// Client-facing error summaries (Finding 7)
+// ---------------------------------------------------------------------------
+
+/// Maximum characters persisted in the client-facing `error_summary`.
+const ERROR_SUMMARY_MAX: usize = 300;
+
+/// Lower-case markers that reveal raw daemon or subprocess output. When any is
+/// present the client-facing summary is replaced wholesale: the machine code
+/// already lives in `error_code`, and the raw text (daemon internals, runc/OCI
+/// traces, host paths) is preserved only in `tracing`.
+const RAW_DAEMON_MARKERS: &[&str] = &[
+    "docker error:",
+    "error response from daemon",
+    "oci runtime",
+    "runc",
+    "container_linux.go",
+    "stderr",
+];
+
+/// Sanitize an error summary before it is persisted back to the `tasks` table.
+///
+/// Strips absolute filesystem paths and collapses raw daemon/subprocess text to
+/// a stable, bounded sentence. The full detail is expected to have been logged
+/// by the caller; this is the last line of defence for the stored value, so a
+/// path-bearing runtime message can never reach a client.
+pub(crate) fn sanitize_summary(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "operation failed".to_string();
+    }
+    let lower = collapsed.to_ascii_lowercase();
+    if RAW_DAEMON_MARKERS.iter().any(|m| lower.contains(m)) {
+        return "runtime operation failed; see manager logs for details".to_string();
+    }
+    let redacted = redact_absolute_paths(&collapsed);
+    redacted.chars().take(ERROR_SUMMARY_MAX).collect()
+}
+
+/// Replace whitespace-delimited tokens that look like absolute filesystem paths
+/// with a fixed marker.
+fn redact_absolute_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for (i, word) in input.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if is_absolute_path(word) {
+            out.push_str("[path redacted]");
+        } else {
+            out.push_str(word);
+        }
+    }
+    out
+}
+
+/// Heuristic: does `word` contain an absolute filesystem path?
+///
+/// Covers POSIX (`/home/...`), Windows (`C:\...`), and the common
+/// `key=/abs` / `key:/abs` forms, while leaving relative paths untouched.
+fn is_absolute_path(word: &str) -> bool {
+    let trimmed = word.trim_matches(|c: char| {
+        !(c.is_alphanumeric() || matches!(c, '/' | '\\' | '.' | '_' | '-'))
+    });
+    if trimmed.starts_with('/') && trimmed.len() > 1 {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') {
+        return true;
+    }
+    for sep in ["=/", ":\\"] {
+        if let Some(idx) = trimmed.find(sep) {
+            let after = &trimmed[idx + 1..];
+            if after.starts_with('/') || after.starts_with('\\') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Record a task failure, logging the full detail and persisting only the
+/// sanitized summary clients are allowed to see.
 async fn fail_task(
     pool: &sqlx::SqlitePool,
     task_id: &str,
     code: &str,
     summary: &str,
 ) -> Result<(), TaskError> {
-    let summary: String = summary.chars().take(500).collect();
-    mark_failed(pool, task_id, code, &summary).await
+    // Full, untruncated detail stays server-side.
+    error!(task_id, code, detail = %summary, "task failure detail");
+    let safe = sanitize_summary(summary);
+    mark_failed(pool, task_id, code, &safe).await
+}
+
+/// Fail a task whose type no worker implements. Also writes the mandatory
+/// audit record (Finding 6): an unknown type is an operator signal, not just a
+/// transient task error.
+async fn fail_unknown_task_type(
+    pool: &sqlx::SqlitePool,
+    task_id: &str,
+    task_type: &str,
+) -> Result<(), TaskError> {
+    audit::record(
+        pool,
+        None,
+        "task.unknown_type",
+        "task",
+        task_id,
+        "failed",
+        &audit::request_id(),
+        serde_json::json!({ "task_type": task_type }),
+    )
+    .await;
+    fail_task(
+        pool,
+        task_id,
+        "UNKNOWN_TASK_TYPE",
+        &format!("no worker implements task type '{task_type}'"),
+    )
+    .await
 }
 
 /// Look up the Docker container id for a server row.
@@ -457,13 +571,7 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
                 // so this arm is defensive: fail loudly instead of panicking.
                 other => {
                     warn!(task_id, task_type = other, "unhandled lifecycle op");
-                    fail_task(
-                        pool,
-                        task_id,
-                        "UNKNOWN_TASK_TYPE",
-                        &format!("no runtime handler for task type '{other}'"),
-                    )
-                    .await?;
+                    fail_unknown_task_type(pool, task_id, other).await?;
                     return Ok(());
                 }
             };
@@ -505,13 +613,7 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
             warn!(task_id, task_type = other, "no worker for task type");
             // Mark running first so the state trail shows the claim.
             mark_running(pool, task_id, "rejecting unknown task type").await?;
-            fail_task(
-                pool,
-                task_id,
-                "UNKNOWN_TASK_TYPE",
-                &format!("no worker implements task type '{other}'"),
-            )
-            .await?;
+            fail_unknown_task_type(pool, task_id, other).await?;
         }
     }
     Ok(())
@@ -643,6 +745,22 @@ mod tests {
         .execute(&pool)
         .await
         .expect("tasks table");
+        sqlx::query(
+            "CREATE TABLE audit_events (
+                id TEXT PRIMARY KEY,
+                actor_user_id TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT 'ok',
+                request_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                metadata TEXT NOT NULL DEFAULT '{}'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("audit_events table");
         pool
     }
 
@@ -742,6 +860,62 @@ mod tests {
         let r = get(&pool, &rec.id).await.expect("get").expect("row");
         assert_eq!(r.state, TaskState::Failed);
         assert_eq!(r.error_code.as_deref(), Some("UNKNOWN_TASK_TYPE"));
+        // Finding 6: an unknown task type must also be recorded in the audit
+        // trail, not merely marked failed.
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'task.unknown_type' AND target_id = ?",
+        )
+        .bind(&rec.id)
+        .fetch_one(&pool)
+        .await
+        .expect("audit count");
+        assert_eq!(audited, 1, "unknown task type must be audited");
+    }
+
+    #[tokio::test]
+    async fn fail_task_redacts_absolute_paths_in_error_summary() {
+        let pool = test_pool().await;
+        let rec = enqueue(&pool, "start", None, None).await.expect("q");
+        fail_task(
+            &pool,
+            &rec.id,
+            "IO_ERROR",
+            "cannot open /home/pumpkin/instances/world/level.dat for reading",
+        )
+        .await
+        .expect("fail");
+        let row = get(&pool, &rec.id).await.expect("get").expect("row");
+        let summary = row.error_summary.expect("summary");
+        assert!(
+            !summary.contains("/home/pumpkin"),
+            "host path must not leak to clients: {summary}"
+        );
+        assert!(
+            summary.contains("[path redacted]"),
+            "path is replaced by a stable marker: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_task_collapses_raw_daemon_text() {
+        let pool = test_pool().await;
+        let rec = enqueue(&pool, "start", None, None).await.expect("q");
+        fail_task(
+            &pool,
+            &rec.id,
+            "DOCKER_ERROR",
+            "docker error: Error response from daemon: stat /var/lib/docker/overlay2/abc: no such file or directory",
+        )
+        .await
+        .expect("fail");
+        let row = get(&pool, &rec.id).await.expect("get").expect("row");
+        let summary = row.error_summary.expect("summary");
+        assert_eq!(
+            summary, "runtime operation failed; see manager logs for details",
+            "raw daemon text collapses to a stable summary"
+        );
+        assert!(!summary.contains("/var/lib/docker"));
+        assert!(!summary.contains("overlay2"));
     }
 
     #[tokio::test]
