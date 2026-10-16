@@ -1,5 +1,6 @@
 import {
   createContext,
+  useEffect,
   useCallback,
   useContext,
   useMemo,
@@ -8,52 +9,45 @@ import {
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-export const TOKEN_KEY = "pm_token";
+const CSRF_COOKIE = "pm_csrf";
+const CSRF_HEADER = "X-CSRF-Token";
 
-let memoryToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
 
-function readStoredToken(): string | null {
-  try {
-    return window.localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
+function cookieValue(name: string): string | null {
+  const prefix = `${name}=`;
+  const pair = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return pair ? decodeURIComponent(pair.slice(prefix.length)) : null;
 }
 
-export function getToken(): string | null {
-  if (memoryToken) return memoryToken;
-  memoryToken = readStoredToken();
-  return memoryToken;
-}
-
-export function setToken(token: string): void {
-  memoryToken = token;
-  try {
-    window.localStorage.setItem(TOKEN_KEY, token);
-  } catch {
-    /* storage unavailable (private mode) — memory token still works */
-  }
-}
-
-export function clearToken(): void {
-  memoryToken = null;
-  try {
-    window.localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* ignore */
-  }
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
 }
 
 export async function authFetch(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
-  const token = getToken();
   const headers = new Headers(init.headers);
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const method = (init.method ?? "GET").toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const csrf = cookieValue(CSRF_COOKIE);
+    if (csrf && !headers.has(CSRF_HEADER)) {
+      headers.set(CSRF_HEADER, csrf);
+    }
   }
-  return fetch(input, { ...init, headers });
+  const response = await fetch(input, {
+    ...init,
+    credentials: "include",
+    headers,
+  });
+  if (response.status === 401) {
+    unauthorizedHandler?.();
+  }
+  return response;
 }
 
 async function parseJson<T>(res: Response): Promise<T> {
@@ -80,13 +74,12 @@ export interface SetupStatusResponse {
   needs_setup: boolean;
 }
 
-interface TokenResponse {
-  token: string;
+interface SessionResponse {
   user: AuthUser;
 }
 
 export async function fetchSetupStatus(): Promise<SetupStatusResponse> {
-  const res = await fetch("/api/v1/auth/setup-status");
+  const res = await fetch("/api/v1/auth/setup-status", { credentials: "include" });
   return parseJson<SetupStatusResponse>(res);
 }
 
@@ -98,25 +91,27 @@ export async function fetchMe(): Promise<AuthUser> {
 export async function postLogin(
   username: string,
   password: string,
-): Promise<TokenResponse> {
+): Promise<SessionResponse> {
   const res = await fetch("/api/v1/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ username, password }),
   });
-  return parseJson<TokenResponse>(res);
+  return parseJson<SessionResponse>(res);
 }
 
 export async function postSetup(
   username: string,
   password: string,
-): Promise<TokenResponse> {
+): Promise<SessionResponse> {
   const res = await fetch("/api/v1/auth/setup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ username, password }),
   });
-  return parseJson<TokenResponse>(res);
+  return parseJson<SessionResponse>(res);
 }
 
 export async function postLogout(): Promise<void> {
@@ -128,7 +123,6 @@ export async function postLogout(): Promise<void> {
 
 interface AuthContextValue {
   user: AuthUser | null;
-  token: string | null;
   isLoading: boolean;
   isAuthenticated: boolean;
   needsSetup: boolean | null;
@@ -146,8 +140,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
-  const [, setTokenVersion] = useState(0);
-  const token = getToken();
+  const [, setAuthVersion] = useState(0);
 
   const setupStatusQuery = useQuery({
     queryKey: ["auth", "setup-status"],
@@ -159,17 +152,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const meQuery = useQuery({
     queryKey: ["auth", "me"],
     queryFn: fetchMe,
-    enabled: token !== null,
     retry: false,
   });
+
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      qc.setQueryData(["auth", "me"], null);
+      setAuthVersion((version) => version + 1);
+    };
+    setUnauthorizedHandler(handleUnauthorized);
+    return () => setUnauthorizedHandler(null);
+  }, [qc]);
 
   const loginMutation = useMutation({
     mutationFn: ({ username, password }: { username: string; password: string }) =>
       postLogin(username, password),
     onSuccess: (data) => {
-      setToken(data.token);
       qc.setQueryData(["auth", "me"], data.user);
-      setTokenVersion((v) => v + 1);
+      setAuthVersion((version) => version + 1);
     },
   });
 
@@ -177,22 +177,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     mutationFn: ({ username, password }: { username: string; password: string }) =>
       postSetup(username, password),
     onSuccess: (data) => {
-      setToken(data.token);
       qc.setQueryData(["auth", "me"], data.user);
       qc.setQueryData<SetupStatusResponse>(["auth", "setup-status"], {
         needs_setup: false,
       });
-      setTokenVersion((v) => v + 1);
+      setAuthVersion((version) => version + 1);
     },
   });
 
   const logoutMutation = useMutation({
     mutationFn: postLogout,
     onSettled: () => {
-      clearToken();
       qc.setQueryData(["auth", "me"], null);
       qc.removeQueries({ queryKey: ["auth", "me"] });
-      setTokenVersion((v) => v + 1);
+      setAuthVersion((version) => version + 1);
     },
   });
 
@@ -214,18 +212,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await logoutMutation.mutateAsync();
     } catch {
-      clearToken();
       qc.removeQueries({ queryKey: ["auth", "me"] });
-      setTokenVersion((v) => v + 1);
+      setAuthVersion((version) => version + 1);
     }
   }, [logoutMutation, qc]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
       user: (meQuery.data as AuthUser | undefined) ?? null,
-      token,
       isLoading: meQuery.isLoading,
-      isAuthenticated: token !== null && meQuery.data !== undefined,
+      isAuthenticated: meQuery.data !== undefined && meQuery.data !== null,
       needsSetup: setupStatusQuery.data?.needs_setup ?? null,
       needsSetupLoading: setupStatusQuery.isLoading,
       loginPending: loginMutation.isPending,
@@ -241,7 +237,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       meQuery.data,
       meQuery.isLoading,
-      token,
       setupStatusQuery.data,
       setupStatusQuery.isLoading,
       loginMutation.isPending,
