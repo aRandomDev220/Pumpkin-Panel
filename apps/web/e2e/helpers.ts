@@ -49,6 +49,7 @@ export async function startBackend(): Promise<BackendHandle> {
       PUMPKIN_MANAGER_BACKUP_DIR: backupDir,
       PUMPKIN_MANAGER_DATABASE_URL: `sqlite:${dbFile}?mode=rwc`,
       PUMPKIN_INSECURE_COOKIES: "1",
+      PUMPKIN_ALLOWED_ORIGINS: "http://127.0.0.1:5193",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

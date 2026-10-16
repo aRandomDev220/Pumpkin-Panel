@@ -22,5 +22,7 @@ Rules enforced in this scaffold:
   `PUMPKIN_INSECURE_COOKIES=1` is an explicit local-HTTP development override.
 - Unsafe cookie-authenticated mutations require the readable CSRF cookie to be
   echoed in `X-CSRF-Token`; bearer-token mutations remain supported for API use.
+- Reverse-proxy browser origins must be explicitly listed in
+  `PUMPKIN_ALLOWED_ORIGINS`; arbitrary `Origin` values are never trusted.
 
 Full review lands in Phase 8.

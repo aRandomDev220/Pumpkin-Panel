@@ -500,7 +500,24 @@ fn same_origin_ok(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    origin_authority(source).is_some_and(|authority| authority.eq_ignore_ascii_case(host))
+    let Some(authority) = origin_authority(source) else {
+        return false;
+    };
+    if authority.eq_ignore_ascii_case(host) {
+        return true;
+    }
+
+    // A reverse proxy or Vite dev proxy can terminate the browser origin
+    // before forwarding the request to this backend. Permit only explicitly
+    // configured authorities; never infer trust from arbitrary Origin values.
+    std::env::var("PUMPKIN_ALLOWED_ORIGINS")
+        .ok()
+        .is_some_and(|allowed| {
+            allowed.split(',').any(|candidate| {
+                origin_authority(candidate.trim())
+                    .is_some_and(|configured| configured.eq_ignore_ascii_case(authority))
+            })
+        })
 }
 
 /// `https://host:port/path` → `host:port`; scheme-relative `//host` honored.
