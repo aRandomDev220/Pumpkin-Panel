@@ -535,10 +535,34 @@ pub fn import_tar_gz(
     limits: &ArchiveLimits,
 ) -> Result<usize, FileError> {
     let dest_full = resolve(root, dest)?;
+    extract_tar_reader(&dest_full, flate2::read::GzDecoder::new(data), limits)
+}
 
+/// Streaming variant of [`import_tar_gz`] that never buffers the archive.
+///
+/// `reader` yields the **already decompressed** tar stream — for a `.tar.gz`
+/// file, wrap a [`std::fs::File`] in a [`flate2::read::GzDecoder`] first.
+/// Shares every validation and write guard with [`import_tar_gz`]; `dest` is
+/// the destination directory (it is used as the root, with the archive's
+/// entries extracted beneath it).
+pub fn import_tar_gz_reader<R: std::io::Read>(
+    reader: R,
+    dest: &Path,
+    limits: &ArchiveLimits,
+) -> Result<usize, FileError> {
+    let dest_full = resolve(dest, "")?;
+    extract_tar_reader(&dest_full, reader, limits)
+}
+
+/// Shared two-phase extraction core: validate every entry from `reader`, then
+/// write. See [`import_tar_gz`].
+fn extract_tar_reader<R: std::io::Read>(
+    dest_full: &Path,
+    reader: R,
+    limits: &ArchiveLimits,
+) -> Result<usize, FileError> {
     // ---- Phase 1: parse + validate everything, no writes. ----
-    let decoder = flate2::read::GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(reader);
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -606,12 +630,12 @@ pub fn import_tar_gz(
     // ---- Phase 2: write. `rel` names are validated relative/`..`-free, so
     // `dest_full.join(rel)` is lexically inside `dest_full`; the remaining
     // risk (pre-existing symlinks in `dest`) is checked per path. ----
-    std::fs::create_dir_all(&dest_full).map_err(map_io)?;
+    std::fs::create_dir_all(dest_full).map_err(map_io)?;
 
     dirs.sort_by_key(|p| p.components().count());
     for d in &dirs {
         let full = dest_full.join(d);
-        ensure_writable_location(&dest_full, &full)?;
+        ensure_writable_location(dest_full, &full)?;
         match std::fs::symlink_metadata(&full) {
             Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
             Ok(_) => remove_existing(&full)?,
@@ -623,7 +647,7 @@ pub fn import_tar_gz(
     }
     for (rel, bytes) in &files {
         let full = dest_full.join(rel);
-        ensure_writable_location(&dest_full, &full)?;
+        ensure_writable_location(dest_full, &full)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(map_io)?;
         }
@@ -637,7 +661,7 @@ pub fn import_tar_gz(
     }
     for (rel, target) in &symlinks {
         let full = dest_full.join(rel);
-        ensure_writable_location(&dest_full, &full)?;
+        ensure_writable_location(dest_full, &full)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(map_io)?;
         }
@@ -654,7 +678,7 @@ pub fn import_tar_gz(
     }
     for (rel, target) in &hardlinks {
         let full = dest_full.join(rel);
-        ensure_writable_location(&dest_full, &full)?;
+        ensure_writable_location(dest_full, &full)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(map_io)?;
         }

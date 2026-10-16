@@ -163,8 +163,13 @@ fn error(status: StatusCode, code: &'static str, message: &str) -> Response {
         .into_response()
 }
 
+/// Map a [`BackupError`] to an HTTP error response. The client-facing
+/// `message` is sanitized (`task_runner::sanitize_summary`), so no variant —
+/// e.g. a storage error that names a directory — can leak an absolute host
+/// path into a response body. Full detail stays in the server-side log.
 fn backup_error(e: BackupError) -> Response {
-    error(e.status(), e.code(), &e.to_string())
+    let safe = task_runner::sanitize_summary(&e.to_string());
+    error(e.status(), e.code(), &safe)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +237,10 @@ async fn fetch_backup(pool: &SqlitePool, id: &str) -> Result<Option<BackupRow>, 
 
 async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
+        // `cancel_requested` counts as busy too, matching the scheduler's
+        // `server_busy` definition: a task winding down still owns the server.
         "SELECT COUNT(*) FROM tasks
-         WHERE server_id = ? AND state IN ('queued', 'running')",
+         WHERE server_id = ? AND state IN ('queued', 'running', 'cancel_requested')",
     )
     .bind(server_id)
     .fetch_one(pool)
@@ -282,6 +289,9 @@ fn backup_json(b: &BackupRow) -> serde_json::Value {
 /// tasks; the rows stay as evidence).
 pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
     clean_staging(backup_root.to_path_buf()).await;
+    // The backup root can also hold recovery leftovers (should not normally,
+    // but never assume): report them, never delete.
+    report_recovery_leftovers(pool, backup_root).await;
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT data_path FROM servers WHERE deleted_at IS NULL")
             .fetch_all(pool)
@@ -479,20 +489,34 @@ fn free_bytes_for(path: &Path) -> Option<u64> {
     best.map(|(_, free)| free)
 }
 
-/// Pre-flight free-space and size check for a backup of `estimate` bytes:
-/// refuse when the destination cannot hold ~2x the estimate (archive +
-/// staging headroom), and refuse when the input exceeds the in-memory cap.
-/// `free = None` means "unknown filesystem", in which case we proceed
-/// optimistically. Pure so it is unit-testable with a seam.
-fn preflight_backup_space(estimate: u64, free: Option<u64>) -> Result<(), BackupError> {
-    if estimate > MAX_ARCHIVE_BYTES {
-        return Err(BackupError::Failed(format!(
-            "server data ({estimate} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte archive cap"
-        )));
+/// Free bytes available for restore staging at `path`. Delegates to
+/// [`free_bytes_for`], with a test-only override so the free-space rejection
+/// path can be exercised without a genuinely full filesystem.
+fn restore_free_bytes(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    {
+        if let Ok(guard) = RESTORE_FREE_OVERRIDE.lock() {
+            if let Some(value) = *guard {
+                return value;
+            }
+        }
     }
-    if estimate > 0 {
+    free_bytes_for(path)
+}
+
+/// Test-only free-space override: `None` = use the real filesystem, `Some(v)`
+/// (including `Some(None)`) = report `v` regardless.
+#[cfg(test)]
+static RESTORE_FREE_OVERRIDE: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+
+/// Shared free-space rule for backup and restore: refuse when the destination
+/// cannot hold ~2x `required` (content + staging headroom). `free = None` means
+/// "unknown filesystem", in which case we proceed optimistically. Pure so it is
+/// unit-testable with a seam.
+fn ensure_space_available(required: u64, free: Option<u64>) -> Result<(), BackupError> {
+    if required > 0 {
         if let Some(free) = free {
-            if free < estimate.saturating_mul(2) {
+            if free < required.saturating_mul(2) {
                 return Err(BackupError::NoSpace);
             }
         }
@@ -500,28 +524,55 @@ fn preflight_backup_space(estimate: u64, free: Option<u64>) -> Result<(), Backup
     Ok(())
 }
 
-/// Restore pre-flight: refuse an archive larger than the in-memory cap so the
-/// extract path never reads an unbounded file into a `Vec`.
+/// Pre-flight free-space and size check for a backup of `estimate` bytes.
+///
+/// The `MAX_ARCHIVE_BYTES` cap (~2 GiB) is **intentional**: it bounds the
+/// uncompressed server data this manager will treat as a single logical
+/// snapshot, keeping archive creation/verification time and the restore
+/// extraction destination bounded. Inputs beyond it are refused with a clear,
+/// path-free error rather than being attempted.
+fn preflight_backup_space(estimate: u64, free: Option<u64>) -> Result<(), BackupError> {
+    if estimate > MAX_ARCHIVE_BYTES {
+        return Err(BackupError::Failed(format!(
+            "server data ({estimate} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte archive cap"
+        )));
+    }
+    ensure_space_available(estimate, free)
+}
+
+/// Restore pre-flight: the extraction destination (the server root) must have
+/// room for the archive's contents, reusing the backup free-space rule. The
+/// archive's on-disk size is a conservative lower bound on what will be
+/// written; the extract is additionally capped by `DEFAULT_ARCHIVE_LIMITS`.
+fn preflight_restore_space(archive_len: u64, free: Option<u64>) -> Result<(), BackupError> {
+    ensure_space_available(archive_len, free)
+}
+
+/// Restore pre-flight: refuse an archive larger than the cap so the extract
+/// path never processes an unbounded file.
 fn preflight_restore_archive(len: u64) -> Result<(), BackupError> {
     if len > MAX_ARCHIVE_BYTES {
         return Err(BackupError::Failed(format!(
-            "backup archive ({len} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte cap; \
-             streaming restore is not yet supported"
+            "backup archive ({len} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte cap"
         )));
     }
     Ok(())
 }
 
 /// `create_dir_all` plus a write-probe, so unwritable storage fails fast at
-/// enqueue time instead of mid-worker.
+/// enqueue time instead of mid-worker. The returned message is deliberately
+/// **path-free** (the absolute dir is logged server-side) so it can never leak
+/// a host path through a client error body.
 async fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| format!("cannot create backup dir {}: {e}", dir.display()))?;
+    tokio::fs::create_dir_all(dir).await.map_err(|e| {
+        tracing::warn!(path = %dir.display(), error = %e, "cannot create backup dir");
+        "backup storage dir cannot be created".to_string()
+    })?;
     let probe = dir.join(format!(".write-probe-{}", uuid::Uuid::new_v4()));
-    tokio::fs::write(&probe, b"probe")
-        .await
-        .map_err(|e| format!("backup dir {} is not writable: {e}", dir.display()))?;
+    tokio::fs::write(&probe, b"probe").await.map_err(|e| {
+        tracing::warn!(path = %dir.display(), error = %e, "backup dir is not writable");
+        "backup storage dir is not writable".to_string()
+    })?;
     let _ = tokio::fs::remove_file(&probe).await;
     Ok(())
 }
@@ -1150,15 +1201,13 @@ async fn execute_restore_inner(
         .await?
         .ok_or(BackupError::BackupNotFound)?;
     verify_backup_file(&backup).await?;
-    // Bound the extract buffer: never read an unbounded archive into memory.
+    // Cap the archive size before touching it; extraction streams from the
+    // file (no whole-archive buffer).
     let archive_len = tokio::fs::metadata(&backup.storage_path)
         .await
         .map_err(|_| BackupError::Corrupt)?
         .len();
     preflight_restore_archive(archive_len)?;
-    let archive_bytes = tokio::fs::read(&backup.storage_path)
-        .await
-        .map_err(|_| BackupError::Corrupt)?;
 
     // Auto pre-restore safety backup (protected from retention). Its failure
     // ABORTS the restore — live data is never touched on this path.
@@ -1258,8 +1307,14 @@ async fn execute_restore_inner(
     .map_err(|e| BackupError::Failed(format!("cannot stage restore: {e}")))?;
     let staged = tokio::task::spawn_blocking({
         let staging = staging.clone();
+        let storage_path = backup.storage_path.clone();
         let limits = file_service::DEFAULT_ARCHIVE_LIMITS;
-        move || file_service::import_tar_gz(&staging, "", &archive_bytes, &limits)
+        move || {
+            let file = std::fs::File::open(&storage_path)
+                .map_err(|e| file_service::FileError::Io(e.to_string()))?;
+            let reader = flate2::read::GzDecoder::new(file);
+            file_service::import_tar_gz_reader(reader, &staging, &limits)
+        }
     })
     .await
     .map_err(|_| BackupError::Failed("restore extract task failed".into()))?;
@@ -1471,9 +1526,18 @@ pub async fn enqueue_restore(
     ensure_writable_dir(backup_dir)
         .await
         .map_err(BackupError::Storage)?;
-    if parent_of(&server.data_path).is_none() {
+    let Some(server_root) = parent_of(&server.data_path) else {
         return Err(BackupError::Failed("server has no data path".into()));
-    }
+    };
+    // Free-space preflight for the extraction destination (the server root,
+    // where `.tmp-restore-*` staging lands) — fail with a clear, path-free 5xx
+    // before a task exists, mirroring the backup path.
+    let archive_len = tokio::fs::metadata(&backup.storage_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    preflight_restore_archive(archive_len)?;
+    preflight_restore_space(archive_len, restore_free_bytes(&server_root))?;
 
     let task =
         task_runner::enqueue(pool, TASK_TYPE_RESTORE, Some(&server.id), requested_by).await?;
@@ -1674,8 +1738,8 @@ pub async fn download_backup(
             "backup file is not available",
         );
     }
-    let bytes = match tokio::fs::read(&backup.storage_path).await {
-        Ok(b) => b,
+    let file = match tokio::fs::File::open(&backup.storage_path).await {
+        Ok(f) => f,
         Err(_) => {
             return error(
                 StatusCode::NOT_FOUND,
@@ -1684,6 +1748,7 @@ pub async fn download_backup(
             );
         }
     };
+    let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     audit::record(
         &state.pool,
         Some(&user.id),
@@ -1692,9 +1757,23 @@ pub async fn download_backup(
         &id,
         "ok",
         &request_id,
-        serde_json::json!({ "size_bytes": bytes.len() }),
+        serde_json::json!({ "size_bytes": size }),
     )
     .await;
+    // Stream the archive off disk in bounded chunks: the whole file is never
+    // held in memory (the previous `fs::read` allocated the full archive).
+    let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buf.truncate(n);
+            Ok(Some((axum::body::Bytes::from(buf), file)))
+        }
+    });
+    let body = axum::body::Body::from_stream(stream);
     (
         [
             ("content-type", "application/gzip".to_string()),
@@ -1703,7 +1782,7 @@ pub async fn download_backup(
                 format!("attachment; filename=\"backup-{id}.tar.gz\""),
             ),
         ],
-        bytes,
+        body,
     )
         .into_response()
 }
@@ -2218,6 +2297,18 @@ mod tests {
             .await;
         assert_eq!(dl.status_code(), 200, "body: {}", dl.text());
         assert_eq!(dl.as_bytes().as_ref(), on_disk.as_slice());
+        assert_eq!(
+            dl.headers().get("content-type").unwrap(),
+            "application/gzip"
+        );
+        // Important 3: the body is streamed from the file, not buffered into a
+        // `Vec`, so axum frames it chunked and sets no `Content-Length`
+        // (a `Vec<u8>` body would have set one).
+        assert!(
+            dl.headers().get("content-length").is_none(),
+            "download must stream (chunked), not set Content-Length: {:?}",
+            dl.headers().get("content-length")
+        );
 
         // List shows the backup.
         let list = fx
@@ -2861,7 +2952,13 @@ mod tests {
             .authorization_bearer(&fx.token)
             .json(&json!({"mode": "full", "consistency": "live"}))
             .await;
-        assert_eq!(res.status_code(), 502, "body: {}", res.text());
+        let body = res.text();
+        assert_eq!(res.status_code(), 502, "body: {body}");
+        // Critical 1: the client error body must never contain a host path.
+        assert!(
+            !body.contains('/'),
+            "client error body must be path-free: {body}"
+        );
         assert_eq!(backup_count(&fx, &id).await, 0);
 
         // The lock must be reclaimable promptly (Drop removal is deferred).
@@ -2902,6 +2999,73 @@ mod tests {
             Err(BackupError::Failed(_))
         ));
         assert!(preflight_restore_archive(MAX_ARCHIVE_BYTES).is_ok());
+    }
+
+    /// RAII reset for the test-only free-space override: it is cleared on drop,
+    /// so a panicking assertion cannot leak the override into later tests.
+    struct FreeSpaceOverride;
+    impl Drop for FreeSpaceOverride {
+        fn drop(&mut self) {
+            *RESTORE_FREE_OVERRIDE.lock().unwrap() = None;
+        }
+    }
+    fn force_free_bytes(value: Option<u64>) -> FreeSpaceOverride {
+        *RESTORE_FREE_OVERRIDE.lock().unwrap() = Some(value);
+        FreeSpaceOverride
+    }
+
+    #[test]
+    fn preflight_restore_space_rejects_full_disk() {
+        // Restore reuses the backup free-space rule (~2x the archive size).
+        assert!(matches!(
+            preflight_restore_space(1000, Some(1999)),
+            Err(BackupError::NoSpace)
+        ));
+        assert!(preflight_restore_space(1000, Some(2000)).is_ok());
+        // Unknown filesystem → optimistic; empty archive → no headroom needed.
+        assert!(preflight_restore_space(1000, None).is_ok());
+        assert!(preflight_restore_space(0, Some(0)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn restore_rejected_when_disk_full() {
+        // Important 4: a restore whose extraction destination has no free space
+        // is refused up front (no task, no writes) with a path-free body.
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-restore-space").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("keep.txt"), b"precious").unwrap();
+        let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
+
+        let _override = force_free_bytes(Some(0));
+        let res = fx
+            .server
+            .post(&format!("/api/v1/backups/{backup_id}/restore"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({}))
+            .await;
+        let body = res.text();
+        assert!(
+            [409, 502].contains(&res.status_code().as_u16()),
+            "expected a space refusal, got {}: {body}",
+            res.status_code()
+        );
+        assert!(
+            !body.contains('/'),
+            "space-refusal body leaked a path: {body}"
+        );
+
+        // Nothing was enqueued and live data is untouched.
+        let tasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restore'",
+        )
+        .bind(&id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(tasks, 0, "no restore task may be enqueued");
+        assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"precious");
     }
 
     #[tokio::test]
