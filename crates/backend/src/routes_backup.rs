@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -31,12 +31,12 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::{
     audit,
     auth::AuthUser,
-    backup_service, file_service,
+    backup_service, file_service, op_lock,
     runtime::{DockerAdapter, RuntimeAdapter, RuntimeError},
     task_runner, AppState,
 };
@@ -54,6 +54,13 @@ const TASK_TYPE_RESTORE: &str = "restore";
 /// (mirrors the `backup_policies` column defaults in `0005_backups.sql`).
 const DEFAULT_RETENTION_COUNT: usize = 7;
 const DEFAULT_MAX_AGE_DAYS: u64 = 30;
+
+/// Upper bound on an archive this manager will buffer in memory. Archive
+/// *creation* streams straight to disk (no whole-archive buffer); this bound
+/// still guards the pre-flight estimate and the restore extract path, which
+/// must read the archive into memory until a streaming importer exists.
+/// Exceeding it is a clear, actionable error rather than an OOM.
+pub const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -235,14 +242,17 @@ async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
         > 0
 }
 
+/// Client-facing projection of a backup row. The absolute `storage_path` is
+/// deliberately omitted (host path leak); `downloadable` conveys the same
+/// "an archive exists" fact safely.
 fn backup_json(b: &BackupRow) -> serde_json::Value {
     serde_json::json!({
         "id": b.id,
         "server_id": b.server_id,
         "type": b.backup_type,
         "state": b.state,
-        "storage_path": b.storage_path,
         "size_bytes": b.size_bytes,
+        "downloadable": !b.storage_path.is_empty(),
         "checksum_algorithm": b.checksum_algorithm,
         "checksum": b.checksum,
         "consistency_method": b.consistency_method,
@@ -258,14 +268,20 @@ fn backup_json(b: &BackupRow) -> serde_json::Value {
 // Roots, hashing, space
 // ---------------------------------------------------------------------------
 
-/// Best-effort boot cleanup: remove `.tmp-*` staging entries predating this
-/// boot from the backup root, plus `.tmp-*`/`.recovery-*` crash leftovers
-/// beside every live server's data dir (restore stages `.tmp-restore-<id>`
-/// and parks `.recovery-<ts>` in the server root). In-progress backup *rows*
-/// are left alone (`requeue_interrupted` already fails their tasks; the rows
-/// stay as evidence).
+/// Best-effort boot cleanup: remove stale `.tmp-*` scratch entries predating
+/// this boot from the backup root and from beside every live server's data
+/// dir (restore stages `.tmp-restore-<id>` in the server root).
+///
+/// **Never touches `.recovery-*`.** Restore parks the prior data dir as
+/// `.recovery-<ts>` before swapping the staged tree in; an interrupted restore
+/// can leave that copy as the *only* surviving snapshot. Deleting it at boot
+/// can therefore destroy live data. Any `.recovery-*` entry found is left in
+/// place, logged with its full path, and recorded as `backup.recovery_leftover`
+/// so an operator can recover or remove it deliberately. In-progress backup
+/// *rows* are likewise left alone (`requeue_interrupted` already fails their
+/// tasks; the rows stay as evidence).
 pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
-    clean_staging_dir(backup_root, false);
+    clean_staging(backup_root.to_path_buf()).await;
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT data_path FROM servers WHERE deleted_at IS NULL")
             .fetch_all(pool)
@@ -278,15 +294,21 @@ pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
         }
     }
     for parent in parents {
-        clean_staging_dir(&parent, true);
+        clean_staging(parent.clone()).await;
+        report_recovery_leftovers(pool, &parent).await;
     }
 }
 
-/// Remove stale staging entries from `dir`: always `.tmp-*`, plus
-/// `.recovery-*` when `with_recovery` (server data-dir parents only). An
-/// entry counts as stale when its mtime predates this boot (`<= now` at
-/// cleanup time); live data files never match either prefix.
-fn clean_staging_dir(dir: &Path, with_recovery: bool) {
+/// Run the (blocking) scratch-directory sweep off the async runtime.
+async fn clean_staging(dir: PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || clean_staging_dir(&dir)).await;
+}
+
+/// Remove stale `.tmp-*` scratch entries from `dir`. An entry counts as stale
+/// when its mtime predates this boot (`<= now` at cleanup time); live data
+/// files never match the prefix. `.recovery-*` is deliberately NOT matched:
+/// see [`startup_cleanup`].
+fn clean_staging_dir(dir: &Path) {
     let now = std::time::SystemTime::now();
     let entries = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -299,9 +321,7 @@ fn clean_staging_dir(dir: &Path, with_recovery: bool) {
     let mut removed = 0u32;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let staging = name.starts_with(".tmp-");
-        let recovery = with_recovery && name.starts_with(".recovery-");
-        if !staging && !recovery {
+        if !name.starts_with(".tmp-") {
             continue;
         }
         let stale = entry
@@ -327,6 +347,69 @@ fn clean_staging_dir(dir: &Path, with_recovery: bool) {
         tracing::info!(removed, path = %dir.display(),
             "backup cleanup removed stale staging entries");
     }
+}
+
+/// Leave `.recovery-*` prior-data copies untouched and make them visible.
+///
+/// An interrupted restore can leave one or more of these beside a server data
+/// dir — the only copy of the pre-restore data. We never delete them. The full
+/// paths go to the warning log (the operator's recovery aid); the audit event
+/// carries the entry names plus the parent directory *name* so the trail is
+/// useful without embedding absolute host paths (see the path-leak rule).
+async fn report_recovery_leftovers(pool: &SqlitePool, dir: &Path) {
+    let dir = dir.to_path_buf();
+    let leftovers = tokio::task::spawn_blocking(move || {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".recovery-"))
+            .map(|e| e.path())
+            .collect();
+        found.sort();
+        found
+    })
+    .await
+    .unwrap_or_default();
+    if leftovers.is_empty() {
+        return;
+    }
+    let full_paths: Vec<String> = leftovers.iter().map(|p| p.display().to_string()).collect();
+    tracing::warn!(
+        count = leftovers.len(),
+        paths = ?full_paths,
+        "interrupted restore left .recovery-* prior data in place; \
+         NOT deleted — recover or remove it manually"
+    );
+    let names: Vec<String> = leftovers
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
+    let parent_name = leftovers
+        .first()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    audit::record(
+        pool,
+        None,
+        "backup.recovery_leftover",
+        "backup",
+        "",
+        "warning",
+        &audit::request_id(),
+        serde_json::json!({
+            "count": names.len(),
+            "entries": names,
+            "parent_dir": parent_name,
+        }),
+    )
+    .await;
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -396,23 +479,37 @@ fn free_bytes_for(path: &Path) -> Option<u64> {
     best.map(|(_, free)| free)
 }
 
-/// Fully decode a tar.gz in memory, draining every regular file. Proves the
-/// archive round-trips before we call a backup verified.
-fn verify_archive_bytes(data: &[u8]) -> Result<usize, String> {
-    use std::io::Read as _;
-    let decoder = flate2::read::GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive.entries().map_err(|e| e.to_string())?;
-    let mut count = 0usize;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        if entry.header().entry_type().is_file() {
-            let mut sink = Vec::new();
-            entry.read_to_end(&mut sink).map_err(|e| e.to_string())?;
-        }
-        count += 1;
+/// Pre-flight free-space and size check for a backup of `estimate` bytes:
+/// refuse when the destination cannot hold ~2x the estimate (archive +
+/// staging headroom), and refuse when the input exceeds the in-memory cap.
+/// `free = None` means "unknown filesystem", in which case we proceed
+/// optimistically. Pure so it is unit-testable with a seam.
+fn preflight_backup_space(estimate: u64, free: Option<u64>) -> Result<(), BackupError> {
+    if estimate > MAX_ARCHIVE_BYTES {
+        return Err(BackupError::Failed(format!(
+            "server data ({estimate} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte archive cap"
+        )));
     }
-    Ok(count)
+    if estimate > 0 {
+        if let Some(free) = free {
+            if free < estimate.saturating_mul(2) {
+                return Err(BackupError::NoSpace);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restore pre-flight: refuse an archive larger than the in-memory cap so the
+/// extract path never reads an unbounded file into a `Vec`.
+fn preflight_restore_archive(len: u64) -> Result<(), BackupError> {
+    if len > MAX_ARCHIVE_BYTES {
+        return Err(BackupError::Failed(format!(
+            "backup archive ({len} bytes) exceeds the {MAX_ARCHIVE_BYTES}-byte cap; \
+             streaming restore is not yet supported"
+        )));
+    }
+    Ok(())
 }
 
 /// `create_dir_all` plus a write-probe, so unwritable storage fails fast at
@@ -439,21 +536,6 @@ fn semaphore() -> &'static Semaphore {
     BACKUP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
 
-/// Try to claim the per-server op lock on the shared [`AppState::op_locks`].
-/// `false` = conflicting op in flight (same pattern as `routes_servers`).
-async fn try_lock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) -> bool {
-    let mut guard = locks.lock().await;
-    if guard.contains(server_id) {
-        return false;
-    }
-    guard.insert(server_id.to_string());
-    true
-}
-
-async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
-    locks.lock().await.remove(server_id);
-}
-
 async fn cancel_requested(pool: &SqlitePool, task_id: &str) -> bool {
     matches!(
         task_runner::get(pool, task_id).await,
@@ -461,21 +543,25 @@ async fn cancel_requested(pool: &SqlitePool, task_id: &str) -> bool {
     )
 }
 
-fn truncate500(s: &str) -> String {
-    s.chars().take(500).collect()
-}
-
+/// Persist a client-facing failure summary on a backup row. The stored value
+/// is sanitized (paths/raw daemon text removed); the caller is expected to have
+/// logged the full detail.
 async fn fail_backup_row(pool: &SqlitePool, backup_id: &str, summary: &str) {
+    let safe = task_runner::sanitize_summary(summary);
     let _ = sqlx::query("UPDATE backups SET state = 'failed', error_summary = ? WHERE id = ?")
-        .bind(truncate500(summary))
+        .bind(&safe)
         .bind(backup_id)
         .execute(pool)
         .await;
 }
 
 async fn fail_backup(pool: &SqlitePool, task_id: &str, backup_id: &str, code: &str, summary: &str) {
+    // Full, untruncated detail stays server-side; only the sanitized summary
+    // is persisted where a client can read it.
+    tracing::error!(task_id, backup_id, code, detail = %summary, "backup failure detail");
     fail_backup_row(pool, backup_id, summary).await;
-    let _ = task_runner::mark_failed(pool, task_id, code, &truncate500(summary)).await;
+    let safe = task_runner::sanitize_summary(summary);
+    let _ = task_runner::mark_failed(pool, task_id, code, &safe).await;
     audit::record(
         pool,
         None,
@@ -526,10 +612,8 @@ fn nanos_now() -> u128 {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct BackupOutcome {
-    pub(crate) storage_path: String,
     pub(crate) size_bytes: i64,
     pub(crate) checksum: String,
-    pub(crate) archive_entries: usize,
 }
 
 /// Capture a verified `.tar.gz` of the server data dir. Stops the container
@@ -563,23 +647,23 @@ pub(crate) async fn run_backup_capture(
             "refusing to back up the server root itself".into(),
         ));
     }
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| BackupError::Failed(format!("cannot open server data dir: {e}")))?;
+    tokio::task::spawn_blocking({
+        let dir = data_dir.clone();
+        move || std::fs::create_dir_all(&dir)
+    })
+    .await
+    .map_err(|_| BackupError::Failed("data dir open task failed".into()))?
+    .map_err(|e| BackupError::Failed(format!("cannot open server data dir: {e}")))?;
 
-    // Pre-check: refuse when the disk cannot hold ~2x the data estimate.
+    // Pre-check: cap the input and refuse when the disk cannot hold ~2x the
+    // data estimate.
     let estimate = tokio::task::spawn_blocking({
         let dir = data_dir.clone();
         move || dir_size_bytes(&dir)
     })
     .await
     .map_err(|_| BackupError::Failed("size estimate task failed".into()))?;
-    if estimate > 0 {
-        if let Some(free) = free_bytes_for(&backup_root) {
-            if free < estimate.saturating_mul(2) {
-                return Err(BackupError::NoSpace);
-            }
-        }
-    }
+    preflight_backup_space(estimate, free_bytes_for(&backup_root))?;
 
     if cancel_requested(pool, cancel_task_id).await {
         return Err(BackupError::Cancelled);
@@ -619,37 +703,28 @@ pub(crate) async fn run_backup_capture(
         }
     }
 
-    // Tar the data dir (blocking: gzip-bound), stage as `.part`, rename.
-    let bytes = tokio::task::spawn_blocking({
-        let dir = data_dir.clone();
-        move || file_service::export_tar_gz(&dir, &[""])
-    })
-    .await
-    .map_err(|_| BackupError::Failed("backup export task failed".into()))?
-    .map_err(|e| BackupError::Failed(format!("backup export failed: {e}")))?;
+    // Stream the archive straight to a `.part` file on disk (gzip-bound), then
+    // publish with a rename. `create_full_backup` walks the tree with
+    // symlink-free rules (escaping symlinks are skipped, never followed) and
+    // never holds the whole archive in memory.
     let part_path = backup_root.join(format!("{backup_id}.tar.gz.part"));
     let final_path = backup_root.join(format!("{backup_id}.tar.gz"));
-    tokio::fs::write(&part_path, &bytes)
+    let _ = tokio::fs::remove_file(&part_path).await;
+    let manifest = backup_service::create_full_backup(&data_dir, &part_path, &|_done, _total| {})
         .await
-        .map_err(|e| BackupError::Failed(format!("failed to write backup archive: {e}")))?;
+        .map_err(|e| BackupError::Failed(format!("backup export failed: {e}")))?;
     tokio::fs::rename(&part_path, &final_path)
         .await
         .map_err(|e| BackupError::Failed(format!("failed to publish backup archive: {e}")))?;
 
-    // Verify from disk: checksum + full archive re-list.
-    let final_path_clone = final_path.clone();
-    let (checksum, size_bytes, archive_entries) =
-        tokio::task::spawn_blocking(move || -> Result<(String, i64, usize), String> {
-            let data = std::fs::read(&final_path_clone).map_err(|e| e.to_string())?;
-            let entries = verify_archive_bytes(&data)?;
-            use sha2::{Digest as _, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&data);
-            Ok((hex_encode(&hasher.finalize()), data.len() as i64, entries))
-        })
+    // Verify from disk by streaming: re-hash and re-list the archive without
+    // buffering it in memory.
+    let verified = backup_service::verify_backup(&final_path, &manifest.checksum_sha256)
         .await
-        .map_err(|_| BackupError::Failed("backup verify task failed".into()))?
-        .map_err(BackupError::Failed)?;
+        .map_err(|e| BackupError::Failed(format!("backup verify failed: {e}")))?;
+    let checksum = verified.checksum_sha256;
+    let size_bytes = verified.bytes as i64;
+    let archive_entries = verified.files as usize;
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let _ = sqlx::query(
@@ -682,10 +757,8 @@ pub(crate) async fn run_backup_capture(
     .await;
     Ok((
         BackupOutcome {
-            storage_path: final_path.to_string_lossy().into_owned(),
             size_bytes,
             checksum,
-            archive_entries,
         },
         resume,
     ))
@@ -813,7 +886,7 @@ async fn execute_backup(
     .await;
 
     match outcome {
-        Ok(outcome) => {
+        Ok(_outcome) => {
             // Cooperative cancel before the prune: the backup itself is done
             // and verified; only the retention sweep is skipped.
             if cancel_requested(pool, task_id).await {
@@ -832,22 +905,9 @@ async fn execute_backup(
                 return;
             }
             prune_retention(pool, server_id, actor).await;
-            audit::record(
-                pool,
-                actor,
-                "backup.complete",
-                "backup",
-                backup_id,
-                "ok",
-                &audit::request_id(),
-                serde_json::json!({
-                    "server_id": server_id,
-                    "storage_path": outcome.storage_path,
-                    "size_bytes": outcome.size_bytes,
-                    "archive_entries": outcome.archive_entries,
-                }),
-            )
-            .await;
+            // No second `backup.complete` audit here: `run_backup_capture`
+            // already records it (with size/entries/consistency). Emitting it
+            // twice was duplicate audit noise.
             let _ = task_runner::mark_succeeded(pool, task_id, "backup completed").await;
         }
         Err(BackupError::Cancelled) => {
@@ -869,9 +929,11 @@ async fn execute_backup(
         }
         Err(BackupError::ResumeFailed(msg)) => {
             // The backup row is `completed` and verified; only the task
-            // reports the restart failure, with both facts recorded.
-            let _ =
-                task_runner::mark_failed(pool, task_id, "RESTART_FAILED", &truncate500(&msg)).await;
+            // reports the restart failure, with both facts recorded. Full
+            // detail to the log; the stored/audited copy is sanitized.
+            tracing::error!(task_id, backup_id, detail = %msg, "backup restart failed");
+            let safe = task_runner::sanitize_summary(&msg);
+            let _ = task_runner::mark_failed(pool, task_id, "RESTART_FAILED", &safe).await;
             audit::record(
                 pool,
                 actor,
@@ -880,7 +942,7 @@ async fn execute_backup(
                 backup_id,
                 "failed",
                 &audit::request_id(),
-                serde_json::json!({ "task_id": task_id, "message": truncate500(&msg) }),
+                serde_json::json!({ "task_id": task_id, "message": safe }),
             )
             .await;
         }
@@ -1025,8 +1087,10 @@ async fn execute_restore(
             .await;
         }
         Err(e) => {
-            let _ = task_runner::mark_failed(pool, task_id, e.code(), &truncate500(&e.to_string()))
-                .await;
+            // Full detail to the log; the stored copy is sanitized.
+            tracing::error!(task_id, backup_id, code = e.code(), detail = %e, "restore failure detail");
+            let safe = task_runner::sanitize_summary(&e.to_string());
+            let _ = task_runner::mark_failed(pool, task_id, e.code(), &safe).await;
             audit::record(
                 pool,
                 actor,
@@ -1086,6 +1150,12 @@ async fn execute_restore_inner(
         .await?
         .ok_or(BackupError::BackupNotFound)?;
     verify_backup_file(&backup).await?;
+    // Bound the extract buffer: never read an unbounded archive into memory.
+    let archive_len = tokio::fs::metadata(&backup.storage_path)
+        .await
+        .map_err(|_| BackupError::Corrupt)?
+        .len();
+    preflight_restore_archive(archive_len)?;
     let archive_bytes = tokio::fs::read(&backup.storage_path)
         .await
         .map_err(|_| BackupError::Corrupt)?;
@@ -1145,7 +1215,10 @@ async fn execute_restore_inner(
                     &id,
                     "failed",
                     &audit::request_id(),
-                    serde_json::json!({ "server_id": server.id, "error": e.to_string() }),
+                    serde_json::json!({
+                        "server_id": server.id,
+                        "error": task_runner::sanitize_summary(&e.to_string()),
+                    }),
                 )
                 .await;
                 return Err(BackupError::Failed(format!(
@@ -1173,9 +1246,16 @@ async fn execute_restore_inner(
         ));
     }
     let staging = server_root.join(format!(".tmp-restore-{}", backup.id));
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| BackupError::Failed(format!("cannot stage restore: {e}")))?;
+    tokio::task::spawn_blocking({
+        let staging = staging.clone();
+        move || {
+            let _ = std::fs::remove_dir_all(&staging);
+            std::fs::create_dir_all(&staging)
+        }
+    })
+    .await
+    .map_err(|_| BackupError::Failed("restore stage task failed".into()))?
+    .map_err(|e| BackupError::Failed(format!("cannot stage restore: {e}")))?;
     let staged = tokio::task::spawn_blocking({
         let staging = staging.clone();
         let limits = file_service::DEFAULT_ARCHIVE_LIMITS;
@@ -1186,17 +1266,25 @@ async fn execute_restore_inner(
     let staged_count = match staged {
         Ok(n) => n,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            let staging = staging.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&staging)).await;
             return Err(BackupError::Failed(format!(
                 "restore archive failed validation: {e}"
             )));
         }
     };
     // Validate the listing: the staged tree must read back.
-    let listed = std::fs::read_dir(&staging)
-        .map(|rd| rd.count())
-        .map_err(|e| BackupError::Failed(format!("staged restore unreadable: {e}")))?;
-    let _ = listed;
+    tokio::task::spawn_blocking({
+        let staging = staging.clone();
+        move || {
+            std::fs::read_dir(&staging)
+                .map(|rd| rd.count())
+                .map_err(|e| format!("staged restore unreadable: {e}"))
+        }
+    })
+    .await
+    .map_err(|_| BackupError::Failed("restore listing task failed".into()))?
+    .map_err(BackupError::Failed)?;
     audit::record(
         pool,
         actor,
@@ -1210,36 +1298,45 @@ async fn execute_restore_inner(
     .await;
 
     if cancel_requested(pool, task_id).await {
-        let _ = std::fs::remove_dir_all(&staging);
+        let staging = staging.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&staging)).await;
         return Err(BackupError::Cancelled);
     }
 
     // Swap: current data aside, staged tree in. Recovery is deleted on
     // success and KEPT (with its path reported) on failure.
     let recovery = server_root.join(format!(".recovery-{}", nanos_now()));
-    let had_data = data_dir.exists();
-    if had_data {
-        std::fs::rename(&data_dir, &recovery).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&staging);
-            BackupError::Failed(format!("restore swap failed, current data untouched: {e}"))
-        })?;
-    }
-    if let Err(e) = std::fs::rename(&staging, &data_dir) {
-        let mut msg = format!("restore swap failed: {e}");
+    let staging_swap = staging.clone();
+    let data_swap = data_dir.clone();
+    let recovery_swap = recovery.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), BackupError> {
+        let had_data = data_swap.exists();
         if had_data {
-            match std::fs::rename(&recovery, &data_dir) {
-                Ok(()) => msg.push_str("; current data rolled back, recovery restored"),
-                Err(e2) => msg.push_str(&format!(
-                    "; ROLLBACK FAILED, prior data preserved at {}: {e2}",
-                    recovery.display()
-                )),
-            }
+            std::fs::rename(&data_swap, &recovery_swap).map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging_swap);
+                BackupError::Failed(format!("restore swap failed, current data untouched: {e}"))
+            })?;
         }
-        return Err(BackupError::Failed(msg));
-    }
-    if had_data {
-        let _ = std::fs::remove_dir_all(&recovery);
-    }
+        if let Err(e) = std::fs::rename(&staging_swap, &data_swap) {
+            let mut msg = format!("restore swap failed: {e}");
+            if had_data {
+                match std::fs::rename(&recovery_swap, &data_swap) {
+                    Ok(()) => msg.push_str("; current data rolled back, recovery restored"),
+                    Err(e2) => msg.push_str(&format!(
+                        "; ROLLBACK FAILED, prior data preserved at {}: {e2}",
+                        recovery_swap.display()
+                    )),
+                }
+            }
+            return Err(BackupError::Failed(msg));
+        }
+        if had_data {
+            let _ = std::fs::remove_dir_all(&recovery_swap);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| BackupError::Failed("restore swap task failed".into()))??;
     audit::record(
         pool,
         actor,
@@ -1438,14 +1535,15 @@ pub async fn create_backup(
     }
     let consistency = body.consistency.unwrap_or_else(|| "stopped".to_string());
     // Shared op lock (same domain as lifecycle ops): fail fast when another
-    // operation holds the server, mirroring `routes_servers`.
-    if !try_lock(&state.op_locks, &id).await {
+    // operation holds the server. The RAII guard is held for the whole
+    // handler, so the lock is released on every exit path — including errors.
+    let Some(_guard) = op_lock::try_acquire(&state.op_locks, &id).await else {
         return error(
             StatusCode::CONFLICT,
             "SERVER_BUSY",
             "another operation is in flight for this server",
         );
-    }
+    };
     let outcome = enqueue_backup(
         &state.pool,
         state.adapter.as_deref(),
@@ -1455,7 +1553,6 @@ pub async fn create_backup(
         &consistency,
     )
     .await;
-    unlock(&state.op_locks, &id).await;
     match outcome {
         Ok((task_id, backup_id)) => {
             audit::record(
@@ -1635,29 +1732,45 @@ pub async fn delete_backup(
     if backup.protected != 0 {
         return backup_error(BackupError::Protected);
     }
-    if backup.state == "completed" {
-        let completed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM backups WHERE server_id = ? AND state = 'completed'",
-        )
-        .bind(&backup.server_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
-        if completed <= 1 {
+    // Atomic guard: the "is this the last completed backup?" test and the
+    // DELETE run as ONE statement, so two concurrent deletes of a server's
+    // last two verified backups cannot both pass. The second DELETE
+    // re-evaluates `COUNT(*)` and sees a single survivor, affecting 0 rows.
+    // The row is deleted BEFORE the file is unlinked, so a refused delete can
+    // never leave a live row pointing at a missing archive.
+    let deleted = match sqlx::query(
+        "DELETE FROM backups
+         WHERE id = ? AND protected = 0
+           AND (
+             state != 'completed'
+             OR (SELECT COUNT(*) FROM backups b
+                 WHERE b.server_id = backups.server_id AND b.state = 'completed') > 1
+           )",
+    )
+    .bind(&id)
+    .execute(&state.pool)
+    .await
+    {
+        Ok(res) => res.rows_affected(),
+        Err(_) => {
             return error(
-                StatusCode::CONFLICT,
-                "BACKUP_PROTECTED",
-                "refusing to delete the last verified backup",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to delete backup",
             );
         }
+    };
+    if deleted == 0 {
+        // Refused by the floor (or removed concurrently): keep the archive.
+        return error(
+            StatusCode::CONFLICT,
+            "BACKUP_PROTECTED",
+            "refusing to delete the last verified backup",
+        );
     }
     if !backup.storage_path.is_empty() {
         let _ = tokio::fs::remove_file(&backup.storage_path).await;
     }
-    let _ = sqlx::query("DELETE FROM backups WHERE id = ?")
-        .bind(&id)
-        .execute(&state.pool)
-        .await;
     audit::record(
         &state.pool,
         Some(&user.id),
@@ -1725,13 +1838,15 @@ pub async fn restore_backup(
             "stop the server before restoring a backup",
         );
     }
-    if !try_lock(&state.op_locks, &server.id).await {
+    // Shared op lock (same domain as lifecycle ops): the RAII guard is held
+    // for the whole handler, so the lock is released on every exit path.
+    let Some(_guard) = op_lock::try_acquire(&state.op_locks, &server.id).await else {
         return error(
             StatusCode::CONFLICT,
             "SERVER_BUSY",
             "another operation is in flight for this server",
         );
-    }
+    };
     let outcome = enqueue_restore(
         &state.pool,
         state.adapter.as_deref(),
@@ -1741,7 +1856,6 @@ pub async fn restore_backup(
         body.pre_restore_backup,
     )
     .await;
-    unlock(&state.op_locks, &server.id).await;
     match outcome {
         Ok(task_id) => {
             audit::record(
@@ -2068,7 +2182,18 @@ mod tests {
         assert!(body["size_bytes"].as_i64().unwrap() > 0);
         let checksum = body["checksum"].as_str().unwrap().to_string();
         assert_eq!(checksum.len(), 64);
-        let storage = body["storage_path"].as_str().unwrap().to_string();
+        // The absolute path must NOT leak to clients (it lives only in the DB).
+        assert!(
+            body.get("storage_path").is_none(),
+            "storage_path must not be exposed: {body}"
+        );
+        assert_eq!(body["downloadable"], json!(true));
+        let storage: (String,) = sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        let storage = storage.0;
 
         // Checksum matches the file on disk, and the archive re-lists.
         let on_disk = std::fs::read(&storage).unwrap();
@@ -2607,10 +2732,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_cleanup_cleans_server_staging_and_recovery() {
-        // I4: crashed restores leave `.tmp-restore-*` staging and
-        // `.recovery-*` dirs beside the server data dir. Boot cleanup must
-        // remove them (older than boot) while leaving live data alone.
+    async fn startup_cleanup_never_deletes_recovery_but_reports_it() {
+        // CRITICAL: crashed restores leave `.tmp-restore-*` staging and
+        // `.recovery-*` prior-data copies beside the server data dir. Boot
+        // cleanup removes only stale `.tmp-*` scratch; `.recovery-*` is the
+        // only surviving copy of the pre-restore data and MUST be preserved,
+        // with an audit event + warning naming it.
         let _guard = test_guard().await;
         let fx = fixture().await;
         let id = make_server(&fx, "bak-cleanup").await;
@@ -2624,8 +2751,296 @@ mod tests {
 
         startup_cleanup(&fx.pool, &fx.backup_dir).await;
 
-        assert!(!parent.join(".tmp-restore-stale").exists());
-        assert!(!parent.join(".recovery-12345").exists());
+        assert!(
+            !parent.join(".tmp-restore-stale").exists(),
+            "scratch removed"
+        );
+        assert!(
+            parent.join(".recovery-12345").exists(),
+            "recovery copy must survive boot"
+        );
+        assert_eq!(
+            std::fs::read(parent.join(".recovery-12345/saved")).unwrap(),
+            b"y",
+            "recovery contents intact"
+        );
         assert_eq!(std::fs::read(dir.join("live.txt")).unwrap(), b"live");
+
+        // An audit event names the leftover so an operator can recover it.
+        let (count, metadata): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(metadata), '') FROM audit_events
+             WHERE action = 'backup.recovery_leftover'",
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "recovery leftover must be audited");
+        assert!(metadata.contains(".recovery-12345"), "metadata: {metadata}");
+        // ...but the audit metadata must not embed the absolute host path.
+        assert!(
+            !metadata.contains(&parent.to_string_lossy().to_string()),
+            "audit metadata leaked an absolute path: {metadata}"
+        );
+    }
+
+    async fn owner_id(fx: &Fixture) -> String {
+        sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_delete_never_removes_last_verified() {
+        // FIX 3: the existence + last-verified check and the DELETE run as one
+        // statement. Two concurrent deletes of a server's only two verified
+        // backups must have exactly one winner; the loser re-evaluates
+        // `COUNT(*)`, sees a single survivor, and is refused. The old
+        // COUNT-then-DELETE could let both pass and leave zero verified
+        // backups (or a live row pointing at a deleted archive).
+        use crate::auth::Role;
+
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-race").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+        let (_, b1) = backup_and_wait(&fx, &id, "live").await;
+        let (_, b2) = backup_and_wait(&fx, &id, "live").await;
+
+        let user = AuthUser {
+            id: owner_id(&fx).await,
+            username: "owner".to_string(),
+            role: Role::Owner,
+        };
+        let (r1, r2) = tokio::join!(
+            delete_backup(State(fx.state.clone()), user.clone(), AxumPath(b1.clone())),
+            delete_backup(State(fx.state.clone()), user.clone(), AxumPath(b2.clone())),
+        );
+        let mut codes = [r1.status().as_u16(), r2.status().as_u16()];
+        codes.sort_unstable();
+        assert_eq!(codes, [204, 409], "expected one winner and one refusal");
+
+        let survivors = backup_ids(&fx, &id).await;
+        assert_eq!(
+            survivors.len(),
+            1,
+            "exactly one verified backup must remain: {survivors:?}"
+        );
+        // The row is deleted before its file, so the survivor still has an
+        // archive on disk (no live row may point at a missing file).
+        let storage: (String,) = sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
+            .bind(&survivors[0])
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert!(
+            Path::new(&storage.0).is_file(),
+            "surviving archive missing on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn op_lock_released_after_failed_enqueue() {
+        // FIX 2: `create_backup` claims the shared op lock, then enqueue fails
+        // (unwritable storage). The RAII guard must release the lock on that
+        // error path, or the server is wedged for every later operation.
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-lockfail").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+
+        let blocker = fx.backup_dir.join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let mut bad = fx.state.clone();
+        bad.backup_dir = blocker;
+        let bad_server = TestServer::new(test_router(bad)).unwrap();
+        let res = bad_server
+            .post(&format!("/api/v1/servers/{id}/backups"))
+            .authorization_bearer(&fx.token)
+            .json(&json!({"mode": "full", "consistency": "live"}))
+            .await;
+        assert_eq!(res.status_code(), 502, "body: {}", res.text());
+        assert_eq!(backup_count(&fx, &id).await, 0);
+
+        // The lock must be reclaimable promptly (Drop removal is deferred).
+        let reclaimed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::op_lock::acquire(&fx.state.op_locks, &id),
+        )
+        .await
+        .expect("op lock leaked after failed enqueue");
+        drop(reclaimed);
+
+        // And the server is not wedged: a normal backup now succeeds.
+        let (_, _bid) = backup_and_wait(&fx, &id, "live").await;
+    }
+
+    #[test]
+    fn preflight_space_and_cap() {
+        // Cap: an estimate beyond the in-memory bound is refused, at the
+        // boundary it is allowed.
+        assert!(matches!(
+            preflight_backup_space(MAX_ARCHIVE_BYTES + 1, Some(u64::MAX)),
+            Err(BackupError::Failed(_))
+        ));
+        assert!(preflight_backup_space(MAX_ARCHIVE_BYTES, None).is_ok());
+        // Free space: refuse when the destination cannot hold ~2x the data.
+        assert!(matches!(
+            preflight_backup_space(1000, Some(1999)),
+            Err(BackupError::NoSpace)
+        ));
+        assert!(preflight_backup_space(1000, Some(2000)).is_ok());
+        // Unknown filesystem → proceed optimistically.
+        assert!(preflight_backup_space(1000, None).is_ok());
+        // An empty data dir needs no headroom.
+        assert!(preflight_backup_space(0, Some(0)).is_ok());
+        // Restore cap.
+        assert!(matches!(
+            preflight_restore_archive(MAX_ARCHIVE_BYTES + 1),
+            Err(BackupError::Failed(_))
+        ));
+        assert!(preflight_restore_archive(MAX_ARCHIVE_BYTES).is_ok());
+    }
+
+    #[tokio::test]
+    async fn backup_failure_summary_is_redacted() {
+        // FIX 6: the worker stores only the sanitized failure summary. A
+        // path-bearing runtime/failure detail must never reach the row a
+        // client reads (nor the task row).
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-redact").await;
+        let backup_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO backups (id, server_id, type, state, consistency_method)
+             VALUES (?, ?, 'full', 'in_progress', 'live')",
+        )
+        .bind(&backup_id)
+        .bind(&id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let task = crate::task_runner::enqueue(&fx.pool, "backup", Some(&id), None)
+            .await
+            .unwrap();
+
+        let raw = "/srv/pumpkin/servers/abc/world/level.dat: permission denied";
+        fail_backup(&fx.pool, &task.id, &backup_id, "BACKUP_FAILED", raw).await;
+
+        let res = fx
+            .server
+            .get(&format!("/api/v1/backups/{backup_id}"))
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let summary = res.json::<Value>()["error_summary"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !summary.contains("/srv/pumpkin"),
+            "absolute path leaked to client: {summary}"
+        );
+        assert!(
+            summary.contains("[path redacted]"),
+            "summary not redacted: {summary}"
+        );
+
+        let (state, code, tsum): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT state, error_code, error_summary FROM tasks WHERE id = ?")
+                .bind(&task.id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "failed");
+        assert_eq!(code.as_deref(), Some("BACKUP_FAILED"));
+        assert!(
+            !tsum.unwrap_or_default().contains("/srv/pumpkin"),
+            "task summary leaked a path"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_does_not_follow_escaping_symlink() {
+        // FIX 11: archive creation must not follow a symlink out of the data
+        // dir. A link to an outside secret is skipped entirely.
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-symlink").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("inside.txt"), b"inside-bytes").unwrap();
+        let secret = fx
+            .server_root
+            .join(format!("secret-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&secret, b"TOP-SECRET-OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("escape-link")).unwrap();
+
+        let (_, backup_id) = backup_and_wait(&fx, &id, "live").await;
+
+        let storage: (String,) = sqlx::query_as("SELECT storage_path FROM backups WHERE id = ?")
+            .bind(&backup_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        let entries = list_archive(&std::fs::read(&storage.0).unwrap());
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("inside.txt")),
+            "real file must be archived: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("escape-link")),
+            "escaping symlink must not be archived: {names:?}"
+        );
+        assert!(
+            !entries.iter().any(|(_, c)| c == b"TOP-SECRET-OUTSIDE"),
+            "symlink target leaked into the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_selection_equals_worker_prune_selection() {
+        // FIX 5: preview (`scheduler::preview_for`) and the worker prune
+        // (`prune_retention`) must select exactly the same backups. Both go
+        // through the canonical decision fn + shared retention rule.
+        let _guard = test_guard().await;
+        let fx = fixture().await;
+        let id = make_server(&fx, "bak-preview-eq").await;
+        let dir = data_dir(&fx, &id).await;
+        std::fs::write(dir.join("a.txt"), b"v1").unwrap();
+        for (i, bid) in ["c1", "c2", "c3", "c4", "c5"].iter().enumerate() {
+            seed_completed(
+                &fx,
+                &id,
+                bid,
+                &format!("2026-01-01T00:00:0{}Z", i + 1),
+                false,
+            )
+            .await;
+        }
+        insert_policy(&fx, &id, 2, 0).await;
+
+        let (would_delete, _retained, _protected) =
+            crate::scheduler::preview_for(&fx.pool, &id, 2, 0).await;
+        assert_eq!(would_delete.len(), 3, "preview: {would_delete:?}");
+
+        prune_retention(&fx.pool, &id, None).await;
+
+        let remaining = backup_ids(&fx, &id).await;
+        let mut deleted: Vec<String> = ["c1", "c2", "c3", "c4", "c5"]
+            .iter()
+            .filter(|b| !remaining.iter().any(|r| r == *b))
+            .map(|b| (*b).to_string())
+            .collect();
+        deleted.sort();
+        let mut expected = would_delete.clone();
+        expected.sort();
+        assert_eq!(deleted, expected, "preview and worker prune must agree");
+        // Newest two survive; the pruned archives are gone from disk.
+        assert!(remaining.contains(&"c4".to_string()));
+        assert!(remaining.contains(&"c5".to_string()));
+        assert!(!fx.backup_dir.join("c1.tar.gz").exists());
     }
 }
