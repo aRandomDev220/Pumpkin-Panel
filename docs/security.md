@@ -11,12 +11,16 @@ Trust boundaries (§5.3 of plan):
 
 Rules enforced in this scaffold:
 
-- `/var/run/docker.sock` mounted `:ro` into manager container, accessed only
-  from backend Rust code. Never proxied to the frontend.
+- `/var/run/docker.sock` is mounted for backend-only Engine API access and is
+  accessed only from backend Rust code. The adapter needs read/write access to
+  create and manage child containers; it is never proxied to the frontend.
 - No arbitrary Docker JSON from clients — container specs are built from
   validated `servers` rows (Phase 2).
 - 5 MB request body cap, JSON structured logs without secrets.
 - SQLite separate from world dirs (`/data/*.db` vs `/data/servers/*`).
-- Cookies `HttpOnly/Secure/SameSite` when auth lands (Phase 2).
+- Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` by default;
+  `PUMPKIN_INSECURE_COOKIES=1` is an explicit local-HTTP development override.
+- Unsafe cookie-authenticated mutations require the readable CSRF cookie to be
+  echoed in `X-CSRF-Token`; bearer-token mutations remain supported for API use.
 
 Full review lands in Phase 8.

@@ -28,7 +28,7 @@ docker build -f deploy/Dockerfile -t pumpkin-manager:0.1.0 .
 docker run -d --name pumpkin-manager \
   -p 8080:8080 \
   -v pumpkin-data:/data \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   pumpkin-manager:0.1.0
 ```
 

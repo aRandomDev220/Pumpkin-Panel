@@ -48,6 +48,7 @@ export async function startBackend(): Promise<BackendHandle> {
       PUMPKIN_MANAGER_DATA_DIR: dataDir,
       PUMPKIN_MANAGER_BACKUP_DIR: backupDir,
       PUMPKIN_MANAGER_DATABASE_URL: `sqlite:${dbFile}?mode=rwc`,
+      PUMPKIN_INSECURE_COOKIES: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -148,17 +149,17 @@ export function removeContainer(name: string): Promise<string> {
   });
 }
 
-/** Minimal JSON API client against the backend. `token` adds a Bearer header. */
+/** Minimal JSON API client against the backend. `session` is a cookie header. */
 export async function api<T>(
   baseUrl: string,
   method: string,
   path: string,
   body?: unknown,
-  token?: string,
+  session?: string,
 ): Promise<{ status: number; json: T }> {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (session) headers.Cookie = session;
   const res = await fetch(`${baseUrl}${path}`, {
     method,
     headers,
@@ -185,7 +186,7 @@ export interface TaskView {
 export async function waitForTaskOk(
   baseUrl: string,
   taskId: string,
-  token: string,
+  session: string,
   timeoutMs = 120_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -196,7 +197,7 @@ export async function waitForTaskOk(
       "GET",
       `/api/v1/tasks/${encodeURIComponent(taskId)}`,
       undefined,
-      token,
+      session,
     );
     if (status !== 200) {
       throw new Error(`task poll for ${taskId} failed: HTTP ${status}`);
@@ -227,7 +228,7 @@ export interface StatusView {
 export async function waitForReadiness(
   baseUrl: string,
   serverId: string,
-  token: string,
+  session: string,
   want: string,
   timeoutMs = 60_000,
 ): Promise<StatusView> {
@@ -239,7 +240,7 @@ export async function waitForReadiness(
       "GET",
       `/api/v1/servers/${encodeURIComponent(serverId)}/status`,
       undefined,
-      token,
+      session,
     );
     if (status !== 200) {
       throw new Error(`status poll for ${serverId} failed: HTTP ${status}`);

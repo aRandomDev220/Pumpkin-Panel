@@ -23,13 +23,16 @@ const IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
 const CONTAINER = "pumpkin-e2e-journey";
 
 let backend: BackendHandle | undefined;
-let token = "";
+let session = "";
 let serverId = "";
 
-async function readToken(page: Page): Promise<string> {
-  const value = await page.evaluate(() => window.localStorage.getItem("pm_token"));
-  expect(typeof value).toBe("string");
-  return value as string;
+async function readSession(page: Page): Promise<string> {
+  const cookies = await page.context().cookies(E2E_BASE_URL);
+  const sessionCookies = cookies.filter(
+    (cookie) => cookie.name === "pm_session" || cookie.name === "pm_csrf",
+  );
+  expect(sessionCookies.length).toBe(2);
+  return sessionCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
 }
 
 // Re-run `fn`; on failure append the test container's logs so a task or
@@ -43,13 +46,15 @@ async function withContainerLogs<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// Each test gets a fresh browser context, so seed the stored token before
-// navigating. Runs on every navigation in the test's context.
-async function seedToken(page: Page, value: string): Promise<void> {
+// Each test gets a fresh browser context, so seed the HttpOnly session and
+// readable CSRF cookies before navigating.
+async function seedSession(page: Page, value: string): Promise<void> {
   expect(value.length).toBeGreaterThan(0);
-  await page.addInitScript(
-    (stored: string) => window.localStorage.setItem("pm_token", stored),
-    value,
+  await page.context().addCookies(
+    value.split("; ").map((part) => {
+      const [name, ...rest] = part.split("=");
+      return { name, value: rest.join("="), url: E2E_BASE_URL };
+    }),
   );
 }
 
@@ -85,7 +90,7 @@ test.describe.serial("full user journey", () => {
     ]);
     expect(setupResp.ok()).toBe(true);
     await expect(page).toHaveURL(/\/servers$/);
-    token = await readToken(page);
+    session = await readSession(page);
     const { status, json } = await api<{ needs_setup: boolean }>(
       E2E_BASE_URL,
       "GET",
@@ -95,10 +100,10 @@ test.describe.serial("full user journey", () => {
     expect(json.needs_setup).toBe(false);
   });
 
-  test("(b) no token redirects to login; bad login errors; login works", async ({
+  test("(b) no session redirects to login; bad login errors; login works", async ({
     page,
   }) => {
-    // No token is seeded in this test's fresh context: the guard must bounce
+    // No session is seeded in this test's fresh context: the guard must bounce
     // /servers to /login.
     await page.goto("/servers");
     await expect(page).toHaveURL(/\/login$/);
@@ -111,11 +116,11 @@ test.describe.serial("full user journey", () => {
     await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
     await page.getByRole("button", { name: "Login", exact: true }).click();
     await expect(page).toHaveURL(/\/servers$/);
-    token = await readToken(page);
+    session = await readSession(page);
   });
 
   test("(c) create server appears in list", async ({ page }) => {
-    await seedToken(page, token);
+    await seedSession(page, session);
     await page.goto("/servers");
     await page.getByLabel("Name", { exact: true }).fill(SERVER_NAME);
     await page.getByLabel("Game port", { exact: true }).fill(String(GAME_PORT));
@@ -134,7 +139,7 @@ test.describe.serial("full user journey", () => {
       "GET",
       "/api/v1/servers",
       undefined,
-      token,
+      session,
     );
     expect(status).toBe(200);
     const match = json.servers.filter((s) => s.name === SERVER_NAME);
@@ -146,7 +151,7 @@ test.describe.serial("full user journey", () => {
   });
 
   test("(d) start reaches online", async ({ page }) => {
-    await seedToken(page, token);
+    await seedSession(page, session);
     await page.goto(`/servers/${serverId}`);
     const [startResp] = await Promise.all([
       page.waitForResponse(
@@ -160,15 +165,15 @@ test.describe.serial("full user journey", () => {
     const startBody = (await startResp.json()) as { task_id: string };
     expect(typeof startBody.task_id).toBe("string");
     await withContainerLogs(async () => {
-      await waitForTaskOk(E2E_BASE_URL, startBody.task_id, token, 120_000);
-      const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "online", 60_000);
+      await waitForTaskOk(E2E_BASE_URL, startBody.task_id, session, 120_000);
+      const status = await waitForReadiness(E2E_BASE_URL, serverId, session, "online", 60_000);
       expect(status.readiness?.state).toBe("online");
     });
     await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
   });
 
   test("(e) stop reaches stopped", async ({ page }) => {
-    await seedToken(page, token);
+    await seedSession(page, session);
     await page.goto(`/servers/${serverId}`);
     const [stopResp] = await Promise.all([
       page.waitForResponse(
@@ -182,15 +187,15 @@ test.describe.serial("full user journey", () => {
     const stopBody = (await stopResp.json()) as { task_id: string };
     expect(typeof stopBody.task_id).toBe("string");
     await withContainerLogs(async () => {
-      await waitForTaskOk(E2E_BASE_URL, stopBody.task_id, token, 120_000);
-      const status = await waitForReadiness(E2E_BASE_URL, serverId, token, "stopped", 60_000);
+      await waitForTaskOk(E2E_BASE_URL, stopBody.task_id, session, 120_000);
+      const status = await waitForReadiness(E2E_BASE_URL, serverId, session, "stopped", 60_000);
       expect(status.readiness?.state).toBe("stopped");
     });
     await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
   });
 
   test("(f) delete with retain removes it from the list", async ({ page }) => {
-    await seedToken(page, token);
+    await seedSession(page, session);
     await page.goto("/servers");
     await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
     await page
@@ -212,7 +217,7 @@ test.describe.serial("full user journey", () => {
       "GET",
       `/api/v1/servers/${encodeURIComponent(serverId)}`,
       undefined,
-      token,
+      session,
     );
     expect(status).toBe(404);
   });

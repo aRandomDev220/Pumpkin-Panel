@@ -17,15 +17,17 @@ COPY migrations/ ./migrations/
 RUN cargo build --release -p pumpkin-manager-backend
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates sqlite-libs \
+RUN apk add --no-cache ca-certificates sqlite-libs su-exec \
  && addgroup -S app && adduser -S app -G app
 WORKDIR /app
 COPY --from=apibuild /app/target/release/pumpkin-manager /usr/local/bin/pumpkin-manager
 COPY --from=webbuild /web/dist /app/web
-RUN chown -R app:app /app
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh \
+ && mkdir -p /data/servers /data/backups \
+ && chown -R app:app /app /data
 # NOTE: /var/run/docker.sock mount makes this container privileged-equivalent.
 # Backend only — never expose the socket to the browser.
-USER app
 ENV PUMPKIN_MANAGER_HTTP_PORT=8080 \
     PUMPKIN_MANAGER_DATA_DIR=/data/servers \
     PUMPKIN_MANAGER_BACKUP_DIR=/data/backups \
@@ -33,4 +35,4 @@ ENV PUMPKIN_MANAGER_HTTP_PORT=8080 \
 EXPOSE 8080
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8080/api/v1/health/live || exit 1
-ENTRYPOINT ["pumpkin-manager"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
