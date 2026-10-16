@@ -22,6 +22,8 @@ artifacts.
 | npm offline audit | Passed: 0 vulnerabilities. |
 | Docker image build | Passed with pinned base-image digests. |
 | Clean Docker install | Passed: fresh named volume, live/ready health, first-owner setup, and `/auth/me`. |
+| Browser E2E | Passed: 6 Playwright tests covering setup, login, create, online, stop, and delete. |
+| Manager DB recovery | Passed in the release image: download, staged multipart restore, restart, ready, setup remains complete. |
 | Migration preservation | Covered by `db::tests::migration_0008_preserves_existing_rows`. |
 | Backup/restore/recovery | Covered by backend tests and Phase 7 live staged-restore evidence. |
 | Update/rollback | Covered by backend tests and Phase 7 live E2E evidence. |
