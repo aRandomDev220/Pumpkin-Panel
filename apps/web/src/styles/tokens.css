@@ -1,0 +1,17 @@
+:root {
+  --canvas: #f2f4f1;
+  --paper: #ffffff;
+  --ink: #1b2528;
+  --muted: #6c7b78;
+  --muted-strong: #4f5f5c;
+  --line: #d8e0dc;
+  --line-strong: #bdcbc5;
+  --charcoal: #222d31;
+  --signal: #4a7478;
+  --signal-strong: #345c60;
+  --focus: #a8663d;
+  --success: #47765e;
+  --warning: #96722e;
+  --danger: #a3574f;
+  --shadow: 0 14px 35px rgba(27, 37, 40, .12);
+}
