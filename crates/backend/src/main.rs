@@ -54,10 +54,6 @@ use auth::Permission;
 use runtime::{DockerAdapter, RuntimeAdapter};
 use task_runner::RunnerHandle;
 
-/// Auth attempts allowed per client/user within [`AUTH_RATE_WINDOW`].
-const AUTH_RATE_ATTEMPTS: u32 = 5;
-const AUTH_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Shared application state (all cheaply cloneable handles).
 #[derive(Clone)]
 pub struct AppState {
@@ -111,8 +107,8 @@ impl AppState {
 
 fn new_rate_limiter() -> Arc<std::sync::Mutex<ratelimit::RateLimiter>> {
     Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new(
-        AUTH_RATE_ATTEMPTS,
-        AUTH_RATE_WINDOW,
+        ratelimit::AUTH_ATTEMPTS,
+        ratelimit::AUTH_WINDOW,
     )))
 }
 
@@ -493,12 +489,16 @@ pub fn build_router(state: AppState) -> Router {
         .merge(public_auth)
         .merge(protected)
         .merge(protected_uploads)
+        // Register the fallback BEFORE the layers: `Router::layer` only wraps
+        // endpoints present at call time, and a later `.fallback()` would
+        // replace the layered default endpoint — leaving static/SPA responses
+        // (index.html, JS, CSS) without security headers.
+        .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
         ))
-        .fallback(static_handler)
         .with_state(state)
 }
 

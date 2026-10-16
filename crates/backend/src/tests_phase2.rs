@@ -674,3 +674,58 @@ async fn security_headers_present() {
     assert!(headers.get("permissions-policy").is_some());
     assert!(headers.get("strict-transport-security").is_some());
 }
+
+#[tokio::test]
+async fn security_headers_present_on_static_asset() {
+    let pool = test_pool().await;
+    let root = std::env::temp_dir().join(format!("pm-static-{}", uuid::Uuid::new_v4()));
+    let web = root.join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(web.join("index.html"), "<html>STATIC-MARKER</html>").unwrap();
+    let state = AppState::for_tests(pool, root.clone());
+    let server = TestServer::new(build_router(state)).unwrap();
+
+    let res = server.get("/").await;
+    assert_eq!(res.status_code(), 200, "body: {}", res.text());
+    assert!(res.text().contains("STATIC-MARKER"));
+    let headers = res.headers();
+    assert!(
+        headers.get("content-security-policy").is_some(),
+        "CSP missing on static asset response"
+    );
+    assert_eq!(
+        headers.get("x-content-type-options").unwrap(),
+        "nosniff",
+        "nosniff missing on static asset response"
+    );
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert!(headers.get("strict-transport-security").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn logout_clears_both_cookies() {
+    let (server, _) = test_server().await;
+    let (token, csrf) = setup_and_cookies(&server).await;
+    let res = server
+        .post("/api/v1/auth/logout")
+        .add_header("cookie", cookie_header(&token, &csrf))
+        .add_header("x-csrf-token", &csrf)
+        .await;
+    assert_eq!(res.status_code(), 204, "body: {}", res.text());
+    let session = set_cookie(&res, "pm_session");
+    let csrf_cookie = set_cookie(&res, "pm_csrf");
+    assert!(
+        session.contains("pm_session=;"),
+        "value not cleared: {session}"
+    );
+    assert!(session.contains("Max-Age=0"), "not expired: {session}");
+    assert!(
+        csrf_cookie.contains("pm_csrf=;"),
+        "value not cleared: {csrf_cookie}"
+    );
+    assert!(
+        csrf_cookie.contains("Max-Age=0"),
+        "not expired: {csrf_cookie}"
+    );
+}

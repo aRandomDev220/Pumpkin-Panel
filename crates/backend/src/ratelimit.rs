@@ -12,12 +12,28 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Hard ceiling on tracked keys; prevents unbounded memory/CPU under
+/// many-distinct-key floods (XFF-spoofed client keys, random usernames).
+pub const DEFAULT_MAX_KEYS: usize = 10_000;
+/// Run idle-pruning at most once per this many `check` calls (bounded cost).
+pub const DEFAULT_PRUNE_INTERVAL: u64 = 1024;
+/// Auth attempts allowed per client/user per [`AUTH_WINDOW`].
+pub const AUTH_ATTEMPTS: u32 = 5;
+/// Auth rate-limit window (single source of truth for the auth endpoints).
+pub const AUTH_WINDOW: Duration = Duration::from_secs(60);
+
 /// Token bucket: `capacity` attempts, refilling steadily over `window`.
 #[derive(Debug)]
 pub struct RateLimiter {
     buckets: HashMap<String, Bucket>,
     capacity: f64,
     refill_per_sec: f64,
+    max_keys: usize,
+    /// Buckets untouched for this long are dropped during periodic pruning.
+    idle: Duration,
+    /// Prune at most once per this many `check_at` calls (bounded cost).
+    prune_interval: u64,
+    calls: u64,
 }
 
 #[derive(Debug)]
@@ -29,13 +45,32 @@ struct Bucket {
 impl RateLimiter {
     /// `capacity` attempts per `window` (5 per 60s for auth).
     pub fn new(capacity: u32, window: Duration) -> Self {
+        Self::with_limits(capacity, window, DEFAULT_MAX_KEYS)
+    }
+
+    /// Like [`new`], with an explicit bucket-map cap (used by tests).
+    pub fn with_limits(capacity: u32, window: Duration, max_keys: usize) -> Self {
         let capacity = capacity.max(1) as f64;
         let window_secs = window.as_secs_f64().max(1.0);
         Self {
             buckets: HashMap::new(),
             capacity,
             refill_per_sec: capacity / window_secs,
+            max_keys: max_keys.max(1),
+            idle: window.saturating_mul(10),
+            prune_interval: DEFAULT_PRUNE_INTERVAL,
+            calls: 0,
         }
+    }
+
+    /// Number of tracked keys (test/diagnostic seam).
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Whether no keys are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
     }
 
     /// Consume one token for `key`. `Ok(())` when allowed, otherwise
@@ -45,12 +80,32 @@ impl RateLimiter {
     }
 
     fn check_at(&mut self, key: &str, now: Instant) -> Result<(), u64> {
+        // Periodic, bounded pruning — never a full-map scan per request.
+        self.calls = self.calls.wrapping_add(1);
+        if self.prune_interval != 0 && self.calls.is_multiple_of(self.prune_interval) {
+            self.prune(self.idle, now);
+        }
+
+        if !self.buckets.contains_key(key) {
+            // Hard cap: evict one arbitrary bucket before inserting a new key,
+            // so a many-distinct-key flood cannot grow memory without bound.
+            if self.buckets.len() >= self.max_keys {
+                if let Some(victim) = self.buckets.keys().next().cloned() {
+                    self.buckets.remove(&victim);
+                }
+            }
+            self.buckets.insert(
+                key.to_owned(),
+                Bucket {
+                    tokens: self.capacity,
+                    last: now,
+                },
+            );
+        }
+
         let capacity = self.capacity;
         let refill_per_sec = self.refill_per_sec;
-        let bucket = self.buckets.entry(key.to_owned()).or_insert(Bucket {
-            tokens: capacity,
-            last: now,
-        });
+        let bucket = self.buckets.get_mut(key).expect("bucket just ensured");
         let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * refill_per_sec).min(capacity);
         bucket.last = now;
@@ -120,5 +175,15 @@ mod tests {
         rl.prune(Duration::from_secs(1), now + Duration::from_secs(120));
         // Fresh bucket after prune.
         assert!(rl.check_at("k", now + Duration::from_secs(120)).is_ok());
+    }
+
+    #[test]
+    fn map_stays_bounded_under_many_distinct_keys() {
+        // Cap of 100: a flood of distinct keys must not grow the map past it.
+        let mut rl = RateLimiter::with_limits(5, Duration::from_secs(60), 100);
+        for i in 0..10_000 {
+            let _ = rl.check(&format!("key-{i}"));
+        }
+        assert!(rl.len() <= 100, "bucket map grew to {} (cap 100)", rl.len());
     }
 }

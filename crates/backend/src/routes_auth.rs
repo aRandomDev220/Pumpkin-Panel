@@ -32,9 +32,6 @@ const MIN_PASSWORD_LEN: usize = 8;
 const MAX_PASSWORD_LEN: usize = 1024;
 const MAX_USERNAME_LEN: usize = 64;
 
-/// Auth attempts allowed per client/user within [`RATE_LIMIT_WINDOW_SECS`].
-const RATE_LIMIT_WINDOW_SECS: u64 = 60;
-
 // ---------------------------------------------------------------------------
 // Request/response models
 // ---------------------------------------------------------------------------
@@ -130,21 +127,22 @@ pub async fn setup(
     if !same_origin_ok(&headers) {
         return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
     }
+    // Rate-limit first: junk payloads must consume a token too.
+    if let Err(retry) = check_rate_limit(
+        &app,
+        &[
+            client_key(&headers, peer.as_ref()),
+            user_key("setup", &body.username),
+        ],
+    ) {
+        return rate_limited(retry);
+    }
     let username = match validate_username(&body.username) {
         Ok(u) => u,
         Err(code) => return error(StatusCode::BAD_REQUEST, code),
     };
     if let Err(code) = validate_password(&body.password, true) {
         return error(StatusCode::BAD_REQUEST, code);
-    }
-    if let Err(retry) = check_rate_limit(
-        &app,
-        &[
-            client_key(&headers, peer.as_ref()),
-            user_key("setup", &username),
-        ],
-    ) {
-        return rate_limited(retry);
     }
 
     let pool: SqlitePool = app.pool.clone();
@@ -226,21 +224,22 @@ pub async fn login(
     if !same_origin_ok(&headers) {
         return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
     }
+    // Rate-limit first: junk payloads must consume a token too.
+    if let Err(retry) = check_rate_limit(
+        &app,
+        &[
+            client_key(&headers, peer.as_ref()),
+            user_key("login", &body.username),
+        ],
+    ) {
+        return rate_limited(retry);
+    }
     let username = match validate_username(&body.username) {
         Ok(u) => u,
         Err(_) => return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS"),
     };
     if validate_password(&body.password, false).is_err() {
         return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS");
-    }
-    if let Err(retry) = check_rate_limit(
-        &app,
-        &[
-            client_key(&headers, peer.as_ref()),
-            user_key("login", &username),
-        ],
-    ) {
-        return rate_limited(retry);
     }
 
     let pool: SqlitePool = app.pool.clone();
@@ -516,7 +515,8 @@ fn origin_authority(url: &str) -> Option<&str> {
 }
 
 /// Rate-limit key for the calling client: first `X-Forwarded-For` hop, else the
-/// peer address, else a shared "global" bucket.
+/// peer address, else a shared "global" bucket. Bounded in length so a
+/// header-flood cannot mint unbounded keys.
 fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
     if let Some(hop) = headers
         .get("x-forwarded-for")
@@ -525,7 +525,7 @@ fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return format!("ip:{hop}");
+        return format!("ip:{}", truncate_key(hop));
     }
     match peer {
         Some(addr) => format!("ip:{addr}"),
@@ -533,21 +533,24 @@ fn client_key(headers: &HeaderMap, peer: Option<&SocketAddr>) -> String {
     }
 }
 
+/// Username bucket key. Takes the *raw* submitted name (rate limiting runs
+/// before validation) but lowercases and truncates it so junk input cannot
+/// create oversized keys.
 fn user_key(endpoint: &str, username: &str) -> String {
-    format!("{endpoint}:user:{}", username.to_lowercase())
+    let bounded: String = username.trim().chars().take(MAX_USERNAME_LEN).collect();
+    format!("{endpoint}:user:{}", bounded.to_lowercase())
+}
+
+fn truncate_key(value: &str) -> String {
+    value.chars().take(64).collect()
 }
 
 /// Consume one token for each key. Returns `Err(retry_after_secs)` if any key
-/// is exhausted (the largest wait among them).
+/// is exhausted (the largest wait among them). Pruning/eviction is handled
+/// inside the limiter at a bounded rate.
 fn check_rate_limit(app: &crate::AppState, keys: &[String]) -> Result<(), u64> {
     let mut limiter = lock_limiter(app);
     let mut retry = 0u64;
-    let now = std::time::Instant::now();
-    // Best-effort opportunistic cleanup so the map stays bounded.
-    limiter.prune(
-        std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS * 10),
-        now,
-    );
     for key in keys {
         if let Err(secs) = limiter.check(key) {
             retry = retry.max(secs);
