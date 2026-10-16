@@ -41,7 +41,6 @@
 // The preview/enqueue/handler surface below is wired by the controller in
 // `main.rs`, so it reads as dead code to the binary build until then.
 // Drop this once the routes are wired (same pattern as scheduler.rs).
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

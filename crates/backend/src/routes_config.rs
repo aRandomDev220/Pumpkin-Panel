@@ -679,6 +679,7 @@ mod tests {
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0003_config_revisions.sql"),
             include_str!("../../../migrations/0004_config_baseline_hash.sql"),
+            include_str!("../../../migrations/0007_update.sql"),
         ] {
             // Strip `--` comment lines first: they may contain semicolons
             // (e.g. "immutable; new tables only") that naive splitting

@@ -50,6 +50,8 @@ pub struct ServerDto {
     pub runtime_version: String,
     pub image_reference: String,
     pub image_digest: String,
+    pub previous_image_reference: String,
+    pub previous_image_digest: String,
     pub container_id: String,
     pub data_path: String,
     pub game_port: i64,
@@ -145,7 +147,8 @@ fn slugify(name: &str) -> String {
 async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerDto>, sqlx::Error> {
     sqlx::query_as::<_, ServerDto>(
         "SELECT id, name, slug, description, runtime_type, runtime_version,
-                image_reference, image_digest, container_id, data_path,
+                image_reference, image_digest, previous_image_reference,
+                previous_image_digest, container_id, data_path,
                 game_port, bind_address, desired_state, observed_state,
                 created_by, created_at, updated_at
          FROM servers WHERE id = ? AND deleted_at IS NULL",
@@ -250,7 +253,8 @@ pub async fn list_servers(
         .unwrap_or(0);
     let servers = sqlx::query_as::<_, ServerDto>(
         "SELECT id, name, slug, description, runtime_type, runtime_version,
-                image_reference, image_digest, container_id, data_path,
+                image_reference, image_digest, previous_image_reference,
+                previous_image_digest, container_id, data_path,
                 game_port, bind_address, desired_state, observed_state,
                 created_by, created_at, updated_at
          FROM servers WHERE deleted_at IS NULL

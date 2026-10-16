@@ -270,7 +270,6 @@ pub struct CreateUserRequest {
 /// Empty usernames, passwords under 8 chars, and unknown roles are 422;
 /// duplicate usernames are 409. The DB UNIQUE constraint is the backstop
 /// for a first-user-style creation race (setup path untouched).
-#[allow(dead_code)] // controller wires the route in main.rs
 pub async fn create_user(
     State(state): State<AppState>,
     actor: AuthUser,
@@ -372,7 +371,6 @@ pub async fn create_user(
 /// `LAST_OWNER`, same guard as the update path) and revokes every session
 /// immediately. Self-delete is allowed: the caller's token stops working,
 /// so the client must discard it after the 204.
-#[allow(dead_code)] // controller wires the route in main.rs
 pub async fn delete_user(
     State(state): State<AppState>,
     actor: AuthUser,
@@ -524,7 +522,6 @@ pub async fn list_audit(
 /// entries carry only `{id, name, desired_state, observed_state}` and
 /// failures carry only `{id, type, server_id, message}` (error summaries,
 /// never bodies).
-#[allow(dead_code)] // controller wires the route in main.rs; drop then
 pub async fn export_diagnostics(State(state): State<AppState>, _user: AuthUser) -> Response {
     let schema_version: Option<i64> =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
@@ -719,7 +716,6 @@ fn vacuum_into_sql(path: &std::path::Path) -> String {
 /// manager DB as an attachment download
 /// (`pumpkin-manager-<schema>-<ts>.db`). Uses `VACUUM INTO` a temp file
 /// so a WAL-mode live database streams consistently.
-#[allow(dead_code)] // controller wires the route in main.rs
 pub async fn backup_database(State(state): State<AppState>, user: AuthUser) -> Response {
     if live_db_path(&state.pool).await.is_none() {
         return error(
@@ -793,7 +789,6 @@ pub async fn backup_database(State(state): State<AppState>, user: AuthUser) -> R
 /// DB is copied aside as `<live>.pre-restore-<ts>` and the upload is
 /// written to `pending_restore_path(db_path)`, which the controller
 /// applies at startup. Returns `200 {staged, restart_required}`.
-#[allow(dead_code)] // controller wires the route in main.rs
 pub async fn restore_database(
     State(state): State<AppState>,
     user: AuthUser,

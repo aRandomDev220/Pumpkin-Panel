@@ -743,13 +743,16 @@ mod tests {
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
+            include_str!("../../../migrations/0007_update.sql"),
         ] {
             for stmt in file.split(";\n") {
                 let stmt = stmt.trim();
                 if stmt.is_empty() {
                     continue;
                 }
-                if !stmt.to_uppercase().contains("CREATE") && !stmt.to_uppercase().contains("INDEX")
+                if !stmt.to_uppercase().contains("CREATE")
+                    && !stmt.to_uppercase().contains("INDEX")
+                    && !stmt.to_uppercase().contains("ALTER")
                 {
                     continue;
                 }

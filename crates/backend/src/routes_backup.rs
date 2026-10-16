@@ -1813,6 +1813,7 @@ mod tests {
             include_str!("../../../migrations/0001_init.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0005_backups.sql"),
+            include_str!("../../../migrations/0007_update.sql"),
         ] {
             // Strip `--` comment lines first: headers may contain `;`
             // (e.g. 0002's "immutable; new tables only"), which would split

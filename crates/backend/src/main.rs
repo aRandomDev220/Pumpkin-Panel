@@ -20,7 +20,6 @@ mod routes_servers;
 mod runtime;
 mod scheduler;
 mod task_runner;
-mod update_service;
 #[cfg(test)]
 mod tests_concurrency;
 #[cfg(test)]
@@ -29,6 +28,7 @@ mod tests_docker;
 mod tests_phase2;
 #[cfg(test)]
 mod tests_phase3;
+mod update_service;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -216,6 +216,48 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/reconcile",
             post(routes_admin::trigger_reconcile).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::SettingsManage),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/update/preview",
+            post(update_service::preview_image_update).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerUpdate),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/update",
+            post(update_service::update_server).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerUpdate),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/rollback",
+            post(update_service::rollback_server).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerUpdate),
+            )),
+        )
+        .route(
+            "/api/v1/users",
+            post(routes_admin::create_user).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::UsersManage),
+            )),
+        )
+        .route(
+            "/api/v1/users/:id",
+            delete(routes_admin::delete_user).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::UsersManage),
+            )),
+        )
+        .route(
+            "/api/v1/admin/database/backup",
+            get(routes_admin::backup_database).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::SettingsManage),
+            )),
+        )
+        .route(
+            "/api/v1/admin/database/restore",
+            post(routes_admin::restore_database).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::SettingsManage),
             )),
         )
@@ -430,6 +472,23 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Apply a staged manager-DB restore (from POST /admin/database/restore)
+    // BEFORE opening the pool: swap the validated file into place, keeping
+    // a timestamped copy of the replaced database alongside it.
+    if let Some(db_file) = db_file_path(&settings.database_url) {
+        let pending = routes_admin::pending_restore_path(&db_file);
+        if pending.is_file() {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let aside = db_file.with_extension(format!("pre-restore-{stamp}.db"));
+            if db_file.is_file() {
+                std::fs::rename(&db_file, &aside)?;
+                tracing::warn!(aside = %aside.display(), "manager DB replaced aside");
+            }
+            std::fs::rename(&pending, &db_file)?;
+            tracing::warn!("staged manager DB restore applied; re-validating on boot");
+        }
+    }
+
     let pool = db::connect(&settings.database_url).await.map_err(|e| {
         tracing::error!(error = %e, "database connect/migrate failed");
         e
@@ -607,6 +666,16 @@ fn mime_for(p: &std::path::Path) -> &'static str {
 }
 
 use axum::response::IntoResponse;
+
+fn db_file_path(url: &str) -> Option<PathBuf> {
+    let stripped = url.strip_prefix("sqlite:")?;
+    let path = stripped.split('?').next()?;
+    let path = path.strip_prefix("//").unwrap_or(path);
+    if path == ":memory:" {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
 
 fn db_path_parent(url: &str) -> Option<PathBuf> {
     let stripped = url.strip_prefix("sqlite:")?;
