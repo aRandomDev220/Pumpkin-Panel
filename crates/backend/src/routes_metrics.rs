@@ -7,7 +7,6 @@
 //!   stale). A single failed ping or a single failed start NEVER alerts
 //!   (flap guard); only sustained, DB-evidenced failure does.
 
-#![allow(dead_code)] // unwired until controller routes land; drop then.
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -16,7 +15,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{auth::AuthUser, AppState};
+use crate::{auth::AuthUser, metrics_collector::server_samples, AppState};
 
 fn error(status: StatusCode, code: &'static str, message: &str) -> Response {
     (
@@ -85,45 +84,25 @@ pub async fn server_metrics(
     if exists == 0 {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
-    // Column names verbatim from the Task 1 `metrics_samples` shape:
-    // `memory_usage_bytes` surfaces as `memory_bytes` (NULLs preserved).
-    let rows = sqlx::query(
-        "SELECT sampled_at, cpu_percent, memory_usage_bytes,
-                players_online, latency_ms, state
-         FROM metrics_samples
-         WHERE server_id = ? AND sampled_at >= ?
-         ORDER BY sampled_at DESC
-         LIMIT 1000",
-    )
-    .bind(&id)
-    .bind(utc_cutoff(window))
-    .fetch_all(&state.pool)
-    .await;
-    match rows {
-        Ok(rows) => {
-            use sqlx::Row as _;
-            let samples: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "sampled_at": r.get::<String, _>("sampled_at"),
-                        "cpu_percent": r.get::<Option<f64>, _>("cpu_percent"),
-                        "memory_bytes": r.get::<Option<i64>, _>("memory_usage_bytes"),
-                        "players_online": r.get::<Option<i64>, _>("players_online"),
-                        "latency_ms": r.get::<Option<i64>, _>("latency_ms"),
-                        "state": r.get::<String, _>("state"),
-                    })
-                })
-                .collect();
-            let total = samples.len();
-            Json(serde_json::json!({ "samples": samples, "total": total })).into_response()
-        }
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL",
-            "failed to load metrics history",
-        ),
-    }
+    // History reads go through Task 1's canonical `server_samples`
+    // (newest-first, 1000-capped, NULL-preserving) — no second query here.
+    let since = utc_cutoff(window);
+    let rows = server_samples(&state.pool, &id, &since).await;
+    let samples: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "sampled_at": r.sampled_at,
+                "cpu_percent": r.cpu_percent,
+                "memory_bytes": r.memory_bytes,
+                "players_online": r.players_online,
+                "latency_ms": r.latency_ms,
+                "state": r.state,
+            })
+        })
+        .collect();
+    let total = samples.len();
+    Json(serde_json::json!({ "samples": samples, "total": total })).into_response()
 }
 
 #[derive(sqlx::FromRow)]
@@ -327,25 +306,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pm6t2-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::for_tests(pool.clone(), root);
-        let authed = axum::Router::new()
-            .route(
-                "/api/v1/servers/:id/metrics",
-                axum::routing::get(super::server_metrics).route_layer(axum::middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerRead),
-                )),
-            )
-            .route(
-                "/api/v1/alerts",
-                axum::routing::get(super::list_alerts).route_layer(axum::middleware::from_fn(
-                    crate::auth::require_permission(crate::auth::Permission::ServerRead),
-                )),
-            )
-            .route_layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
-                crate::auth::auth_middleware,
-            ))
-            .with_state(state.clone());
-        let app = crate::build_router(state).merge(authed);
+        // Routes are wired in `build_router` with the production auth +
+        // permission gates; use it directly (no second test router merge).
+        let app = crate::build_router(state);
         (TestServer::new(app).unwrap(), pool)
     }
 
@@ -590,6 +553,59 @@ mod tests {
                 > samples.last().unwrap()["sampled_at"].as_str().unwrap(),
             "capped page stays newest-first"
         );
+    }
+
+    #[tokio::test]
+    async fn history_matches_canonical_server_samples() {
+        let (server, pool) = test_router_server().await;
+        let t = owner_token(&server).await;
+        let id = seed_server(&pool, "single-source", 25567, PINNED_IMAGE, &ts_ago(0)).await;
+        seed_sample(
+            &pool,
+            &id,
+            &ts_ago(300),
+            Some(12.5),
+            Some(1024),
+            Some(3),
+            Some(42),
+            "running",
+        )
+        .await;
+        seed_sample(&pool, &id, &ts_ago(900), None, None, None, None, "missing").await;
+        seed_sample(
+            &pool,
+            &id,
+            &ts_ago(1500),
+            Some(8.0),
+            None,
+            None,
+            Some(7),
+            "running",
+        )
+        .await;
+
+        let res = server
+            .get(&format!("/api/v1/servers/{id}/metrics?range=1h"))
+            .authorization_bearer(&t)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body = res.json::<Value>();
+        let samples = body["samples"].as_array().unwrap().clone();
+
+        // Canonical rows for the same window, recomputed independently.
+        let since = super::utc_cutoff(3600);
+        let rows = crate::metrics_collector::server_samples(&pool, &id, &since).await;
+        assert_eq!(samples.len(), rows.len(), "handler mirrors canonical rows");
+        for (json_row, row) in samples.iter().zip(rows.iter()) {
+            assert_eq!(json_row["sampled_at"], json!(row.sampled_at));
+            assert_eq!(json_row["cpu_percent"], json!(row.cpu_percent));
+            assert_eq!(json_row["memory_bytes"], json!(row.memory_bytes));
+            assert_eq!(json_row["players_online"], json!(row.players_online));
+            assert_eq!(json_row["latency_ms"], json!(row.latency_ms));
+            assert_eq!(json_row["state"], json!(row.state));
+        }
+        // NULLs preserved end-to-end, never 0-filled.
+        assert!(samples.iter().any(|s| s["cpu_percent"] == json!(null)));
     }
 
     #[tokio::test]
