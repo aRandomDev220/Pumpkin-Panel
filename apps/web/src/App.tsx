@@ -1,7 +1,8 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { BrowserRouter, Link } from "react-router-dom";
 import { fetchHealth } from "./lib/api";
-import { AuthProvider } from "./lib/auth";
+import { AuthProvider, useAuth } from "./lib/auth";
+import { isPrivilegedRole } from "./lib/admin";
 import AppRoutes from "./routes";
 
 const qc = new QueryClient();
@@ -21,6 +22,25 @@ function HealthBadge() {
   );
 }
 
+function Nav() {
+  const { user } = useAuth();
+  const privileged = isPrivilegedRole(user?.role);
+  return (
+    <nav>
+      <Link to="/">Overview</Link>
+      <Link to="/servers">Servers</Link>
+      <Link to="/monitoring">Monitoring</Link>
+      {privileged && (
+        <>
+          <Link to="/users">Users</Link>
+          <Link to="/audit">Audit</Link>
+          <Link to="/settings">Settings</Link>
+        </>
+      )}
+    </nav>
+  );
+}
+
 export default function App() {
   return (
     <QueryClientProvider client={qc}>
@@ -29,11 +49,7 @@ export default function App() {
           <div className="shell">
             <header>
               <h1>Pumpkin Manager</h1>
-              <nav>
-                <Link to="/">Overview</Link>
-                <Link to="/servers">Servers</Link>
-                <Link to="/monitoring">Monitoring</Link>
-              </nav>
+              <Nav />
               <HealthBadge />
             </header>
             <main>

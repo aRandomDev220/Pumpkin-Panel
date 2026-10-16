@@ -22,8 +22,330 @@ import {
 import type { MetricsRange } from "../lib/monitoring";
 import { ServerHistoryPanels } from "./Monitoring";
 import BackupsSection from "./Backups";
+import {
+  AdminApiError,
+  errMsg,
+  previousImageOf,
+  previewUpdate,
+  requestRollback,
+  requestUpdate,
+} from "../lib/admin";
+import type { UpdatePreview } from "../lib/admin";
 
 const LOG_TAIL_OPTIONS = [50, 200, 500];
+
+const ROLLBACK_ONE_WAY =
+  "Rollback is one-way for data: world files written by the new version may " +
+  "not load on the old image. Keep a backup before rolling back.";
+
+interface TaskProgress {
+  state?: string;
+  progress_percent?: number | null;
+  message?: string | null;
+  error?: string | null;
+}
+
+function taskProgress(t: TaskStatus): TaskProgress {
+  return t as unknown as TaskProgress;
+}
+
+function UpdateSection({
+  serverId,
+  server,
+}: {
+  serverId: string;
+  server: object;
+}) {
+  const qc = useQueryClient();
+  const [target, setTarget] = useState("");
+  const [digest, setDigest] = useState("");
+  const [preview, setPreview] = useState<UpdatePreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [noBackup, setNoBackup] = useState(false);
+  const [updateTaskId, setUpdateTaskId] = useState<string | null>(null);
+  const [rollbackError, setRollbackError] = useState<string | null>(null);
+  const [rollbackTaskId, setRollbackTaskId] = useState<string | null>(null);
+
+  const current = (server as { image_reference?: string }).image_reference ?? "";
+  const currentDigest = (server as { image_digest?: unknown }).image_digest;
+  const previous = previousImageOf(server);
+  const previousDigest = (server as { previous_image_digest?: unknown })
+    .previous_image_digest;
+
+  const updateTaskQuery = useQuery<TaskStatus>({
+    queryKey: ["tasks", updateTaskId],
+    queryFn: () => fetchTask(updateTaskId ?? ""),
+    enabled: updateTaskId !== null && updateTaskId !== "",
+    refetchInterval: updateTaskId ? 2_000 : false,
+    retry: false,
+  });
+
+  const rollbackTaskQuery = useQuery<TaskStatus>({
+    queryKey: ["tasks", rollbackTaskId],
+    queryFn: () => fetchTask(rollbackTaskId ?? ""),
+    enabled: rollbackTaskId !== null && rollbackTaskId !== "",
+    refetchInterval: rollbackTaskId ? 2_000 : false,
+    retry: false,
+  });
+
+  useEffect(() => {
+    const t = updateTaskQuery.data;
+    if (!t || !isTerminalTaskState(t.state)) return;
+    setUpdateTaskId(null);
+    qc.invalidateQueries({ queryKey: ["servers", serverId] });
+    qc.invalidateQueries({ queryKey: ["servers", serverId, "tasks"] });
+  }, [updateTaskQuery.data, serverId, qc]);
+
+  useEffect(() => {
+    const t = rollbackTaskQuery.data;
+    if (!t || !isTerminalTaskState(t.state)) return;
+    setRollbackTaskId(null);
+    qc.invalidateQueries({ queryKey: ["servers", serverId] });
+    qc.invalidateQueries({ queryKey: ["servers", serverId, "tasks"] });
+  }, [rollbackTaskQuery.data, serverId, qc]);
+
+  async function onPreview() {
+    setPreview(null);
+    setPreviewError(null);
+    setNoBackup(false);
+    if (!target.trim()) {
+      setPreviewError("Enter a target image reference first.");
+      return;
+    }
+    setPreviewBusy(true);
+    try {
+      setPreview(await previewUpdate(serverId, target.trim(), digest));
+    } catch (err) {
+      setPreviewError(errMsg(err));
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
+
+  const updateMutation = useMutation({
+    mutationFn: () => requestUpdate(serverId, target.trim(), digest),
+    onSuccess: (res) => {
+      setUpdateError(null);
+      setNoBackup(false);
+      setUpdateTaskId(res.task_id);
+    },
+    onError: (err) => {
+      if (
+        err instanceof AdminApiError &&
+        (err.status === 409 || /UPDATE_NO_BACKUP/i.test(err.message))
+      ) {
+        setNoBackup(true);
+        setUpdateError(null);
+      } else {
+        setNoBackup(false);
+        setUpdateError(errMsg(err));
+      }
+    },
+  });
+
+  const rollbackMutation = useMutation({
+    mutationFn: () => requestRollback(serverId),
+    onSuccess: (res) => {
+      setRollbackError(null);
+      setRollbackTaskId(res.task_id);
+    },
+    onError: (err) => setRollbackError(errMsg(err)),
+  });
+
+  const updateTask = updateTaskQuery.data
+    ? taskProgress(updateTaskQuery.data)
+    : null;
+  const rollbackTask = rollbackTaskQuery.data
+    ? taskProgress(rollbackTaskQuery.data)
+    : null;
+
+  return (
+    <section aria-label="Update image">
+      <h3>Update image</h3>
+      <dl>
+        <dt>Current</dt>
+        <dd>
+          <code>{current || "unknown"}</code>
+          {typeof currentDigest === "string" && currentDigest !== "" && (
+            <>
+              {" "}
+              <code title={currentDigest}>
+                {currentDigest.slice(0, 19)}…
+              </code>
+            </>
+          )}
+        </dd>
+        <dt>Previous (rollback target)</dt>
+        <dd>
+          {previous ? (
+            <code>{previous}</code>
+          ) : (
+            <span className="muted">
+              none recorded — rollback unavailable
+            </span>
+          )}
+          {typeof previousDigest === "string" && previousDigest !== "" && (
+            <>
+              {" "}
+              <code title={previousDigest}>
+                {previousDigest.slice(0, 19)}…
+              </code>
+            </>
+          )}
+        </dd>
+      </dl>
+
+      <div className="row">
+        <label>
+          Target image{" "}
+          <input
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            placeholder="pumpkin/mc:1.22"
+            aria-label="Target image reference"
+          />
+        </label>
+        <label>
+          Digest (optional){" "}
+          <input
+            value={digest}
+            onChange={(e) => setDigest(e.target.value)}
+            placeholder="sha256:…"
+            aria-label="Target image digest (optional)"
+          />
+        </label>
+        <button
+          type="button"
+          disabled={previewBusy}
+          onClick={onPreview}
+        >
+          {previewBusy ? "Previewing…" : "Preview"}
+        </button>
+      </div>
+      {previewError && (
+        <p className="err" role="alert">
+          {previewError}
+        </p>
+      )}
+      {preview && (
+        <div>
+          <p className="muted" role="status">
+            Preview of <code>{target.trim()}</code>
+            {preview.resolved_digest && (
+              <>
+                {" "}(resolves to <code>{preview.resolved_digest}</code>)
+              </>
+            )}
+            {preview.current_reference !== "" &&
+              preview.current_reference !== target.trim() && (
+                <>
+                  {" "}— current is <code>{preview.current_reference}</code>
+                </>
+              )}
+            .
+          </p>
+          {preview.warnings.length === 0 && (
+            <p className="muted">No warnings.</p>
+          )}
+          {preview.warnings.length > 0 && (
+            <ul>
+              {preview.warnings.map((w, i) => (
+                <li key={i} className="warn">
+                  {w}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <div className="row">
+        <button
+          type="button"
+          disabled={target.trim() === "" || updateMutation.isPending}
+          onClick={() => updateMutation.mutate()}
+        >
+          {updateTaskId ? "Updating… polling" : "Update to this image"}
+        </button>
+      </div>
+      {updateError && (
+        <p className="err" role="alert">
+          {updateError}
+        </p>
+      )}
+      {noBackup && (
+        <p className="warn" role="alert">
+          No verified backup found — the update was refused.{" "}
+          <a href="#backups">Create a backup first</a>, then retry.
+        </p>
+      )}
+      {updateTask && updateTaskId && (
+        <p className="muted" role="status">
+          Update task {updateTaskQuery.data?.id}:{" "}
+          <span className="badge">{updateTaskQuery.data?.state}</span>
+          {typeof updateTask.progress_percent === "number" &&
+            ` ${updateTask.progress_percent}%`}
+          {updateTask.message ? ` — ${updateTask.message}` : ""}
+          {updateTask.error ? ` — error: ${updateTask.error}` : ""}
+        </p>
+      )}
+      {updateTaskQuery.error && (
+        <p className="err" role="alert">
+          Failed to poll update task status.
+        </p>
+      )}
+
+      <p className="warn" role="note">
+        {ROLLBACK_ONE_WAY}
+      </p>
+      <div className="row">
+        <button
+          type="button"
+          disabled={previous === null || rollbackMutation.isPending}
+          title={
+            previous === null
+              ? "No previous image recorded — rollback unavailable"
+              : `Roll back to ${previous}`
+          }
+          onClick={() => {
+            if (
+              window.confirm(
+                `Roll back to ${previous ?? "the previous image"}? ` +
+                  ROLLBACK_ONE_WAY,
+              )
+            ) {
+              rollbackMutation.mutate();
+            }
+          }}
+        >
+          {previous
+            ? `Roll back to ${previous}`
+            : "Rollback unavailable (no previous image)"}
+        </button>
+      </div>
+      {rollbackError && (
+        <p className="err" role="alert">
+          {rollbackError}
+        </p>
+      )}
+      {rollbackTask && rollbackTaskId && (
+        <p className="muted" role="status">
+          Rollback task {rollbackTaskQuery.data?.id}:{" "}
+          <span className="badge">{rollbackTaskQuery.data?.state}</span>
+          {rollbackTask.message ? ` — ${rollbackTask.message}` : ""}
+          {rollbackTask.error ? ` — error: ${rollbackTask.error}` : ""}
+        </p>
+      )}
+      {rollbackTaskQuery.error && (
+        <p className="err" role="alert">
+          Failed to poll rollback task status.
+        </p>
+      )}
+    </section>
+  );
+}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "n/a";
@@ -454,6 +776,7 @@ export default function ServerDetail() {
       <div id="backups">
         <BackupsSection serverId={s.id} observedState={s.observed_state} />
       </div>
+      <UpdateSection serverId={s.id} server={s} />
     </section>
   );
 }
