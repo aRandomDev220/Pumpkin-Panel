@@ -21,6 +21,7 @@ deploy/.env
 *.sqlite-journal
 data/
 backups/
+dev-data/
 
 # Docker
 .docker/

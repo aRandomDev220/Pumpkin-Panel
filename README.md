@@ -128,6 +128,10 @@ Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml`, Node 24 (`.nv
 Docker Engine.
 
 ```sh
+PUMPKIN_INSECURE_COOKIES=1 \
+PUMPKIN_MANAGER_DATA_DIR=./dev-data/servers \
+PUMPKIN_MANAGER_BACKUP_DIR=./dev-data/backups \
+PUMPKIN_MANAGER_DATABASE_URL='sqlite:./dev.db?mode=rwc' \
 cargo run -p pumpkin-manager-backend        # API on :8080
 npm --prefix apps/web run dev               # UI dev server (proxies /api)
 ```
