@@ -3,12 +3,13 @@
 //! fine-grained permissions at router wiring time.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::{audit, auth::AuthUser, runtime, task_runner, AppState};
 
@@ -258,6 +259,176 @@ pub async fn update_user(
     Json(serde_json::json!({ "id": id, "ok": true })).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub role: String,
+}
+
+/// POST /api/v1/users — create a user (controller applies `UsersManage`).
+/// Empty usernames, passwords under 8 chars, and unknown roles are 422;
+/// duplicate usernames are 409. The DB UNIQUE constraint is the backstop
+/// for a first-user-style creation race (setup path untouched).
+#[allow(dead_code)] // controller wires the route in main.rs
+pub async fn create_user(
+    State(state): State<AppState>,
+    actor: AuthUser,
+    Json(body): Json<CreateUserRequest>,
+) -> Response {
+    let request_id = audit::request_id();
+    let username = body.username.trim().to_owned();
+    if username.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_USERNAME",
+            "username must not be empty",
+        );
+    }
+    if body.password.len() < 8 {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WEAK_PASSWORD",
+            "password must be at least 8 characters",
+        );
+    }
+    let Some(role) = crate::auth::Role::from_str(body.role.trim()) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_ROLE",
+            "role must be owner, admin, or viewer",
+        );
+    };
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = ?")
+        .bind(&username)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    if exists > 0 {
+        return error(
+            StatusCode::CONFLICT,
+            "USER_EXISTS",
+            "username already exists",
+        );
+    }
+    let password_hash = match crate::auth::hash_password(&body.password) {
+        Ok(h) => h,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to hash password",
+            )
+        }
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let inserted = sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&username)
+    .bind(&password_hash)
+    .bind(role.as_str())
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await;
+    if let Err(e) = inserted {
+        if e.to_string().contains("UNIQUE") {
+            return error(
+                StatusCode::CONFLICT,
+                "USER_EXISTS",
+                "username already exists",
+            );
+        }
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to create user",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&actor.id),
+        "users.create",
+        "user",
+        &id,
+        "ok",
+        &request_id,
+        serde_json::json!({ "username": username, "role": role.as_str() }),
+    )
+    .await;
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "username": username, "role": role.as_str() })),
+    )
+        .into_response()
+}
+
+/// DELETE /api/v1/users/:id — delete a user (controller applies
+/// `UsersManage`). Refuses to delete the final active owner (409
+/// `LAST_OWNER`, same guard as the update path) and revokes every session
+/// immediately. Self-delete is allowed: the caller's token stops working,
+/// so the client must discard it after the 204.
+#[allow(dead_code)] // controller wires the route in main.rs
+pub async fn delete_user(
+    State(state): State<AppState>,
+    actor: AuthUser,
+    Path(id): Path<String>,
+) -> Response {
+    let request_id = audit::request_id();
+    let target: Option<(String, i64)> =
+        sqlx::query_as("SELECT role, is_active FROM users WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let Some((target_role, target_active)) = target else {
+        return error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user");
+    };
+    if target_role == "owner" && target_active != 0 {
+        let others: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1 AND id != ?",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+        if others == 0 {
+            return error(
+                StatusCode::CONFLICT,
+                "LAST_OWNER",
+                "cannot delete the last active owner",
+            );
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let _ =
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+            .bind(&now)
+            .bind(&id)
+            .execute(&state.pool)
+            .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await;
+    audit::record(
+        &state.pool,
+        Some(&actor.id),
+        "users.delete",
+        "user",
+        &id,
+        "ok",
+        &request_id,
+        serde_json::json!({}),
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
@@ -493,6 +664,312 @@ pub async fn trigger_reconcile(State(state): State<AppState>, user: AuthUser) ->
     }
 }
 
+// ---------------------------------------------------------------------------
+// Manager database backup / staged restore (controller: `SettingsManage`)
+// ---------------------------------------------------------------------------
+
+/// Highest `user_version` this manager understands. Databases created by
+/// sqlx migrations leave `user_version` at 0; anything higher comes from
+/// an unknown newer manager and must never be staged.
+const MAX_SUPPORTED_DB_USER_VERSION: i64 = 0;
+
+/// SQLite file magic (`SQLite format 3\0`).
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
+/// Path the controller's boot swap watches: `<live>.pending-restore`.
+/// `restore_database` stages validated bytes here; the live DB is never
+/// swapped while the manager is running. Keep this signature stable.
+pub fn pending_restore_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut pending = db_path.as_os_str().to_owned();
+    pending.push(".pending-restore");
+    std::path::PathBuf::from(pending)
+}
+
+/// Filesystem path of the live manager database behind the pool
+/// (`PRAGMA database_list`, `main` entry). `None` for non-file
+/// databases (e.g. in-memory pools).
+async fn live_db_path(pool: &sqlx::SqlitePool) -> Option<std::path::PathBuf> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.into_iter().find_map(|(_, name, file)| {
+        if name == "main" && !file.is_empty() {
+            Some(std::path::PathBuf::from(file))
+        } else {
+            None
+        }
+    })
+}
+
+fn utc_stamp() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// Escape a path for interpolation into `VACUUM INTO '<path>'`
+/// (SQLite accepts no bound parameter there).
+fn vacuum_into_sql(path: &std::path::Path) -> String {
+    format!(
+        "VACUUM INTO '{}'",
+        path.to_string_lossy().replace('\'', "''")
+    )
+}
+
+/// GET /api/v1/admin/database/backup — consistent snapshot of the live
+/// manager DB as an attachment download
+/// (`pumpkin-manager-<schema>-<ts>.db`). Uses `VACUUM INTO` a temp file
+/// so a WAL-mode live database streams consistently.
+#[allow(dead_code)] // controller wires the route in main.rs
+pub async fn backup_database(State(state): State<AppState>, user: AuthUser) -> Response {
+    if live_db_path(&state.pool).await.is_none() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "manager database is not file-backed",
+        );
+    };
+    let schema: String =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0".to_string());
+    let snapshot =
+        std::env::temp_dir().join(format!("pm-manager-backup-{}.db", uuid::Uuid::new_v4()));
+    if sqlx::query(&vacuum_into_sql(&snapshot))
+        .execute(&state.pool)
+        .await
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&snapshot);
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to snapshot database",
+        );
+    }
+    let bytes = match std::fs::read(&snapshot) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = std::fs::remove_file(&snapshot);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to read snapshot",
+            );
+        }
+    };
+    let _ = std::fs::remove_file(&snapshot);
+    let filename = format!("pumpkin-manager-{schema}-{}.db", utc_stamp());
+    audit::record(
+        &state.pool,
+        Some(&user.id),
+        "admin.database.backup",
+        "database",
+        "manager",
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({ "file": filename, "bytes": bytes.len() }),
+    )
+    .await;
+    (
+        [
+            ("content-type", "application/x-sqlite3".to_string()),
+            (
+                "content-disposition",
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// POST /api/v1/admin/database/restore — validate an uploaded manager DB
+/// and STAGE it for the next boot. Never swaps the live file: the current
+/// DB is copied aside as `<live>.pre-restore-<ts>` and the upload is
+/// written to `pending_restore_path(db_path)`, which the controller
+/// applies at startup. Returns `200 {staged, restart_required}`.
+#[allow(dead_code)] // controller wires the route in main.rs
+pub async fn restore_database(
+    State(state): State<AppState>,
+    user: AuthUser,
+    mut multipart: Multipart,
+) -> Response {
+    let mut data: Option<Vec<u8>> = None;
+    let mut total: u64 = 0;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(f) => f,
+            Err(_) => {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "INVALID_DATABASE_FILE",
+                    "invalid multipart body",
+                )
+            }
+        };
+        let Some(field) = field else { break };
+        let bytes = match field.bytes().await {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "INVALID_DATABASE_FILE",
+                    "failed to read upload",
+                )
+            }
+        };
+        total += bytes.len() as u64;
+        if total > crate::file_service::MAX_UPLOAD_BYTES {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "DATABASE_TOO_LARGE",
+                "database file too large",
+            );
+        }
+        if data.is_none() {
+            data = Some(bytes.to_vec());
+        }
+    }
+    let Some(data) = data.filter(|d| !d.is_empty()) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_DATABASE_FILE",
+            "no file uploaded",
+        );
+    };
+    if data.len() < 100 || !data.starts_with(SQLITE_MAGIC) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_DATABASE_FILE",
+            "not a SQLite database file",
+        );
+    }
+    // Validate PRAGMAs + required tables against a temp copy, so a bad
+    // upload never touches the live DB.
+    let scratch =
+        std::env::temp_dir().join(format!("pm-manager-restore-{}.db", uuid::Uuid::new_v4()));
+    if std::fs::write(&scratch, &data).is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to stage upload",
+        );
+    }
+    if let Some(resp) = validate_restore_file(&scratch).await {
+        let _ = std::fs::remove_file(&scratch);
+        return resp;
+    }
+    let _ = std::fs::remove_file(&scratch);
+    let Some(db_path) = live_db_path(&state.pool).await else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "manager database is not file-backed",
+        );
+    };
+    // Copy the current DB aside before staging (consistent snapshot via
+    // the same `VACUUM INTO` technique as the backup download; plain
+    // file copy as fallback).
+    let aside =
+        std::path::PathBuf::from(format!("{}.pre-restore-{}", db_path.display(), utc_stamp()));
+    let aside_ok = sqlx::query(&vacuum_into_sql(&aside))
+        .execute(&state.pool)
+        .await
+        .is_ok()
+        || std::fs::copy(&db_path, &aside).is_ok();
+    if !aside_ok {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to preserve current database",
+        );
+    }
+    let pending = pending_restore_path(&db_path);
+    if std::fs::write(&pending, &data).is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to stage restore",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&user.id),
+        "admin.database.restore_staged",
+        "database",
+        "manager",
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({ "pre_restore": aside.display().to_string(), "bytes": data.len() }),
+    )
+    .await;
+    Json(serde_json::json!({ "staged": true, "restart_required": true })).into_response()
+}
+
+/// Validate a candidate restore file, read-only: parseable SQLite,
+/// `user_version` within the supported range, and the required
+/// `users`/`servers` tables present. Returns the rejection response, or
+/// `None` when the file is acceptable.
+async fn validate_restore_file(path: &std::path::Path) -> Option<Response> {
+    let opts = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = match SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => {
+            return Some(error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_DATABASE_FILE",
+                "not a readable SQLite database",
+            ))
+        }
+    };
+    let version: i64 = match sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&pool)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            pool.close().await;
+            return Some(error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_DATABASE_FILE",
+                "not a readable SQLite database",
+            ));
+        }
+    };
+    if version < 0 || version > MAX_SUPPORTED_DB_USER_VERSION {
+        pool.close().await;
+        return Some(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UNSUPPORTED_SCHEMA",
+            &format!("unsupported database schema version {version}"),
+        ));
+    }
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'servers')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    pool.close().await;
+    if !(tables.iter().any(|t| t == "users") && tables.iter().any(|t| t == "servers")) {
+        return Some(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UNSUPPORTED_SCHEMA",
+            "not a pumpkin-manager database (missing users/servers tables)",
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -626,5 +1103,395 @@ mod tests {
             .expect("config_validation entry missing");
         assert_eq!(validation["ok"], serde_json::json!(false));
         assert!(!validation["errors"].as_array().unwrap().is_empty());
+    }
+
+    // --- Task 2 (Phase 7): user admin + manager DB recovery ---
+
+    use axum_test::TestServer;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    async fn file_backed_pool(dir: &std::path::Path) -> sqlx::SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .filename(dir.join("pumpkin-manager.db"))
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        for file in [
+            include_str!("../../../migrations/0001_init.sql"),
+            include_str!("../../../migrations/0002_sessions_audit.sql"),
+        ] {
+            let stripped: String = file
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for stmt in stripped.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || stmt.to_uppercase().starts_with("PRAGMA") {
+                    continue;
+                }
+                sqlx::query(stmt).execute(&pool).await.unwrap();
+            }
+        }
+        pool
+    }
+
+    /// Mirror of the production wiring the controller will add to
+    /// `build_router`: identical paths + permission gates.
+    fn task2_router(state: AppState) -> axum::Router {
+        use crate::auth::Permission;
+        use axum::{
+            middleware,
+            routing::{delete, get, post},
+        };
+        let pool = state.pool.clone();
+        let public = axum::Router::new()
+            .route("/api/v1/auth/setup", post(crate::routes_auth::setup))
+            .route("/api/v1/auth/login", post(crate::routes_auth::login));
+        let protected = axum::Router::new()
+            .route(
+                "/api/v1/users",
+                post(super::create_user).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::UsersManage),
+                )),
+            )
+            .route(
+                "/api/v1/users/:id",
+                delete(super::delete_user).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::UsersManage),
+                )),
+            )
+            .route(
+                "/api/v1/admin/database/backup",
+                get(super::backup_database).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::SettingsManage),
+                )),
+            )
+            .route(
+                "/api/v1/admin/database/restore",
+                post(super::restore_database).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::SettingsManage),
+                )),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                pool,
+                crate::auth::auth_middleware,
+            ));
+        public.merge(protected).with_state(state)
+    }
+
+    struct AdminFixture {
+        server: TestServer,
+        pool: sqlx::SqlitePool,
+        token: String,
+        viewer_token: String,
+        dir: std::path::PathBuf,
+        live_db: std::path::PathBuf,
+    }
+
+    impl Drop for AdminFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn admin_fixture() -> AdminFixture {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("pm-admin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = file_backed_pool(&dir).await;
+        let root = dir.join("srvroot");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = AppState::for_tests(pool.clone(), root);
+        let server = TestServer::new(task2_router(state)).unwrap();
+        let res = server
+            .post("/api/v1/auth/setup")
+            .json(&json!({"username": "owner", "password": "supersecret1"}))
+            .await;
+        assert_eq!(res.status_code(), 200, "setup: {}", res.text());
+        let token = res.json::<serde_json::Value>()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let res = server
+            .post("/api/v1/users")
+            .authorization_bearer(&token)
+            .json(&json!({"username": "viewer1", "password": "supersecret1", "role": "viewer"}))
+            .await;
+        assert_eq!(res.status_code(), 201, "create viewer: {}", res.text());
+        let res = server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": "viewer1", "password": "supersecret1"}))
+            .await;
+        assert_eq!(res.status_code(), 200, "viewer login: {}", res.text());
+        let viewer_token = res.json::<serde_json::Value>()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let live_db = dir.join("pumpkin-manager.db");
+        AdminFixture {
+            server,
+            pool,
+            token,
+            viewer_token,
+            dir,
+            live_db,
+        }
+    }
+
+    fn restore_form(name: &str, bytes: Vec<u8>) -> axum_test::multipart::MultipartForm {
+        use axum_test::multipart::{MultipartForm, Part};
+        MultipartForm::new().add_part(
+            "file",
+            Part::bytes(bytes)
+                .file_name(name.to_string())
+                .mime_type("application/octet-stream"),
+        )
+    }
+
+    async fn user_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn owner_row_id(pool: &sqlx::SqlitePool) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'owner'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Craft a standalone SQLite file for restore-upload tests.
+    async fn craft_db(dir: &std::path::Path, name: &str, user_version: i64) -> Vec<u8> {
+        let path = dir.join(name);
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE users (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE servers (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("PRAGMA user_version = {user_version}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn pending_restore_path_appends_suffix() {
+        assert_eq!(
+            super::pending_restore_path(std::path::Path::new("/data/pumpkin-manager.db")),
+            std::path::PathBuf::from("/data/pumpkin-manager.db.pending-restore")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_409s() {
+        use serde_json::json;
+        let fx = admin_fixture().await;
+        let body = json!({"username": "alice", "password": "supersecret1", "role": "admin"});
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&body)
+            .await;
+        assert_eq!(res.status_code(), 201, "body: {}", res.text());
+        let created: serde_json::Value = res.json();
+        assert_eq!(created["username"], json!("alice"));
+        assert_eq!(created["role"], json!("admin"));
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&body)
+            .await;
+        assert_eq!(res.status_code(), 409, "body: {}", res.text());
+        assert!(res.text().contains("USER_EXISTS"));
+        // Weak password and unknown role are 422.
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&json!({"username": "bob", "password": "short", "role": "admin"}))
+            .await;
+        assert_eq!(res.status_code(), 422, "body: {}", res.text());
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&json!({"username": "bob", "password": "supersecret1", "role": "superadmin"}))
+            .await;
+        assert_eq!(res.status_code(), 422, "body: {}", res.text());
+    }
+
+    #[tokio::test]
+    async fn delete_last_owner_409s() {
+        use serde_json::json;
+        let fx = admin_fixture().await;
+        let oid = owner_row_id(&fx.pool).await;
+        // Sole active owner: refuse.
+        let res = fx
+            .server
+            .delete(&format!("/api/v1/users/{oid}"))
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 409, "body: {}", res.text());
+        assert!(res.text().contains("LAST_OWNER"));
+        // Second owner exists: self-delete of the first is allowed (204) and
+        // revokes its sessions (the old token stops working).
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&json!({"username": "owner2", "password": "supersecret1", "role": "owner"}))
+            .await;
+        assert_eq!(res.status_code(), 201, "body: {}", res.text());
+        let res = fx
+            .server
+            .delete(&format!("/api/v1/users/{oid}"))
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 204, "body: {}", res.text());
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.token)
+            .json(&json!({"username": "ghost", "password": "supersecret1", "role": "viewer"}))
+            .await;
+        assert_eq!(res.status_code(), 401, "body: {}", res.text());
+    }
+
+    #[tokio::test]
+    async fn viewer_cannot_create_users_403() {
+        use serde_json::json;
+        let fx = admin_fixture().await;
+        let res = fx
+            .server
+            .post("/api/v1/users")
+            .authorization_bearer(&fx.viewer_token)
+            .json(&json!({"username": "mallory", "password": "supersecret1", "role": "viewer"}))
+            .await;
+        assert_eq!(res.status_code(), 403, "body: {}", res.text());
+        assert!(res.text().contains("PERMISSION_DENIED"));
+        let res = fx
+            .server
+            .get("/api/v1/admin/database/backup")
+            .authorization_bearer(&fx.viewer_token)
+            .await;
+        assert_eq!(res.status_code(), 403, "body: {}", res.text());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_non_sqlite() {
+        let fx = admin_fixture().await;
+        let before = user_count(&fx.pool).await;
+        let res = fx
+            .server
+            .post("/api/v1/admin/database/restore")
+            .authorization_bearer(&fx.token)
+            .multipart(restore_form(
+                "evil.txt",
+                b"definitely not a database".to_vec(),
+            ))
+            .await;
+        assert_eq!(res.status_code(), 422, "body: {}", res.text());
+        assert_eq!(user_count(&fx.pool).await, before, "live DB touched");
+        assert!(
+            !super::pending_restore_path(&fx.live_db).exists(),
+            "pending file staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_unknown_schema() {
+        let fx = admin_fixture().await;
+        let bytes = craft_db(&fx.dir, "newer.db", 99999).await;
+        let before = user_count(&fx.pool).await;
+        let res = fx
+            .server
+            .post("/api/v1/admin/database/restore")
+            .authorization_bearer(&fx.token)
+            .multipart(restore_form("newer.db", bytes))
+            .await;
+        assert_eq!(res.status_code(), 422, "body: {}", res.text());
+        assert_eq!(user_count(&fx.pool).await, before, "live DB touched");
+        assert!(
+            !super::pending_restore_path(&fx.live_db).exists(),
+            "pending file staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_stages_valid_file() {
+        let fx = admin_fixture().await;
+        let bytes = craft_db(&fx.dir, "good.db", 0).await;
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+        let before = user_count(&fx.pool).await;
+        let res = fx
+            .server
+            .post("/api/v1/admin/database/restore")
+            .authorization_bearer(&fx.token)
+            .multipart(restore_form("good.db", bytes.clone()))
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let body: serde_json::Value = res.json();
+        assert_eq!(
+            body,
+            serde_json::json!({"staged": true, "restart_required": true})
+        );
+        let pending = super::pending_restore_path(&fx.live_db);
+        assert_eq!(std::fs::read(&pending).unwrap(), bytes);
+        let aside: Vec<_> = std::fs::read_dir(&fx.dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains(".pre-restore-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "pre-restore copy missing: {aside:?}");
+        assert_eq!(user_count(&fx.pool).await, before, "live DB touched");
+    }
+
+    #[tokio::test]
+    async fn backup_downloads_snapshot() {
+        let fx = admin_fixture().await;
+        let res = fx
+            .server
+            .get("/api/v1/admin/database/backup")
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 200, "body: {}", res.text());
+        let disposition = res
+            .headers()
+            .get("content-disposition")
+            .expect("content-disposition header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment;"),
+            "not an attachment: {disposition}"
+        );
+        assert!(
+            disposition.contains("pumpkin-manager-") && disposition.ends_with(".db\""),
+            "unexpected filename: {disposition}"
+        );
+        assert!(res.as_bytes().as_ref().starts_with(b"SQLite format 3\0"));
     }
 }
