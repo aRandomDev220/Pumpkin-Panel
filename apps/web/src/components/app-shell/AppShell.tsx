@@ -96,7 +96,8 @@ function HealthBadge(): React.JSX.Element {
 
   if (isLoading) return <span className="system-status status-loading"><span className="status-dot" />Checking runtime</span>;
   if (isError || !data) return <span className="system-status status-error"><span className="status-dot" />Runtime unavailable</span>;
-  return <span className="system-status"><span className="status-dot" />Runtime healthy</span>;
+  if (data.docker !== "reachable") return <span className="system-status status-error"><span className="status-dot" />Docker degraded</span>;
+  return <span className="system-status"><span className="status-dot" />Docker connected</span>;
 }
 
 function SidebarNav({ items, onNavigate }: { items: NavItem[]; onNavigate: () => void }): React.JSX.Element {

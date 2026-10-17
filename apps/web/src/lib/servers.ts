@@ -17,6 +17,14 @@ export interface ServerDetail extends ServerSummary {
   last_error?: string | null;
 }
 
+export interface ServerSettings {
+  server_id: string;
+  memory_limit_bytes: number;
+  cpu_limit: number;
+  restart_policy: string;
+  auto_start: boolean;
+}
+
 export interface TaskStatus {
   id: string;
   kind: string;
@@ -67,6 +75,28 @@ export async function listServers(): Promise<{ servers: ServerSummary[] }> {
 export async function getServer(id: string): Promise<ServerDetail> {
   const res = await authFetch(`/api/v1/servers/${encodeURIComponent(id)}`);
   return parseJson<ServerDetail>(res, "get server");
+}
+
+export async function fetchServerSettings(
+  id: string,
+): Promise<{ settings: ServerSettings }> {
+  const res = await authFetch(`/api/v1/servers/${encodeURIComponent(id)}/settings`);
+  return parseJson<{ settings: ServerSettings }>(res, "get server settings");
+}
+
+export async function updateServerSettings(
+  id: string,
+  input: Partial<Pick<ServerSettings, "memory_limit_bytes" | "cpu_limit" | "auto_start">>,
+): Promise<{ settings: ServerSettings; restart_required: boolean }> {
+  const res = await authFetch(`/api/v1/servers/${encodeURIComponent(id)}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  return parseJson<{ settings: ServerSettings; restart_required: boolean }>(
+    res,
+    "update server settings",
+  );
 }
 
 export async function createServer(input: CreateServerInput): Promise<ServerDetail> {

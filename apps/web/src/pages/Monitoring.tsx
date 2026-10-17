@@ -251,7 +251,7 @@ export function AlertsList({
     return <p className="muted">No alerts.</p>;
   }
   return (
-    <ul>
+    <ul className="signal-list">
       {alerts.map((a, i) => (
         <li key={`${a.kind}-${a.server_id ?? "host"}-${i}`} className={alertClass(a.severity)}>
           <span className="badge">[{a.severity.toUpperCase()}]</span>{" "}

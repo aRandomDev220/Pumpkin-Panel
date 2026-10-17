@@ -24,6 +24,8 @@ tokens remain supported for non-browser API clients.
 |---|---|---|
 | GET/POST | `/servers` | List or create servers. |
 | GET/PATCH/DELETE | `/servers/:id` | Read, update, or delete a server. |
+| GET | `/servers/:id/settings` | Read bounded memory/CPU limits and boot policy. |
+| PATCH | `/servers/:id/settings` | Update memory/CPU limits or opt-in boot auto-start. Resource changes report `restart_required` and apply on the next container recreate. |
 | POST | `/servers/:id/start`, `/stop`, `/restart` | Queue lifecycle work. |
 | GET | `/servers/:id/status`, `/logs`, `/tasks` | Read runtime state and history. |
 | GET | `/tasks/:id` | Read task progress/result. |

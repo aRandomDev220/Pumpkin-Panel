@@ -80,6 +80,26 @@ pub struct CreateServerRequest {
     pub cpu_limit: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ServerSettingsDto {
+    pub server_id: String,
+    pub memory_limit_bytes: u64,
+    pub cpu_limit: f64,
+    pub restart_policy: String,
+    pub auto_start: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateServerSettingsRequest {
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub cpu_limit: Option<f64>,
+    #[serde(default)]
+    pub auto_start: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Pagination {
     #[serde(default = "default_limit")]
@@ -102,6 +122,9 @@ pub struct DeleteQuery {
 fn default_retain() -> bool {
     true
 }
+
+const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_CPU_LIMIT: f64 = 2.0;
 
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
@@ -307,6 +330,10 @@ pub async fn create_server(
     }
 
     let server_id = uuid::Uuid::new_v4().to_string();
+    let memory_limit_bytes = body
+        .memory_limit_bytes
+        .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES);
+    let cpu_limit = body.cpu_limit.unwrap_or(DEFAULT_CPU_LIMIT);
     let data_path = state
         .server_root
         .join(&server_id)
@@ -321,8 +348,8 @@ pub async fn create_server(
         game_port: body.game_port,
         bind_address: bind_address.clone(),
         data_path: data_path.clone(),
-        memory_limit_bytes: body.memory_limit_bytes.unwrap_or(2 * 1024 * 1024 * 1024),
-        cpu_limit: body.cpu_limit.unwrap_or(2.0),
+        memory_limit_bytes,
+        cpu_limit,
     };
     // Align the spec's server id with the allocated row id.
     let input = ServerSpecInput {
@@ -379,10 +406,26 @@ pub async fn create_server(
             "failed to persist server",
         );
     }
-    let _ = sqlx::query("INSERT INTO server_settings (server_id) VALUES (?)")
-        .bind(&server_id)
-        .execute(&state.pool)
-        .await;
+    if let Err(e) = sqlx::query(
+        "INSERT INTO server_settings (server_id, memory_limit_bytes, cpu_limit) VALUES (?, ?, ?)",
+    )
+    .bind(&server_id)
+    .bind(memory_limit_bytes as i64)
+    .bind(cpu_limit)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(server_id = %server_id, error = %e, "failed to persist server settings");
+        let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
+            .bind(&server_id)
+            .execute(&state.pool)
+            .await;
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to persist server settings",
+        );
+    }
 
     // Materialise the container when a runtime is attached.
     let mut warnings: Vec<String> = Vec::new();
@@ -488,6 +531,195 @@ pub async fn get_server(
             "INTERNAL",
             "failed to load server",
         ),
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ServerSettingsRow {
+    server_id: String,
+    memory_limit_bytes: i64,
+    cpu_limit: f64,
+    restart_policy: String,
+    auto_start: i64,
+}
+
+async fn ensure_server_settings(pool: &SqlitePool, server_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO server_settings
+            (server_id, memory_limit_bytes, cpu_limit, restart_policy, auto_start)
+         VALUES (?, ?, ?, 'no', 0)",
+    )
+    .bind(server_id)
+    .bind(DEFAULT_MEMORY_LIMIT_BYTES as i64)
+    .bind(DEFAULT_CPU_LIMIT)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn fetch_server_settings(
+    pool: &SqlitePool,
+    server_id: &str,
+) -> Result<ServerSettingsDto, sqlx::Error> {
+    let row = sqlx::query_as::<_, ServerSettingsRow>(
+        "SELECT server_id, memory_limit_bytes, cpu_limit, restart_policy, auto_start
+         FROM server_settings WHERE server_id = ?",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(ServerSettingsDto {
+        server_id: row.server_id,
+        memory_limit_bytes: u64::try_from(row.memory_limit_bytes)
+            .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES),
+        cpu_limit: if row.cpu_limit.is_finite() && row.cpu_limit > 0.0 {
+            row.cpu_limit
+        } else {
+            DEFAULT_CPU_LIMIT
+        },
+        restart_policy: row.restart_policy,
+        auto_start: row.auto_start != 0,
+    })
+}
+
+/// GET /api/v1/servers/:id/settings — resource and startup policy for a world.
+pub async fn server_settings(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(id): Path<String>,
+) -> Response {
+    if fetch_server(&state.pool, &id)
+        .await
+        .unwrap_or(None)
+        .is_none()
+    {
+        return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
+    }
+    if let Err(e) = ensure_server_settings(&state.pool, &id).await {
+        tracing::warn!(server_id = %id, error = %e, "failed to ensure server settings");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to load server settings",
+        );
+    }
+    match fetch_server_settings(&state.pool, &id).await {
+        Ok(settings) => Json(serde_json::json!({ "settings": settings })).into_response(),
+        Err(e) => {
+            tracing::warn!(server_id = %id, error = %e, "failed to load server settings");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to load server settings",
+            )
+        }
+    }
+}
+
+/// PATCH /api/v1/servers/:id/settings — update bounded runtime resources.
+/// Memory and CPU changes take effect the next time the container is created;
+/// the response tells the UI when a recreate is required.
+pub async fn update_server_settings(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateServerSettingsRequest>,
+) -> Response {
+    if fetch_server(&state.pool, &id)
+        .await
+        .unwrap_or(None)
+        .is_none()
+    {
+        return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
+    }
+    if let Err(e) = ensure_server_settings(&state.pool, &id).await {
+        tracing::warn!(server_id = %id, error = %e, "failed to ensure server settings");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to load server settings",
+        );
+    }
+    let current = match fetch_server_settings(&state.pool, &id).await {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!(server_id = %id, error = %e, "failed to load server settings");
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to load server settings",
+            );
+        }
+    };
+    let memory_limit_bytes = body
+        .memory_limit_bytes
+        .unwrap_or(current.memory_limit_bytes);
+    let cpu_limit = body.cpu_limit.unwrap_or(current.cpu_limit);
+    if !(runtime::MIN_MEMORY_BYTES..=runtime::MAX_MEMORY_BYTES).contains(&memory_limit_bytes) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_CONFIGURATION",
+            "memory_limit_bytes must be between 256 MiB and 32 GiB",
+        );
+    }
+    if !(runtime::MIN_CPU_LIMIT..=runtime::MAX_CPU_LIMIT).contains(&cpu_limit)
+        || !cpu_limit.is_finite()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_CONFIGURATION",
+            "cpu_limit must be between 0.1 and 16.0",
+        );
+    }
+    let auto_start = body.auto_start.unwrap_or(current.auto_start);
+    if let Err(e) = sqlx::query(
+        "UPDATE server_settings SET memory_limit_bytes = ?, cpu_limit = ?, auto_start = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE server_id = ?",
+    )
+    .bind(memory_limit_bytes as i64)
+    .bind(cpu_limit)
+    .bind(if auto_start { 1 } else { 0 })
+    .bind(&id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(server_id = %id, error = %e, "failed to update server settings");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to update server settings",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&user.id),
+        "server.settings.update",
+        "server",
+        &id,
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({
+            "memory_limit_bytes": memory_limit_bytes,
+            "cpu_limit": cpu_limit,
+            "auto_start": auto_start,
+        }),
+    )
+    .await;
+    match fetch_server_settings(&state.pool, &id).await {
+        Ok(settings) => Json(serde_json::json!({
+            "settings": settings,
+            "restart_required": memory_limit_bytes != current.memory_limit_bytes
+                || (cpu_limit - current.cpu_limit).abs() > f64::EPSILON,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(server_id = %id, error = %e, "updated settings could not be reloaded");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "settings updated but could not be reloaded",
+            )
+        }
     }
 }
 

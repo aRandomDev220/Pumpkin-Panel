@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use sqlx::SqlitePool;
@@ -146,6 +146,18 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/servers/:id",
             delete(routes_servers::delete_server).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerDelete),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/settings",
+            get(routes_servers::server_settings).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerRead),
+            )),
+        )
+        .route(
+            "/api/v1/servers/:id/settings",
+            patch(routes_servers::update_server_settings).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::ServerConfigWrite),
             )),
         )
         .route(
@@ -625,6 +637,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 sync_observed(&pool, a.as_ref()).await;
+                if let Some(runner) = &runner {
+                    schedule_auto_start_servers(&pool, runner).await;
+                }
             }
             Err(e) => tracing::warn!(error = %e, "startup reconcile failed"),
         }
@@ -733,6 +748,60 @@ async fn sync_observed(pool: &SqlitePool, adapter: &DockerAdapter) {
             .bind(&id)
             .execute(pool)
             .await;
+    }
+}
+
+/// Queue opt-in server starts after the first Docker reconciliation. This is
+/// deliberately manager-owned rather than a Docker restart policy: an owner
+/// who stops a world stays in control until the next boot, and every start is
+/// still represented by a persisted task.
+async fn schedule_auto_start_servers(pool: &SqlitePool, runner: &task_runner::RunnerHandle) {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT s.id
+         FROM servers s
+         JOIN server_settings ss ON ss.server_id = s.id
+         WHERE s.deleted_at IS NULL AND ss.auto_start = 1 AND s.container_id != ''",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for server_id in rows {
+        let in_flight: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks
+             WHERE server_id = ? AND state IN ('queued', 'running')",
+        )
+        .bind(&server_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(1);
+        if in_flight > 0 {
+            continue;
+        }
+        let _ = sqlx::query(
+            "UPDATE servers SET desired_state = 'running',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?",
+        )
+        .bind(&server_id)
+        .execute(pool)
+        .await;
+        match task_runner::enqueue_and_submit(pool, runner, "start", Some(&server_id), None).await {
+            Ok(task) => {
+                tracing::info!(server_id = %server_id, task_id = %task.id, "queued auto-start")
+            }
+            Err(e) => {
+                tracing::warn!(server_id = %server_id, error = %e, "auto-start could not be queued");
+                let _ = sqlx::query(
+                    "UPDATE servers SET desired_state = 'stopped',
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE id = ?",
+                )
+                .bind(&server_id)
+                .execute(pool)
+                .await;
+            }
+        }
     }
 }
 

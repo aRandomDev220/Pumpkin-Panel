@@ -137,7 +137,7 @@ export default function Overview(): React.JSX.Element {
           </div>
         </div>
         <div className="node-card">
-          <div className="node-card-header"><h3>Home node</h3><span className="node-chip"><span className="status-dot" />Docker connected</span></div>
+           <div className="node-card-header"><h3>Home node</h3><span className="node-chip"><span className="status-dot" />Manager online</span></div>
           <p className="muted">One protected control plane for your Pumpkin instances.</p>
           <div className="node-card-metrics">
             <div><strong>{servers.length}</strong><span>worlds registered</span></div>

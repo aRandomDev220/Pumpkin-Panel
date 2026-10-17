@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import {
   fetchServerLogs,
+  fetchServerSettings,
   fetchServerTasks,
   fetchStatus,
   fetchTask,
@@ -11,6 +12,7 @@ import {
   isLifecycleAccepted,
   isTerminalTaskState,
   postLifecycle,
+  updateServerSettings,
 } from "../lib/servers";
 import type { LifecycleOp, TaskStatus } from "../lib/servers";
 import {
@@ -30,6 +32,7 @@ import {
   requestUpdate,
 } from "../lib/admin";
 import type { UpdatePreview } from "../lib/admin";
+import { useAuth } from "../lib/auth";
 
 const LOG_TAIL_OPTIONS = [50, 200, 500];
 
@@ -346,6 +349,106 @@ function UpdateSection({
   );
 }
 
+function formatMemory(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "Unavailable";
+  const gib = bytes / (1024 ** 3);
+  return `${gib.toFixed(gib < 1 ? 2 : 1)} GiB`;
+}
+
+function RuntimeSettingsSection({ serverId }: { serverId: string }): React.JSX.Element {
+  const qc = useQueryClient();
+  const { user } = useAuth();
+  const settingsQuery = useQuery({
+    queryKey: ["servers", serverId, "settings"],
+    queryFn: () => fetchServerSettings(serverId),
+    retry: 1,
+  });
+  const [memoryGiB, setMemoryGiB] = useState("2");
+  const [cpuLimit, setCpuLimit] = useState("2");
+  const [autoStart, setAutoStart] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const readOnly = user?.role === "viewer";
+
+  useEffect(() => {
+    const settings = settingsQuery.data?.settings;
+    if (!settings) return;
+    setMemoryGiB((settings.memory_limit_bytes / (1024 ** 3)).toString());
+    setCpuLimit(settings.cpu_limit.toString());
+    setAutoStart(settings.auto_start);
+  }, [settingsQuery.data]);
+
+  const mutation = useMutation({
+    mutationFn: () => {
+      const memory = Number(memoryGiB);
+      const cpu = Number(cpuLimit);
+      if (!Number.isFinite(memory) || memory < 0.25 || memory > 32) {
+        throw new Error("Memory must be between 0.25 and 32 GiB.");
+      }
+      if (!Number.isFinite(cpu) || cpu < 0.1 || cpu > 16) {
+        throw new Error("CPU must be between 0.1 and 16 vCPU.");
+      }
+      return updateServerSettings(serverId, {
+        memory_limit_bytes: Math.round(memory * (1024 ** 3)),
+        cpu_limit: cpu,
+        auto_start: autoStart,
+      });
+    },
+    onSuccess: (result) => {
+      setError(null);
+      setMessage(result.restart_required
+        ? "Saved. The new limits apply the next time this world is recreated."
+        : "Runtime settings saved.");
+      qc.invalidateQueries({ queryKey: ["servers", serverId, "settings"] });
+    },
+    onError: (err) => {
+      setMessage(null);
+      setError(err instanceof Error ? err.message : "Runtime settings could not be saved.");
+    },
+  });
+
+  return (
+    <section className="panel runtime-settings" aria-labelledby="runtime-settings-heading">
+      <div className="section-heading runtime-settings-heading">
+        <div>
+          <h3 id="runtime-settings-heading">Runtime resources</h3>
+          <p className="muted">Bound the container so one world cannot starve the node.</p>
+        </div>
+        <span className="badge">Docker limits</span>
+      </div>
+      {settingsQuery.isLoading && <p className="muted">Loading resource policy…</p>}
+      {settingsQuery.error && <p className="err" role="alert">Resource policy could not be loaded.</p>}
+      {settingsQuery.data && (
+        <>
+          <div className="resource-grid">
+            <label>
+              Memory limit
+              <span>256 MiB to 32 GiB</span>
+              <input type="number" min="0.25" max="32" step="0.25" value={memoryGiB} onChange={(event) => setMemoryGiB(event.target.value)} disabled={readOnly || mutation.isPending} />
+            </label>
+            <label>
+              CPU limit
+              <span>0.1 to 16 vCPU</span>
+              <input type="number" min="0.1" max="16" step="0.1" value={cpuLimit} onChange={(event) => setCpuLimit(event.target.value)} disabled={readOnly || mutation.isPending} />
+            </label>
+            <label className="resource-toggle">
+              <span>Startup behavior</span>
+              <span><input type="checkbox" checked={autoStart} onChange={(event) => setAutoStart(event.target.checked)} disabled={readOnly || mutation.isPending} /> Start this world when the manager boots</span>
+            </label>
+          </div>
+          <div className="runtime-settings-footer">
+            <span className="muted">Current: {formatMemory(settingsQuery.data.settings.memory_limit_bytes)} · {settingsQuery.data.settings.cpu_limit} vCPU · manager restart policy</span>
+            <button type="button" disabled={readOnly || mutation.isPending} onClick={() => mutation.mutate()}>{mutation.isPending ? "Saving…" : "Save resource policy"}</button>
+          </div>
+          {readOnly && <p className="muted" role="note">Viewer accounts can inspect resource limits but cannot change them.</p>}
+          {message && <p className="muted" role="status">{message}</p>}
+          {error && <p className="err" role="alert">{error}</p>}
+        </>
+      )}
+    </section>
+  );
+}
+
 function stateLabel(state: string): string {
   const labels: Record<string, string> = {
     online: "Online",
@@ -584,6 +687,8 @@ export default function ServerDetail() {
         <div className="server-summary-card"><span className="summary-label">Observed state</span><strong>{stateLabel(s.observed_state)}</strong><span className="summary-detail">Desired: {stateLabel(s.desired_state)}</span></div>
       </div>
       {s.last_error && <p className="server-error-banner err" role="alert">{s.last_error}</p>}
+
+      <RuntimeSettingsSection serverId={s.id} />
 
       <div id="metrics" className="section-heading"><h3>Metrics history</h3><Link className="section-link" to="/monitoring">Full monitoring</Link></div>
       <div className="row">

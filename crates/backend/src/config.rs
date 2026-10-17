@@ -55,7 +55,10 @@ impl Settings {
             .set_default("database_url", "sqlite:/data/pumpkin-manager.db?mode=rwc")?
             .add_source(config::Environment::with_prefix("PUMPKIN_MANAGER").try_parsing(true))
             .build()?;
-        Ok(builder.try_deserialize()?)
+        let mut settings: Self = builder.try_deserialize()?;
+        settings.data_dir = resolve_path(settings.data_dir)?;
+        settings.backup_dir = resolve_path(settings.backup_dir)?;
+        Ok(settings)
     }
 
     pub fn bind_addr(&self) -> SocketAddr {
@@ -68,6 +71,13 @@ impl Settings {
     pub fn session_ttl_secs(&self) -> i64 {
         (self.session_ttl_minutes.max(1) as i64) * 60
     }
+}
+
+fn resolve_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
 }
 
 #[cfg(test)]
@@ -94,5 +104,19 @@ mod tests {
         let s = Settings::load().expect("settings load");
         std::env::remove_var("PUMPKIN_MANAGER_HTTP_PORT");
         assert_eq!(s.http_port, 9090);
+    }
+
+    #[test]
+    fn relative_storage_paths_resolve_from_working_directory() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("PUMPKIN_MANAGER_DATA_DIR", "./dev-data/servers");
+        std::env::set_var("PUMPKIN_MANAGER_BACKUP_DIR", "./dev-data/backups");
+        let s = Settings::load().expect("settings load");
+        std::env::remove_var("PUMPKIN_MANAGER_DATA_DIR");
+        std::env::remove_var("PUMPKIN_MANAGER_BACKUP_DIR");
+        assert!(s.data_dir.is_absolute());
+        assert!(s.backup_dir.is_absolute());
+        assert!(s.data_dir.ends_with("dev-data/servers"));
+        assert!(s.backup_dir.ends_with("dev-data/backups"));
     }
 }

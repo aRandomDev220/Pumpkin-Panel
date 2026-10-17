@@ -156,6 +156,37 @@ async fn server_crud_without_docker() {
     assert_eq!(body["server"]["observed_state"], json!("created"));
     assert!(!body["warnings"].as_array().unwrap().is_empty());
 
+    // Resource settings round-trip and remain bounded by the runtime policy.
+    let settings = server
+        .get(&format!("/api/v1/servers/{id}/settings"))
+        .authorization_bearer(&t)
+        .await;
+    assert_eq!(settings.status_code(), 200);
+    assert_eq!(
+        settings.json::<Value>()["settings"]["memory_limit_bytes"],
+        json!(2 * 1024 * 1024 * 1024u64)
+    );
+    let updated_settings = server
+        .patch(&format!("/api/v1/servers/{id}/settings"))
+        .authorization_bearer(&t)
+        .json(&json!({
+            "memory_limit_bytes": 4 * 1024 * 1024 * 1024u64,
+            "cpu_limit": 3.5,
+            "auto_start": true,
+        }))
+        .await;
+    assert_eq!(updated_settings.status_code(), 200);
+    let updated_json = updated_settings.json::<Value>();
+    assert_eq!(updated_json["settings"]["cpu_limit"], json!(3.5));
+    assert_eq!(updated_json["settings"]["auto_start"], json!(true));
+    assert_eq!(updated_json["restart_required"], json!(true));
+    let invalid_settings = server
+        .patch(&format!("/api/v1/servers/{id}/settings"))
+        .authorization_bearer(&t)
+        .json(&json!({ "cpu_limit": 32.0 }))
+        .await;
+    assert_eq!(invalid_settings.status_code(), 422);
+
     // Port (and adjacent bedrock port) cannot be double-allocated.
     for port in [25565u16, 25566u16] {
         let dup = server

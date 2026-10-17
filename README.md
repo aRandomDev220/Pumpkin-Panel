@@ -20,6 +20,7 @@ one Docker container per game server, one SQLite database, zero cloud dependenci
 **Lifecycle & dashboard**
 - Create/start/stop/restart game servers; per-server desired vs. observed state
 - Readiness-gated status (`online` requires a live protocol ping) with player counts and latency
+- Per-world memory/CPU limits and opt-in manager boot auto-start, with recreate-required changes called out
 - Live logs, CPU/memory stats, task history with progress
 
 **Configuration (`pumpkin.toml`)**
@@ -113,7 +114,7 @@ All routes live under `/api/v1` and speak JSON with stable `error_code`s. Highli
 | Area | Endpoints |
 |---|---|
 | Auth | `setup-status`, `setup`, `login`, `logout`, `me`, `change-password` |
-| Servers | CRUD, `start`/`stop`/`restart` (202 + task), `status`, `logs`, `capabilities` |
+| Servers | CRUD, `start`/`stop`/`restart` (202 + task), `status`, `logs`, `capabilities`, bounded `settings` |
 | Config | `config` GET/PUT (revision-checked), `validate`, `revisions`, `revert` |
 | Files | `files` list/upload/download/mkdir/rename/delete, `import`, `export` |
 | Backups | `backups` create/list/download/delete/restore, `backup-policies` + retention preview |
