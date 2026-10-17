@@ -166,6 +166,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .create-panel { max-width: 880px; margin-top: 28px; }
 .create-panel h3 { margin-top: 0; }
 .create-panel > p { max-width: 650px; color: var(--muted); }
+.advanced-field { display: grid; gap: 7px; max-width: 100%; margin-top: 14px; }
+.advanced-field small { color: var(--muted); }
 .form-grid { display: grid; grid-template-columns: 1.15fr .65fr 1.5fr; gap: 14px; }
 .form-actions { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 18px; }
 .server-breadcrumb { margin-bottom: 12px; font-size: 13px; }

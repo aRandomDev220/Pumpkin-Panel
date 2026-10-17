@@ -56,6 +56,7 @@ export interface CreateServerInput {
   name: string;
   game_port: number;
   image_reference: string;
+  image_digest?: string;
 }
 
 export async function listServers(): Promise<{ servers: ServerSummary[] }> {

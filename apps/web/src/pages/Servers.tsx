@@ -4,12 +4,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { createServer, deleteServer, digestWarning, listServers, validateCreateServer } from "../lib/servers";
 
+const RECOMMENDED_IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
+const RECOMMENDED_DIGEST = "sha256:675adcf4f351ed8656385346bf514584b0bb34826f06b553cd16094196d79099";
+
 export default function Servers(): React.JSX.Element {
   const qc = useQueryClient();
   const serversQuery = useQuery({ queryKey: ["servers"], queryFn: listServers });
   const [name, setName] = useState("");
   const [gamePort, setGamePort] = useState("25565");
-  const [imageReference, setImageReference] = useState("");
+  const [imageReference, setImageReference] = useState(RECOMMENDED_IMAGE);
+  const [imageDigest, setImageDigest] = useState(RECOMMENDED_DIGEST);
+  const [customImage, setCustomImage] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [retainData, setRetainData] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -19,7 +24,9 @@ export default function Servers(): React.JSX.Element {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["servers"] });
       setName("");
-      setImageReference("");
+       setImageReference(RECOMMENDED_IMAGE);
+       setImageDigest(RECOMMENDED_DIGEST);
+       setCustomImage(false);
       setFormError(null);
     },
     onError: (err) => setFormError(err instanceof Error ? err.message : "Create failed."),
@@ -41,7 +48,12 @@ export default function Servers(): React.JSX.Element {
       return;
     }
     setFormError(null);
-    createMutation.mutate({ name: name.trim(), game_port: port, image_reference: imageReference.trim() });
+    createMutation.mutate({
+      name: name.trim(),
+      game_port: port,
+      image_reference: imageReference.trim(),
+      image_digest: imageDigest.trim() || undefined,
+    });
   }
 
   const servers = serversQuery.data?.servers ?? [];
@@ -90,14 +102,21 @@ export default function Servers(): React.JSX.Element {
 
       <div className="panel create-panel" id="create-server">
         <h3>Create a server</h3>
-        <p>Use a pinned image reference when possible so updates remain deliberate and reproducible.</p>
-        <form onSubmit={onCreate}>
-          <div className="form-grid">
-            <label>Name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="survival-1" required /></label>
-            <label>Game port<input value={gamePort} onChange={(event) => setGamePort(event.target.value)} inputMode="numeric" placeholder="25565" required /></label>
-            <label>Image reference<input value={imageReference} onChange={(event) => setImageReference(event.target.value)} placeholder="registry.example.com/pumpkin@sha256:…" required /></label>
-          </div>
-          {warning && <p className="warn" role="note">{warning}</p>}
+         <p>Choose a server version below. The recommended build is already pinned and ready to use.</p>
+         <form onSubmit={onCreate}>
+           <div className="form-grid">
+             <label>Name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="survival-1" required /></label>
+             <label>Game port<input value={gamePort} onChange={(event) => setGamePort(event.target.value)} inputMode="numeric" placeholder="25565" required /></label>
+             <label>Server version
+               <select value={customImage ? "custom" : "recommended"} onChange={(event) => setCustomImage(event.target.value === "custom")}>
+                 <option value="recommended">Recommended Pumpkin build</option>
+                 <option value="custom">Custom image (advanced)</option>
+               </select>
+             </label>
+           </div>
+           {!customImage && <p className="subtle-note">Uses the tested Pumpkin build for Linux/amd64. You can change the image later from the server update screen.</p>}
+           {customImage && <label className="advanced-field">Image reference (advanced)<input value={imageReference} onChange={(event) => { setImageReference(event.target.value); setImageDigest(""); }} placeholder="ghcr.io/pumpkin-mc/pumpkin:tag" required /><small>Only allowlisted Pumpkin images are accepted. Use a digest for reproducible updates.</small></label>}
+           {warning && <p className="warn" role="note">{warning}</p>}
           {formError && <p className="err" role="alert">{formError}</p>}
           <div className="form-actions"><button type="submit" disabled={createMutation.isPending}>{createMutation.isPending ? "Creating…" : "Create"}</button></div>
         </form>

@@ -19,7 +19,6 @@ const ADMIN = "e2e-admin";
 const PASSWORD = "password12345";
 const SERVER_NAME = "e2e-journey";
 const GAME_PORT = 26565;
-const IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
 const CONTAINER = "pumpkin-e2e-journey";
 
 let backend: BackendHandle | undefined;
@@ -124,7 +123,6 @@ test.describe.serial("full user journey", () => {
     await page.goto("/servers");
     await page.getByLabel("Name", { exact: true }).fill(SERVER_NAME);
     await page.getByLabel("Game port", { exact: true }).fill(String(GAME_PORT));
-    await page.getByLabel("Image reference", { exact: true }).fill(IMAGE);
     const [createResp] = await Promise.all([
       page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().endsWith("/api/v1/servers"),
