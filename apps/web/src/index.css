@@ -824,6 +824,8 @@ label > span { font-size: 11px; }
   .page-content { padding-top: 27px; }
   .overview-intro { padding: 24px; }
   .server-hero { padding: 20px; }
+  .server-overview-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  .server-search, .server-search input { min-width: 0; }
   .metric-grid, .cards, .host-summary { gap: 8px; }
   .metric-card, .card { padding: 16px; }
   .resource-grid { grid-template-columns: 1fr; }
