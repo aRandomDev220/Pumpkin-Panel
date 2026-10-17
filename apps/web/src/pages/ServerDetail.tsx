@@ -3,7 +3,6 @@ import type { FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import {
-  fetchMetricsSummary,
   fetchServerLogs,
   fetchServerTasks,
   fetchStatus,
@@ -347,16 +346,26 @@ function UpdateSection({
   );
 }
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "n/a";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+function stateLabel(state: string): string {
+  const labels: Record<string, string> = {
+    online: "Online",
+    starting: "Starting",
+    stopping: "Stopping",
+    stopped: "Stopped",
+    unhealthy: "Unhealthy",
+    unknown: "Unknown",
+    running: "Running",
+    exited: "Stopped",
+    missing: "Missing",
+  };
+  return labels[state] ?? state.replaceAll("_", " ");
+}
+
+function readinessClass(state: string): string {
+  if (state === "online") return "badge badge-ok";
+  if (state === "unhealthy" || state === "missing") return "badge badge-err";
+  if (state === "starting" || state === "stopping") return "badge badge-warn";
+  return "badge";
 }
 
 export default function ServerDetail() {
@@ -370,6 +379,7 @@ export default function ServerDetail() {
   const [opError, setOpError] = useState<string | null>(null);
   const [logTail, setLogTail] = useState<number>(200);
   const [copied, setCopied] = useState(false);
+  const [copiedAddress, setCopiedAddress] = useState(false);
   const [historyRange, setHistoryRange] = useState<MetricsRange>("1h");
 
   const serverQuery = useQuery({
@@ -399,13 +409,6 @@ export default function ServerDetail() {
     queryFn: () => fetchServerTasks(id ?? "", 10, 0),
     enabled: !!id,
     retry: 1,
-  });
-
-  const metricsQuery = useQuery({
-    queryKey: ["metrics", "summary"],
-    queryFn: fetchMetricsSummary,
-    retry: 1,
-    staleTime: 10_000,
   });
 
   const historyDetailQuery = useQuery({
@@ -503,6 +506,16 @@ export default function ServerDetail() {
     }
   }
 
+  async function copyAddress(address: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopiedAddress(true);
+      window.setTimeout(() => setCopiedAddress(false), 2000);
+    } catch {
+      setCopiedAddress(false);
+    }
+  }
+
   if (!id) return <p className="err">Missing server id.</p>;
   if (serverQuery.isLoading) return <p>Loading server…</p>;
   if (serverQuery.error || !serverQuery.data)
@@ -511,17 +524,19 @@ export default function ServerDetail() {
   const s = serverQuery.data;
   const st = statusQuery.data;
   const ping = st?.readiness?.ping;
-  const metric = metricsQuery.data?.servers.find((m) => m.server_id === id);
   const opBusy = lifecycleMutation.isPending || activeTaskId !== null;
+  const readiness = st?.readiness;
+  const readinessState = readiness?.state ?? s.observed_state;
+  const connectionAddress = `${window.location.hostname}:${s.game_port}`;
 
   return (
     <section className="server-workspace">
       <p className="server-breadcrumb"><Link to="/servers">Servers</Link> <span className="muted">/ {s.name}</span></p>
       <div className="server-hero">
-        <div>
-          <div className="eyebrow">Server workspace</div>
-          <h2>{s.name}</h2>
-          <div className="server-hero-meta">Port {s.game_port} · {s.image_reference}</div>
+        <div className="server-hero-copy">
+          <div className="eyebrow">Pumpkin world · Server workspace</div>
+          <div className="server-title-row"><span className="server-avatar server-avatar-large" aria-hidden="true">{s.name.slice(0, 1).toUpperCase()}</span><div><h2>{s.name}</h2><div className="server-hero-meta">Pumpkin · Java {s.game_port} · {s.image_reference}</div></div></div>
+          <div className="server-connection"><span className="connection-label">Connect</span><code>{connectionAddress}</code><button className="button-secondary" type="button" onClick={() => void copyAddress(connectionAddress)}>{copiedAddress ? "Copied" : "Copy address"}</button></div>
         </div>
         <div className="server-actions" role="group" aria-label="Lifecycle controls">
           {(["start", "stop", "restart"] as const).map((op) => (
@@ -539,10 +554,12 @@ export default function ServerDetail() {
       </div>
 
       <nav className="server-tabs" aria-label="Server sections">
-        <span className="active">Overview</span>
-        <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Config</Link>
+        <a className="active" href="#overview">Overview</a>
+        <a href="#console">Console & logs</a>
+        <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Configuration</Link>
         <Link to={`/servers/${encodeURIComponent(s.id)}/files`}>Files</Link>
         <a href="#backups">Backups</a>
+        <a href="#metrics">Metrics</a>
       </nav>
       {opFeedback && (
         <p className="muted" role="status">
@@ -560,92 +577,15 @@ export default function ServerDetail() {
         </p>
       )}
 
-      <dl className="panel">
-        <dt>ID</dt>
-        <dd>{s.id}</dd>
-        <dt>Game port</dt>
-        <dd>{s.game_port}</dd>
-        <dt>Image</dt>
-        <dd>{s.image_reference}</dd>
-        <dt>Desired</dt>
-        <dd>
-          <span className="badge">{s.desired_state}</span>
-        </dd>
-        <dt>Observed</dt>
-        <dd>
-          <span className="badge">{s.observed_state}</span>
-        </dd>
-        {s.container_id && (
-          <>
-            <dt>Container</dt>
-            <dd>{s.container_id}</dd>
-          </>
-        )}
-        {s.last_error && (
-          <>
-            <dt>Last error</dt>
-            <dd className="err">{s.last_error}</dd>
-          </>
-        )}
-        <dt>Readiness</dt>
-        <dd>
-          {statusQuery.isLoading && <span className="muted">checking…</span>}
-          {statusQuery.error && <span className="err">Status probe failed.</span>}
-          {st?.readiness && (
-            <span
-              className={
-                st.readiness.state === "online"
-                  ? "badge badge-ok"
-                  : st.readiness.state === "unhealthy"
-                    ? "badge badge-err"
-                    : "badge"
-              }
-              title={st.readiness.reason}
-            >
-              {st.readiness.state}: {st.readiness.reason}
-            </span>
-          )}
-          {st && !st.readiness && (
-            <span className="muted">readiness not reported (backend revision)</span>
-          )}
-        </dd>
-        {ping && (
-          <>
-            <dt>Players</dt>
-            <dd>
-              {ping.players_online} / {ping.players_max}
-            </dd>
-            <dt>Version</dt>
-            <dd>{ping.version}</dd>
-            <dt>Latency</dt>
-            <dd>{ping.latency_ms} ms</dd>
-            <dt>MOTD</dt>
-            <dd>{ping.motd}</dd>
-          </>
-        )}
-        <dt>Metrics</dt>
-        <dd>
-          {metricsQuery.isLoading && <span className="muted">loading…</span>}
-          {(metricsQuery.error || (!metricsQuery.isLoading && !metric)) && (
-            <span className="muted">Metrics unavailable for this server.</span>
-          )}
-          {metric && (
-            <span>
-              CPU{" "}
-              {metric.cpu_percent === null
-                ? "unavailable"
-                : `${metric.cpu_percent.toFixed(1)}%`}
-              {" · "}mem{" "}
-              {metric.memory_bytes === null
-                ? "unavailable"
-                : formatBytes(metric.memory_bytes)}
-              {" · "}{metric.state}
-            </span>
-          )}
-        </dd>
-      </dl>
+      <div id="overview" className="server-summary-grid">
+        <div className="server-summary-card server-summary-status"><span className="summary-label">Readiness</span><strong className={readinessClass(readinessState)}>{stateLabel(readinessState)}</strong><span className="summary-detail">{readiness?.reason ?? "Waiting for a live status probe."}</span></div>
+        <div className="server-summary-card"><span className="summary-label">Players</span><strong>{ping ? `${ping.players_online}/${ping.players_max}` : "—"}</strong><span className="summary-detail">{ping ? `${ping.latency_ms} ms latency` : "Unavailable until online"}</span></div>
+        <div className="server-summary-card"><span className="summary-label">Runtime</span><strong>{ping?.version ?? "Pumpkin"}</strong><span className="summary-detail">{s.image_reference}</span></div>
+        <div className="server-summary-card"><span className="summary-label">Observed state</span><strong>{stateLabel(s.observed_state)}</strong><span className="summary-detail">Desired: {stateLabel(s.desired_state)}</span></div>
+      </div>
+      {s.last_error && <p className="server-error-banner err" role="alert">{s.last_error}</p>}
 
-      <div className="section-heading"><h3>Metrics history</h3><Link className="section-link" to="/monitoring">Full monitoring</Link></div>
+      <div id="metrics" className="section-heading"><h3>Metrics history</h3><Link className="section-link" to="/monitoring">Full monitoring</Link></div>
       <div className="row">
         <label>
           Range{" "}
@@ -673,7 +613,8 @@ export default function ServerDetail() {
         <ServerHistoryPanels samples={historyDetailQuery.data.samples} />
       )}
 
-      <h3>Logs</h3>
+      <div id="console" className="section-heading"><h3>Console & logs</h3><span className="muted">Read-only until Pumpkin command input is verified</span></div>
+      <div className="console-capability"><span className="capability-icon">i</span><span>Pumpkin’s remote command interface is not verified for this build, so this workspace is safely read-only. Live streaming is the next event-layer upgrade.</span></div>
       <div className="row">
         <label>
           Tail{" "}
@@ -709,7 +650,7 @@ export default function ServerDetail() {
         </pre>
       )}
 
-      <h3>Task history</h3>
+      <div className="section-heading"><h3>Task history</h3><span className="muted">Lifecycle and recovery operations</span></div>
       {historyQuery.isLoading && <p>Loading task history…</p>}
       {historyQuery.error && <p className="err">Failed to load task history.</p>}
       {historyQuery.data && historyQuery.data.tasks.length === 0 && (
@@ -731,46 +672,21 @@ export default function ServerDetail() {
         </ul>
       )}
 
-      <h3>Task lookup</h3>
-      <p className="muted">
-        Start/stop/reconcile operations return a task id. Paste it here to poll
-        status via <code>GET /api/v1/tasks/:id</code>.
-      </p>
-      <form onSubmit={onTaskSubmit}>
-        <label>
-          Task ID
-          <input
-            value={taskId}
-            onChange={(e) => setTaskId(e.target.value)}
-            placeholder="task id"
-          />
-        </label>
-        <button type="submit">Check task</button>
-      </form>
-      {taskQuery.isLoading && <p>Loading task…</p>}
-      {taskQuery.error && <p className="err">Task not found or failed to load.</p>}
-      {taskQuery.data && (
-        <dl role="status">
-          <dt>Task</dt>
-          <dd>{taskQuery.data.id}</dd>
-          <dt>Kind</dt>
-          <dd>{taskQuery.data.kind}</dd>
-          <dt>State</dt>
-          <dd>
-            <span className="badge">{taskQuery.data.state}</span>
-          </dd>
-          {taskQuery.data.error && (
-            <>
-              <dt>Error</dt>
-              <dd className="err">{taskQuery.data.error}</dd>
-            </>
-          )}
-        </dl>
-      )}
-      <div id="backups">
+      <details className="advanced-debug">
+        <summary>Advanced task lookup</summary>
+        <p className="muted">Use a task ID from support or audit work when you need to inspect a persisted task directly.</p>
+        <form onSubmit={onTaskSubmit}>
+          <label>Task ID<input value={taskId} onChange={(e) => setTaskId(e.target.value)} placeholder="task id" /></label>
+          <button type="submit">Check task</button>
+        </form>
+        {taskQuery.isLoading && <p>Loading task…</p>}
+        {taskQuery.error && <p className="err">Task not found or failed to load.</p>}
+        {taskQuery.data && <dl role="status"><dt>Task</dt><dd>{taskQuery.data.id}</dd><dt>Kind</dt><dd>{taskQuery.data.kind}</dd><dt>State</dt><dd><span className="badge">{stateLabel(taskQuery.data.state)}</span></dd>{taskQuery.data.error && <><dt>Error</dt><dd className="err">{taskQuery.data.error}</dd></>}</dl>}
+      </details>
+      <div id="backups" className="workspace-section">
         <BackupsSection serverId={s.id} observedState={s.observed_state} />
       </div>
-      <UpdateSection serverId={s.id} server={s} />
+      <div className="workspace-section"><UpdateSection serverId={s.id} server={s} /></div>
     </section>
   );
 }

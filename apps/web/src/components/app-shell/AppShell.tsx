@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchHealth } from "../../lib/api";
 import { isPrivilegedRole } from "../../lib/admin";
 import { useAuth } from "../../lib/auth";
+
+type Theme = "dark" | "light";
 
 type NavItem = {
   label: string;
@@ -19,7 +21,7 @@ const operationalNav: NavItem[] = [
 ];
 
 const adminNav: NavItem[] = [
-  { label: "Users", to: "/users", icon: "users" },
+  { label: "Users & roles", to: "/users", icon: "users" },
   { label: "Audit log", to: "/audit", icon: "list" },
   { label: "Settings", to: "/settings", icon: "settings" },
 ];
@@ -28,10 +30,10 @@ function Icon({ name }: { name: string }): React.JSX.Element {
   const paths: Record<string, React.JSX.Element> = {
     grid: (
       <>
-        <rect x="3" y="3" width="7" height="7" rx="1" />
-        <rect x="14" y="3" width="7" height="7" rx="1" />
-        <rect x="3" y="14" width="7" height="7" rx="1" />
-        <rect x="14" y="14" width="7" height="7" rx="1" />
+        <rect x="3" y="3" width="7" height="7" rx="1.4" />
+        <rect x="14" y="3" width="7" height="7" rx="1.4" />
+        <rect x="3" y="14" width="7" height="7" rx="1.4" />
+        <rect x="14" y="14" width="7" height="7" rx="1.4" />
       </>
     ),
     server: (
@@ -60,12 +62,28 @@ function Icon({ name }: { name: string }): React.JSX.Element {
         <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.1h-2.5v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1A1.7 1.7 0 0 0 8 15a1.7 1.7 0 0 0-1.5-1H6v-2.5h.5A1.7 1.7 0 0 0 8 10a1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V5h2.5v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.1v2.5h-.1a1.7 1.7 0 0 0-1.5 1Z" />
       </>
     ),
+    sun: (
+      <>
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+      </>
+    ),
+    moon: <path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z" />,
   };
 
   return (
     <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
       {paths[name]}
     </svg>
+  );
+}
+
+function PumpkinMark(): React.JSX.Element {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <span className="brand-stem" />
+      <span className="brand-face"><i /><i /><b /></span>
+    </span>
   );
 }
 
@@ -76,17 +94,9 @@ function HealthBadge(): React.JSX.Element {
     refetchInterval: 15_000,
   });
 
-  if (isLoading) {
-    return <span className="health-indicator health-indicator-loading"><span className="status-dot" />Checking system</span>;
-  }
-  if (isError || !data) {
-    return <span className="health-indicator health-indicator-error"><span className="status-dot" />API unreachable</span>;
-  }
-  return (
-    <span className="health-indicator" title={JSON.stringify(data)}>
-      <span className="status-dot" />System healthy
-    </span>
-  );
+  if (isLoading) return <span className="system-status status-loading"><span className="status-dot" />Checking runtime</span>;
+  if (isError || !data) return <span className="system-status status-error"><span className="status-dot" />Runtime unavailable</span>;
+  return <span className="system-status"><span className="status-dot" />Runtime healthy</span>;
 }
 
 function SidebarNav({ items, onNavigate }: { items: NavItem[]; onNavigate: () => void }): React.JSX.Element {
@@ -94,11 +104,9 @@ function SidebarNav({ items, onNavigate }: { items: NavItem[]; onNavigate: () =>
   return (
     <nav className="sidebar-nav" aria-label="Main navigation">
       {items.map((item) => {
-        const active = item.exact
-          ? location.pathname === item.to
-          : location.pathname.startsWith(item.to);
+        const active = item.exact ? location.pathname === item.to : location.pathname.startsWith(item.to);
         return (
-          <Link key={item.to} className={active ? "sidebar-link active" : "sidebar-link"} to={item.to} onClick={onNavigate}>
+          <Link key={item.to} className={active ? "sidebar-link active" : "sidebar-link"} to={item.to} onClick={onNavigate} aria-current={active ? "page" : undefined}>
             <Icon name={item.icon} />
             <span>{item.label}</span>
           </Link>
@@ -108,10 +116,21 @@ function SidebarNav({ items, onNavigate }: { items: NavItem[]; onNavigate: () =>
   );
 }
 
+function initialTheme(): Theme {
+  const saved = window.localStorage.getItem("pumpkin-theme");
+  return saved === "light" ? "light" : "dark";
+}
+
 export default function AppShell({ children }: { children: React.ReactNode }): React.JSX.Element {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("pumpkin-theme", theme);
+  }, [theme]);
 
   async function onLogout(): Promise<void> {
     await logout();
@@ -125,49 +144,48 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
       {sidebarOpen && <button className="sidebar-backdrop" type="button" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
       <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
         <div className="brand-lockup">
-          <span className="brand-mark" aria-hidden="true">P</span>
-          <span>
-            <strong>Pumpkin</strong>
-            <small>Manager</small>
-          </span>
+          <PumpkinMark />
+          <span className="brand-copy"><strong>Pumpkin</strong><small>World control</small></span>
         </div>
 
         <div className="sidebar-section">
-          <span className="sidebar-heading">Workspace</span>
+          <span className="sidebar-heading">Operate</span>
           <SidebarNav items={operationalNav} onNavigate={() => setSidebarOpen(false)} />
         </div>
 
         {isPrivilegedRole(user.role) && (
           <div className="sidebar-section">
-            <span className="sidebar-heading">Administration</span>
+            <span className="sidebar-heading">Administer</span>
             <SidebarNav items={adminNav} onNavigate={() => setSidebarOpen(false)} />
           </div>
         )}
 
         <div className="sidebar-footer">
-          <span className="version-label">Control plane</span>
-          <span className="version-value">v0.1.0</span>
+          <div><span className="version-label">Pumpkin Manager</span><span className="version-value">v0.1.0</span></div>
+          <span className="sidebar-foot-mark">PM</span>
         </div>
       </aside>
 
       <div className="app-main">
         <header className="topbar">
           <button className="menu-toggle" type="button" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
-            <span />
-            <span />
-            <span />
+            <span /><span /><span />
           </button>
-          <div className="topbar-context">Pumpkin control plane</div>
+          <div className="topbar-context"><span className="context-kicker">Control room</span><span className="context-divider">/</span><span>Home node</span></div>
           <div className="topbar-actions">
             <HealthBadge />
+            <button className="theme-toggle" type="button" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+              <Icon name={theme === "dark" ? "sun" : "moon"} />
+              <span>{theme === "dark" ? "Light" : "Dark"}</span>
+            </button>
             <details className="user-menu">
               <summary aria-label="Open user menu">
                 <span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span>
                 <span className="user-summary"><strong>{user.username}</strong><small>{user.role}</small></span>
               </summary>
               <div className="user-menu-popover">
-                <div className="user-menu-meta">Signed in as <strong>{user.username}</strong></div>
-                <button type="button" onClick={() => void onLogout()}>Sign out</button>
+                <div className="user-menu-meta"><span>Signed in as</span><strong>{user.username}</strong></div>
+                <button className="button-secondary" type="button" onClick={() => void onLogout()}>Sign out</button>
               </div>
             </details>
           </div>
