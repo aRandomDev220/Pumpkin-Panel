@@ -394,6 +394,29 @@ pub async fn create_server(
         );
     }
     if let Some(adapter) = &state.adapter {
+        // A fresh manager host usually does not have the selected Pumpkin
+        // image locally. Pull the exact pinned reference before asking Docker
+        // to create the container; otherwise Docker returns a misleading
+        // `No such image` 404 and the UI can only report a generic 502.
+        let pull_ref = runtime::pinned_image_reference(&spec.image_reference, &spec.image_digest);
+        if let Err(e) = adapter.pull_image(&pull_ref).await {
+            let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
+                .bind(&server_id)
+                .execute(&state.pool)
+                .await;
+            audit::record(
+                &state.pool,
+                Some(&user.id),
+                "server.create",
+                "server",
+                &server_id,
+                "failed",
+                &request_id,
+                serde_json::json!({ "name": name, "stage": "image_pull" }),
+            )
+            .await;
+            return runtime_error(e);
+        }
         match adapter.create(&spec).await {
             Ok(handle) => {
                 let _ = sqlx::query(
