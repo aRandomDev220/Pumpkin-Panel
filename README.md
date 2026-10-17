@@ -84,8 +84,9 @@ for CasaOS, [`docs/compatibility/pumpkin-runtime.md`](docs/compatibility/pumpkin
 for the pinned Pumpkin image + capability matrix, and [`docs/security.md`](docs/security.md)
 for the trust model.
 
-> **Heads-up for bind mounts:** Pumpkin runs as UID/GID `2613` inside its container.
-> The manager chowns per-server data dirs where it can; otherwise see the CasaOS guide.
+> **Heads-up for Docker Compose:** `PUMPKIN_MANAGER_DATA_ROOT` defaults to `/data` and is
+> mounted at the same absolute path inside the manager and child containers. If you change
+> it, use an absolute host path and keep the path identical on both sides of the mount.
 
 ## Configuration
 
@@ -94,9 +95,11 @@ Non-secret defaults live in `deploy/.env` (see `deploy/.env.example`):
 | Variable | Default | Purpose |
 |---|---|---|
 | `PUMPKIN_MANAGER_HTTP_PORT` | `8080` | Web UI + API port |
-| `PUMPKIN_MANAGER_DATA_DIR` | `/data/servers` | Per-server world/config data |
-| `PUMPKIN_MANAGER_BACKUP_DIR` | `/data/backups` | Snapshot archives |
-| `PUMPKIN_MANAGER_DATABASE_URL` | `sqlite:/data/…` | Manager database |
+| `PUMPKIN_MANAGER_DATA_ROOT` | `/data` | Shared host-visible state root |
+| `PUMPKIN_MANAGER_DATA_DIR` | `<root>/servers` | Per-server world/config data |
+| `PUMPKIN_MANAGER_BACKUP_DIR` | `<root>/backups` | Snapshot archives |
+| `PUMPKIN_MANAGER_DATABASE_URL` | `sqlite:<root>/…` | Manager database |
+| `PUMPKIN_RUNTIME_USER` | `100:101` | Non-root child container UID/GID |
 | `PUMPKIN_MANAGER_LOG_LEVEL` | `info` | Structured JSON log level |
 
 Secrets are created at first-run setup (owner password) — never shipped or committed.

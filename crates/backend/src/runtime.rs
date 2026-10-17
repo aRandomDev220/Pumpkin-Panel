@@ -26,10 +26,10 @@
 //!
 //! # Deliberate container-security decisions (documented, not accidental)
 //!
-//! * `User` is left **unset**: the Pumpkin image already runs as the
-//!   unprivileged `pumpkin` user. The manager instead ensures the host data
-//!   directory exists before create; the image/deploy entrypoint owns the
-//!   chown to the pumpkin UID (see [`DockerAdapter::create`]).
+//! * The child `User` is normally left **unset** so the Pumpkin image's
+//!   unprivileged user is used. Deployments that share a host-visible data
+//!   root with the manager may set `PUMPKIN_RUNTIME_USER` to a non-root
+//!   numeric `uid[:gid]`, matching the manager's data owner.
 //! * `RestartPolicy` is **`no`**, not `unless-stopped`: the manager (task
 //!   runner + desired-state reconciliation) owns restarts. A daemon-level
 //!   restart policy would fight the manager and resurrect servers an admin
@@ -543,6 +543,41 @@ impl RuntimeError {
     }
 }
 
+/// Validate the deployment-only child user override. Numeric IDs keep the
+/// manager from depending on a username existing in the Pumpkin image, while
+/// rejecting root prevents an environment typo from weakening the container
+/// boundary.
+fn is_valid_runtime_user(value: &str) -> bool {
+    let Some((uid, gid)) = value.split_once(':') else {
+        return false;
+    };
+    let valid_id = |raw: &str| {
+        !raw.is_empty()
+            && raw.bytes().all(|byte| byte.is_ascii_digit())
+            && raw.parse::<u32>().is_ok_and(|id| id != 0)
+    };
+    valid_id(uid) && valid_id(gid)
+}
+
+/// Read the optional child user from deployment environment.
+fn configured_runtime_user() -> Result<Option<String>, RuntimeError> {
+    match std::env::var("PUMPKIN_RUNTIME_USER") {
+        Ok(raw) => {
+            let value = raw.trim();
+            if value.is_empty() || !is_valid_runtime_user(value) {
+                return Err(RuntimeError::InvalidConfiguration(
+                    "PUMPKIN_RUNTIME_USER must be a non-root numeric uid:gid".to_string(),
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(RuntimeError::InvalidConfiguration(
+            "PUMPKIN_RUNTIME_USER must be valid UTF-8".to_string(),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuntimeAdapter trait
 // ---------------------------------------------------------------------------
@@ -610,6 +645,7 @@ pub trait RuntimeAdapter: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct DockerAdapter {
     docker: Docker,
+    runtime_user: Option<String>,
 }
 
 impl DockerAdapter {
@@ -617,20 +653,29 @@ impl DockerAdapter {
     /// manager image mounts from the host.
     pub fn new() -> Result<Self, RuntimeError> {
         let docker = Docker::connect_with_unix_defaults().map_err(RuntimeError::from_bollard)?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            runtime_user: configured_runtime_user()?,
+        })
     }
 
     /// Connect to an explicit socket path (tests / non-standard layouts).
     pub fn connect_socket(path: &str) -> Result<Self, RuntimeError> {
         let docker = Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
             .map_err(RuntimeError::from_bollard)?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            runtime_user: configured_runtime_user()?,
+        })
     }
 
     /// Wrap an existing client (tests, custom transports).
     #[must_use]
     pub fn with_docker(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            runtime_user: None,
+        }
     }
 
     /// Docker container name for a server slug. Always prefixed so manager
@@ -652,14 +697,27 @@ impl DockerAdapter {
 
     /// Build the Docker create body for a validated spec.
     ///
-    /// Security posture (see module docs): no `User` override (image
-    /// already drops to the `pumpkin` user), `RestartPolicy: no` (the
-    /// manager owns restarts), no `ReadonlyRootfs` (Pumpkin writes
+    /// Security posture (see module docs): the default has no `User` override
+    /// (the image already drops to the `pumpkin` user), `RestartPolicy: no`
+    /// (the manager owns restarts), no `ReadonlyRootfs` (Pumpkin writes
     /// `/pumpkin`), `CapDrop: [ALL]` + `no-new-privileges`, and console
     /// I/O enabled (`OpenStdin`/`StdinOnce`/`Tty`) because the web
     /// console attaches to the container's stdio.
     #[must_use]
     pub fn build_create_config(spec: &ValidatedServerSpec) -> Config<String> {
+        Self::build_create_config_with_runtime_user(spec, None)
+    }
+
+    /// Build a create body, optionally overriding the image's default user.
+    ///
+    /// The override is deployment configuration, never user input. It exists
+    /// for bind-mounted deployments where the manager and child must share a
+    /// host-visible data root and therefore need the same numeric owner.
+    #[must_use]
+    pub fn build_create_config_with_runtime_user(
+        spec: &ValidatedServerSpec,
+        runtime_user: Option<&str>,
+    ) -> Config<String> {
         let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::from([
             (
                 format!("{CONTAINER_JAVA_PORT}/tcp"),
@@ -694,7 +752,8 @@ impl DockerAdapter {
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             // Deliberately unset: ReadonlyRootfs (Pumpkin writes
             // /pumpkin + logs), Privileged/CapAdd (never), NetworkMode
-            // (default bridge), User (image already USER pumpkin).
+            // (default bridge). The optional User override is validated when
+            // the Docker adapter is constructed from deployment environment.
             ..Default::default()
         };
 
@@ -715,8 +774,7 @@ impl DockerAdapter {
             stop_timeout: Some(STOP_TIMEOUT_SECS),
             labels: Some(Self::labels(&spec.server_id.to_string())),
             host_config: Some(host_config),
-            // Deliberately unset: `user` (image already USER pumpkin;
-            // caller ensures the host dir exists — see `create`).
+            user: runtime_user.map(str::to_owned),
             ..Default::default()
         }
     }
@@ -739,7 +797,8 @@ impl RuntimeAdapter for DockerAdapter {
                 .map_err(|e| RuntimeError::Io(e.to_string()))?;
 
             let name = Self::container_name(&spec.slug);
-            let config = Self::build_create_config(&spec);
+            let config =
+                Self::build_create_config_with_runtime_user(&spec, self.runtime_user.as_deref());
             let options = CreateContainerOptions {
                 name: name.clone(),
                 platform: None,
@@ -1427,6 +1486,19 @@ mod tests {
 
         let labels = cfg.labels.expect("labels");
         assert_eq!(labels.get(LABEL_MANAGED).map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn runtime_user_override_is_non_root_and_numeric() {
+        assert!(is_valid_runtime_user("100:101"));
+        assert!(is_valid_runtime_user("2613:2613"));
+        for invalid in ["", "100", "100:", ":101", "0:101", "100:0", "app:app"] {
+            assert!(!is_valid_runtime_user(invalid), "must reject {invalid:?}");
+        }
+
+        let spec = validate_spec(input(), &root()).expect("valid");
+        let cfg = DockerAdapter::build_create_config_with_runtime_user(&spec, Some("100:101"));
+        assert_eq!(cfg.user.as_deref(), Some("100:101"));
     }
 
     #[test]

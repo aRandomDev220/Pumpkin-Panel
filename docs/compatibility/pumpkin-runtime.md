@@ -8,7 +8,10 @@ Reported version at boot: `Pumpkin 0.2.0+26.3-26.51`, Java proto 777, Bedrock 21
 
 ## Verified facts
 
-- Startup command: `ENTRYPOINT ["pumpkin"]`, `WORKDIR /pumpkin`, user `pumpkin:pumpkin (2613:2613)`.
+- Startup command: `ENTRYPOINT ["pumpkin"]`, `WORKDIR /pumpkin`, image default user
+  `pumpkin:pumpkin (2613:2613)`. The packaged Compose deployment overrides this
+  with its non-root manager owner (`PUMPKIN_RUNTIME_USER=100:101`) so the
+  host-visible bind mount is writable by both containers.
 - Persistent mount: `/pumpkin`. Generates `pumpkin.toml` (233 lines), `world/`, `data/`, `logs/latest.log`, `plugins/`, `nethernet-key.der` on first boot.
 - Ports observed: `25565/tcp` Java, `19132/udp` Bedrock (+19133 IPv6, 7551 LAN discovery in logs).
 - Logs: stdout/stderr usable (JSON-ish console). File log at `logs/latest.log` with rotation (`*.log.gz`).
@@ -40,6 +43,8 @@ Reported version at boot: `Pumpkin 0.2.0+26.3-26.51`, Java proto 777, Bedrock 21
 1. Pin image by digest, not `:master`. Surface configured reference + digest per server.
 2. Readiness = MC status ping success, not container `running` or `healthy`.
 3. Child spec must set `stdin_open:true tty:true`, `stop_grace ~35s`, explicit port pair (Java+Bedrock), `/pumpkin` volume, labels `io.pumpkin-manager.*`.
-4. UID 2613 owns files in volume — manager file-service runs as host root or same UID mapping, else `Permission denied`. Prefer named volumes by default; document `chown -R 2613:2613` for bind mounts (CasaOS guide).
+4. The manager and child containers must share the same numeric owner for the
+   host-visible bind mount. The packaged deployment uses `100:101` for both;
+   custom images must set `PUMPKIN_RUNTIME_USER` to their manager UID/GID.
 5. Set `color=false` or strip ANSI when ingesting logs; keep `latest.log` as fallback source.
 6. Do not add RCON UI until a build emits `[networking.rcon]` and it is exercised with password auth + command round-trip.

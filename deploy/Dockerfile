@@ -37,8 +37,8 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh \
 ENV PUMPKIN_MANAGER_HTTP_PORT=8080 \
     PUMPKIN_MANAGER_DATA_DIR=/data/servers \
     PUMPKIN_MANAGER_BACKUP_DIR=/data/backups \
+    PUMPKIN_RUNTIME_USER=100:101 \
     PUMPKIN_MANAGER_LOG_LEVEL=info
 EXPOSE 8080
-VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8080/api/v1/health/live || exit 1
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
