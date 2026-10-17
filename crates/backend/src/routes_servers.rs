@@ -632,6 +632,20 @@ pub async fn update_server_settings(
     {
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     }
+    if conflicting_task(&state.pool, &id).await {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "a task is already queued/running for this server",
+        );
+    }
+    let Some(_guard) = op_lock::try_acquire(&state.op_locks, &id).await else {
+        return error(
+            StatusCode::CONFLICT,
+            "SERVER_BUSY",
+            "another operation is in flight for this server",
+        );
+    };
     if let Err(e) = ensure_server_settings(&state.pool, &id).await {
         tracing::warn!(server_id = %id, error = %e, "failed to ensure server settings");
         return error(
@@ -932,7 +946,8 @@ async fn lifecycle_inner(
 
 /// GET /api/v1/servers/:id/status — desired state, live observed state,
 /// and game readiness from a protocol ping (never container existence
-/// alone). A stopped server reports `stopped`, never `unhealthy`.
+/// alone). A stopped server reports `stopped`, never `unhealthy`; when Docker
+/// is unavailable the readiness is `unknown` and marked stale.
 pub async fn server_status(
     State(state): State<AppState>,
     _user: AuthUser,
@@ -944,6 +959,7 @@ pub async fn server_status(
     let mut observed = server.observed_state.clone();
     let mut container: serde_json::Value = serde_json::Value::Null;
     let mut docker_available = state.adapter.is_some();
+    let mut runtime_state_verified = state.adapter.is_some();
     let mut exit_code: Option<i64> = None;
     if let Some(adapter) = &state.adapter {
         if server.container_id.is_empty() {
@@ -970,8 +986,10 @@ pub async fn server_status(
                 }
                 Err(e) if is_daemon_down(&e) => {
                     docker_available = false;
+                    runtime_state_verified = false;
                 }
                 Err(e) => {
+                    runtime_state_verified = false;
                     tracing::warn!(server_id = %server.id, error = %e, "status inspect failed");
                 }
             }
@@ -981,7 +999,7 @@ pub async fn server_status(
     // `bind_address` may be a LAN IP unreachable from here, so ping
     // localhost — the published port answers there for 0.0.0.0 bindings.
     let mut ping_json = serde_json::Value::Null;
-    if observed == "running" {
+    if runtime_state_verified && observed == "running" {
         match crate::readiness::ping_java(
             "127.0.0.1",
             server.game_port as u16,
@@ -1004,8 +1022,14 @@ pub async fn server_status(
         }
     }
     let ping_ok = !ping_json.is_null();
-    let (readiness_state, reason) =
-        readiness_for(&server.desired_state, &observed, exit_code, ping_ok);
+    let (readiness_state, reason) = if runtime_state_verified {
+        readiness_for(&server.desired_state, &observed, exit_code, ping_ok)
+    } else {
+        (
+            "unknown",
+            "Docker runtime unavailable; live server state is stale".to_string(),
+        )
+    };
     Json(serde_json::json!({
         "id": server.id,
         "desired_state": server.desired_state,
@@ -1016,6 +1040,7 @@ pub async fn server_status(
             "ping": ping_json,
         },
         "docker_available": docker_available,
+        "runtime_state_stale": !runtime_state_verified,
         "container": container,
     }))
     .into_response()

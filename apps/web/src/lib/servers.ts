@@ -187,6 +187,7 @@ export interface ServerStatus {
   observed_state: string;
   readiness?: ReadinessInfo | null;
   docker_available: boolean;
+  runtime_state_stale?: boolean;
   container: ServerContainerView | null;
 }
 

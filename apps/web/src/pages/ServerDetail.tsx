@@ -626,10 +626,15 @@ export default function ServerDetail() {
 
   const s = serverQuery.data;
   const st = statusQuery.data;
-  const ping = st?.readiness?.ping;
+  const runtimeStale = statusQuery.isError || st?.runtime_state_stale === true;
+  const ping = runtimeStale ? null : st?.readiness?.ping;
   const opBusy = lifecycleMutation.isPending || activeTaskId !== null;
-  const readiness = st?.readiness;
-  const readinessState = readiness?.state ?? s.observed_state;
+  const readiness = runtimeStale ? null : st?.readiness;
+  const readinessState = runtimeStale ? "unknown" : readiness?.state ?? s.observed_state;
+  const observedState = runtimeStale ? "unknown" : s.observed_state;
+  const readinessReason = statusQuery.isError
+    ? "Live status unavailable; cached state is not current."
+    : st?.readiness?.reason ?? "Waiting for a live status probe.";
   const connectionAddress = `${window.location.hostname}:${s.game_port}`;
 
   return (
@@ -681,10 +686,10 @@ export default function ServerDetail() {
       )}
 
       <div id="overview" className="server-summary-grid">
-        <div className="server-summary-card server-summary-status"><span className="summary-label">Readiness</span><strong className={readinessClass(readinessState)}>{stateLabel(readinessState)}</strong><span className="summary-detail">{readiness?.reason ?? "Waiting for a live status probe."}</span></div>
+         <div className="server-summary-card server-summary-status"><span className="summary-label">Readiness</span><strong className={readinessClass(readinessState)}>{stateLabel(readinessState)}</strong><span className="summary-detail">{readinessReason}</span></div>
         <div className="server-summary-card"><span className="summary-label">Players</span><strong>{ping ? `${ping.players_online}/${ping.players_max}` : "—"}</strong><span className="summary-detail">{ping ? `${ping.latency_ms} ms latency` : "Unavailable until online"}</span></div>
         <div className="server-summary-card"><span className="summary-label">Runtime</span><strong>{ping?.version ?? "Pumpkin"}</strong><span className="summary-detail">{s.image_reference}</span></div>
-        <div className="server-summary-card"><span className="summary-label">Observed state</span><strong>{stateLabel(s.observed_state)}</strong><span className="summary-detail">Desired: {stateLabel(s.desired_state)}</span></div>
+         <div className="server-summary-card"><span className="summary-label">Observed state</span><strong>{stateLabel(observedState)}</strong><span className="summary-detail">Desired: {stateLabel(s.desired_state)}</span></div>
       </div>
       {s.last_error && <p className="server-error-banner err" role="alert">{s.last_error}</p>}
 

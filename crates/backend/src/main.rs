@@ -756,8 +756,8 @@ async fn sync_observed(pool: &SqlitePool, adapter: &DockerAdapter) {
 /// who stops a world stays in control until the next boot, and every start is
 /// still represented by a persisted task.
 async fn schedule_auto_start_servers(pool: &SqlitePool, runner: &task_runner::RunnerHandle) {
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT s.id
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.id, s.observed_state
          FROM servers s
          JOIN server_settings ss ON ss.server_id = s.id
          WHERE s.deleted_at IS NULL AND ss.auto_start = 1 AND s.container_id != ''",
@@ -766,7 +766,11 @@ async fn schedule_auto_start_servers(pool: &SqlitePool, runner: &task_runner::Ru
     .await
     .unwrap_or_default();
 
-    for server_id in rows {
+    for (server_id, observed_state) in rows {
+        if !should_queue_auto_start(&observed_state) {
+            tracing::debug!(server_id = %server_id, observed_state = %observed_state, "auto-start skipped for current runtime state");
+            continue;
+        }
         let in_flight: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks
              WHERE server_id = ? AND state IN ('queued', 'running')",
@@ -803,6 +807,10 @@ async fn schedule_auto_start_servers(pool: &SqlitePool, runner: &task_runner::Ru
             }
         }
     }
+}
+
+fn should_queue_auto_start(observed_state: &str) -> bool {
+    matches!(observed_state, "created" | "exited" | "stopped")
 }
 
 /// Serves the Vite build (`apps/web/dist`) when bundled in the single
@@ -931,7 +939,7 @@ fn db_path_parent(url: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use crate::AppState;
+    use crate::{should_queue_auto_start, AppState};
     use sqlx::SqlitePool;
 
     async fn empty_pool() -> SqlitePool {
@@ -985,5 +993,15 @@ mod tests {
         assert!(res.text().contains("SPA-INDEX-MARKER"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_start_skips_running_and_missing_containers() {
+        assert!(should_queue_auto_start("created"));
+        assert!(should_queue_auto_start("exited"));
+        assert!(should_queue_auto_start("stopped"));
+        assert!(!should_queue_auto_start("running"));
+        assert!(!should_queue_auto_start("missing"));
+        assert!(!should_queue_auto_start("unknown"));
     }
 }

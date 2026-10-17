@@ -70,20 +70,37 @@ async fn make_server(server: &TestServer, token: &str, name: &str, port: u16) ->
 
 #[tokio::test]
 async fn status_reports_readiness_not_container_existence() {
-    let (server, _) = test_server().await;
+    let (server, pool) = test_server().await;
     let t = owner_token(&server).await;
     let id = make_server(&server, &t, "ready1", 25565).await;
 
-    // No container, desired stopped → readiness "stopped", never "online".
+    // Without a Docker runtime, even a clean desired stop is unknown rather
+    // than fabricated from stale database state.
     let status = server
         .get(&format!("/api/v1/servers/{id}/status"))
         .authorization_bearer(&t)
         .await
         .json::<Value>();
     assert_eq!(status["desired_state"], json!("stopped"));
-    assert_eq!(status["readiness"]["state"], json!("stopped"));
+    assert_eq!(status["readiness"]["state"], json!("unknown"));
     assert_eq!(status["readiness"]["ping"], json!(null));
+    assert_eq!(status["runtime_state_stale"], json!(true));
     assert_ne!(status["readiness"]["state"], json!("online"));
+
+    // A stale persisted running state must not become online while Docker is
+    // unavailable, even if another process happens to answer the port.
+    sqlx::query("UPDATE servers SET observed_state = 'running' WHERE id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stale_status = server
+        .get(&format!("/api/v1/servers/{id}/status"))
+        .authorization_bearer(&t)
+        .await
+        .json::<Value>();
+    assert_eq!(stale_status["readiness"]["state"], json!("unknown"));
+    assert_eq!(stale_status["readiness"]["ping"], json!(null));
 }
 
 #[tokio::test]

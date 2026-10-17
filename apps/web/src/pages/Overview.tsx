@@ -115,7 +115,12 @@ export default function Overview(): React.JSX.Element {
     if (status) statusById.set(server.id, { dockerAvailable: status.docker_available, containerMissing: status.container === null || status.observed_state === "missing" });
   });
   const alerts = buildAlerts(servers, statusById, statusQueries.some((query) => query.isError));
-  const readinessStates = servers.map((server, index) => statusQueries[index]?.data?.readiness?.state ?? server.observed_state);
+  const readinessStates = servers.map((server, index) => {
+    const statusQuery = statusQueries[index];
+    return statusQuery?.isError || statusQuery?.data?.runtime_state_stale
+      ? "unknown"
+      : statusQuery?.data?.readiness?.state ?? server.observed_state;
+  });
   const onlineCount = readinessStates.filter((state) => state === "online").length;
   const activeCount = readinessStates.filter((state) => state === "online" || state === "starting" || state === "stopping").length;
   const drifted = servers.filter((server) => server.desired_state !== server.observed_state).length;
@@ -177,10 +182,12 @@ export default function Overview(): React.JSX.Element {
               {servers.map((server, index) => {
                 const status = statusQueries[index]?.data;
                 const readiness = status?.readiness;
-                const state = readiness?.state ?? server.observed_state;
+                 const state = statusQueries[index]?.isError || statusQueries[index]?.data?.runtime_state_stale
+                   ? "unknown"
+                   : readiness?.state ?? server.observed_state;
                 return <div className={shelfClass(state)} key={server.id}>
                   <div><Link className="server-name" to={`/servers/${encodeURIComponent(server.id)}`}>{server.name}</Link><div className="server-meta">Java {server.game_port} · desired {stateLabel(server.desired_state)}</div></div>
-                  <div className="server-state">{statusQueries[index]?.isLoading ? <span className="muted">Checking…</span> : <ReadinessBadge readiness={readiness} observed={server.observed_state} />}</div>
+                   <div className="server-state">{statusQueries[index]?.isLoading ? <span className="muted">Checking…</span> : <ReadinessBadge readiness={readiness} observed={statusQueries[index]?.isError || statusQueries[index]?.data?.runtime_state_stale ? "unknown" : server.observed_state} />}</div>
                   <div className="server-stat"><strong>{readiness?.ping ? `${readiness.ping.players_online}/${readiness.ping.players_max}` : "—"}</strong><small>players</small></div>
                   <Link className="section-link" to={`/servers/${encodeURIComponent(server.id)}`}>Open</Link>
                 </div>;

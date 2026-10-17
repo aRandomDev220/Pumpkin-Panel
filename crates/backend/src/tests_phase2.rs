@@ -186,6 +186,24 @@ async fn server_crud_without_docker() {
         .json(&json!({ "cpu_limit": 32.0 }))
         .await;
     assert_eq!(invalid_settings.status_code(), 422);
+    let busy_task = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO tasks (id, type, server_id, state) VALUES (?, 'update', ?, 'queued')")
+        .bind(&busy_task)
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let busy_settings = server
+        .patch(&format!("/api/v1/servers/{id}/settings"))
+        .authorization_bearer(&t)
+        .json(&json!({ "cpu_limit": 3.0 }))
+        .await;
+    assert_eq!(busy_settings.status_code(), 409);
+    sqlx::query("DELETE FROM tasks WHERE id = ?")
+        .bind(&busy_task)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Port (and adjacent bedrock port) cannot be double-allocated.
     for port in [25565u16, 25566u16] {
@@ -315,6 +333,23 @@ async fn rbac_matrix() {
         .authorization_bearer(&viewer)
         .await;
     assert_eq!(vdel.status_code(), 403);
+    assert_eq!(
+        server
+            .get(&format!("/api/v1/servers/{id}/settings"))
+            .authorization_bearer(&viewer)
+            .await
+            .status_code(),
+        200
+    );
+    assert_eq!(
+        server
+            .patch(&format!("/api/v1/servers/{id}/settings"))
+            .authorization_bearer(&viewer)
+            .json(&json!({ "cpu_limit": 1.0 }))
+            .await
+            .status_code(),
+        403
+    );
 
     // Users/audit are owner(+admin for audit)-gated.
     assert_eq!(

@@ -94,7 +94,9 @@ export default function Servers(): React.JSX.Element {
           {servers.map((server) => {
             const index = allServers.findIndex((item) => item.id === server.id);
             const readiness = statusQueries[index]?.data?.readiness;
-            const state = readiness?.state ?? server.observed_state;
+             const state = statusQueries[index]?.isError || statusQueries[index]?.data?.runtime_state_stale
+               ? "unknown"
+               : readiness?.state ?? server.observed_state;
             const drifted = server.desired_state !== server.observed_state;
             return <li className="server-list-item" key={server.id}>
               <div className={`server-list-main ${state === "online" ? "is-running" : ""} ${drifted ? "is-drifted" : ""}`} aria-label={`${server.name} server`}>
