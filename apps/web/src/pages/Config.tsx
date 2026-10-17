@@ -12,6 +12,7 @@ import {
   validateConfig,
 } from "../lib/config";
 import type { GuidedConfig } from "../lib/config";
+import { getServer } from "../lib/servers";
 
 function formatTomlValue(value: string | number | boolean): string {
   if (typeof value === "boolean") return value ? "true" : "false";
@@ -163,6 +164,13 @@ export default function Config() {
     retry: 1,
   });
 
+  const serverQuery = useQuery({
+    queryKey: ["servers", id],
+    queryFn: () => getServer(id ?? ""),
+    enabled: !!id,
+    retry: 1,
+  });
+
   const revisionsQuery = useQuery({
     queryKey: ["servers", id, "config", "revisions"],
     queryFn: () => listConfigRevisions(id ?? ""),
@@ -248,12 +256,23 @@ export default function Config() {
   const dirty = syncedRevision !== null && data != null && content !== data.content;
 
   return (
-    <section>
-      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Server workspace</Link> <span className="muted">/ Config</span></p>
-      <div className="page-heading">
-        <div><div className="eyebrow">Server configuration</div><h2>Config</h2><p>Use guided settings for common changes or edit the complete TOML when you need control over every key.</p></div>
-        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/files`}><button className="button-secondary" type="button">Open files</button></Link></div>
+    <section className="workspace-page">
+      <div className="workspace-page-context">
+        <Link to={`/servers/${encodeURIComponent(id)}`}>← {serverQuery.data?.name ?? "Server workspace"}</Link>
+        <span className="workspace-context-divider">/</span>
+        <span>Configuration</span>
       </div>
+      <div className="workspace-page-heading">
+        <div className="workspace-title-row"><span className="server-avatar" aria-hidden="true">{(serverQuery.data?.name ?? "P").slice(0, 1).toUpperCase()}</span><div><div className="eyebrow">Pumpkin world · Configuration</div><h2>Shape the world</h2><p>Use guided settings for safe common changes, or edit the complete TOML when you need control over every key.</p></div></div>
+        <div className="heading-actions"><Link className="button-link" to={`/servers/${encodeURIComponent(id)}`}>Back to overview</Link></div>
+      </div>
+      <nav className="workspace-tabs" aria-label="Server sections">
+        <Link to={`/servers/${encodeURIComponent(id)}`}>Overview</Link>
+        <a href={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</a>
+        <span className="active">Configuration</span>
+        <Link to={`/servers/${encodeURIComponent(id)}/files`}>Files</Link>
+        <a href={`/servers/${encodeURIComponent(id)}#backups`}>Backups</a>
+      </nav>
 
       {configQuery.isLoading && <p>Loading config…</p>}
       {configQuery.error && <p className="err">Failed to load config.</p>}
@@ -321,14 +340,14 @@ export default function Config() {
             {dirty ? " · unsaved changes" : " · no unsaved changes"}
           </p>
 
-           <div className="section-heading"><h3>Guided settings</h3><span className="muted">Common server controls</span></div>
+            <div className="config-section-heading"><div><div className="eyebrow">Safe defaults</div><h3>Guided settings</h3><p>These controls map to fields verified for the active Pumpkin profile.</p></div><span className="config-section-state">{data.profile?.known === false ? "Profile unknown" : "Profile-aware"}</span></div>
           <p className="muted">
             Editing a guided field patches the raw TOML below. Top-level fields edit the
             document preamble; fields marked “Java + Bedrock” are written to both{" "}
             <code>[networking.java]</code> and <code>[networking.bedrock]</code> together —
             use raw TOML for per-edition control.
           </p>
-          <div className="row">
+           <div className="guided-grid">
             <label>
               Seed{" "}
               <input
@@ -361,8 +380,8 @@ export default function Config() {
                 placeholder="world"
               />
             </label>
-          </div>
-          <div className="row">
+           </div>
+           <div className="guided-grid guided-grid-toggles">
             <label>
               <input
                 type="checkbox"
@@ -395,8 +414,8 @@ export default function Config() {
               />{" "}
               Online mode (Java + Bedrock)
             </label>
-          </div>
-          <div className="row">
+           </div>
+           <div className="guided-grid guided-grid-performance">
             <label>
               TPS{" "}
               <input
@@ -443,9 +462,9 @@ export default function Config() {
             </label>
           </div>
 
-           <div className="section-heading"><h3>Raw TOML</h3><span className="muted">Preserves unknown keys</span></div>
-           <label className="config-editor">
-            <span className="muted">revision {data.revision} content</span>
+            <div className="config-section-heading raw-config-heading"><div><div className="eyebrow">Full control</div><h3>Raw TOML</h3><p>Unknown keys are preserved. Save is atomic and revision-checked.</p></div><span className="config-section-state">revision {data.revision}</span></div>
+            <label className="config-editor">
+             <span className="config-editor-label"><span>pumpkin.toml</span><span className="muted">{dirty ? "Unsaved changes" : "Synced"}</span></span>
             <textarea
               value={content}
               onChange={(e) => setContent(e.target.value)}
@@ -455,7 +474,7 @@ export default function Config() {
               style={{ display: "block", width: "100%", fontFamily: "monospace" }}
             />
           </label>
-          <div className="row">
+           <div className="config-actions">
             <button
               type="button"
               disabled={validateMutation.isPending}
@@ -496,7 +515,7 @@ export default function Config() {
             </div>
           )}
 
-           <div className="section-heading"><h3>Revision history</h3><span className="muted">{revisionsQuery.data?.total ?? 0} revisions</span></div>
+           <div className="config-section-heading revision-heading"><div><div className="eyebrow">Recovery</div><h3>Revision history</h3><p>Review or restore a previous configuration snapshot.</p></div><span className="config-section-state">{revisionsQuery.data?.total ?? 0} revisions</span></div>
           {revisionsQuery.isLoading && <p>Loading revisions…</p>}
           {revisionsQuery.error && <p className="err">Failed to load revisions.</p>}
           {revisionsQuery.data && revisionsQuery.data.revisions.length === 0 && (

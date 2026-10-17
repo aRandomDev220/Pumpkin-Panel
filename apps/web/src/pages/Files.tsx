@@ -191,13 +191,24 @@ export default function Files() {
   }
 
   return (
-    <section>
-      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Servers / {serverQuery.data?.name ?? "server"}</Link> <span className="muted">/ Files</span></p>
-      <div className="page-heading">
-        <div><div className="eyebrow">Server files</div><h2>Files</h2><p>Browse the server data directory, move files safely, and import or export archives.</p></div>
-        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/config`}><button className="button-secondary" type="button">Open config</button></Link></div>
+    <section className="workspace-page">
+      <div className="workspace-page-context">
+        <Link to={`/servers/${encodeURIComponent(id)}`}>← {serverQuery.data?.name ?? "Server workspace"}</Link>
+        <span className="workspace-context-divider">/</span>
+        <span>Files</span>
       </div>
-      <div className="files-toolbar"><span className="muted" title="Relative path">Current path <code>{displayPath(path)}</code></span><div className="row"><button type="button" onClick={() => void onExport()}>Export current folder</button><label title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>Import archive<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing} /></label></div></div>
+      <div className="workspace-page-heading">
+        <div className="workspace-title-row"><span className="server-avatar" aria-hidden="true">{(serverQuery.data?.name ?? "P").slice(0, 1).toUpperCase()}</span><div><div className="eyebrow">Pumpkin world · Files</div><h2>World files</h2><p>Browse the protected server root, edit files safely, and move worlds in or out as archives.</p></div></div>
+        <div className="heading-actions"><Link className="button-link" to={`/servers/${encodeURIComponent(id)}/config`}>Open configuration</Link></div>
+      </div>
+      <nav className="workspace-tabs" aria-label="Server sections">
+        <Link to={`/servers/${encodeURIComponent(id)}`}>Overview</Link>
+        <a href={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</a>
+        <Link to={`/servers/${encodeURIComponent(id)}/config`}>Configuration</Link>
+        <span className="active">Files</span>
+        <a href={`/servers/${encodeURIComponent(id)}#backups`}>Backups</a>
+      </nav>
+      <div className="files-toolbar"><div className="files-path-summary"><span className="eyebrow">Protected root</span><code>{displayPath(path)}</code><span className="muted">Server must be stopped before importing an archive.</span></div><div className="files-toolbar-actions"><button className="button-secondary" type="button" onClick={() => void onExport()}>Export folder</button><label className="file-action-button" title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>Import archive<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing} /></label></div></div>
 
       <nav aria-label="Breadcrumb" className="path-breadcrumb">
         <button type="button" onClick={() => setPath("")}>
@@ -235,6 +246,8 @@ export default function Files() {
         <p className="muted">Empty directory.</p>
       )}
       {filesQuery.data && filesQuery.data.entries.length > 0 && (
+        <div className="file-browser-panel">
+        <div className="file-browser-toolbar"><strong>{filesQuery.data.entries.length} entries</strong><span className="muted">Files stay inside this server’s assigned data root.</span></div>
         <div className="table-scroll">
         <table className="table">
           <thead>
@@ -299,26 +312,18 @@ export default function Files() {
           </tbody>
         </table>
         </div>
+        </div>
       )}
 
-      <div className="section-heading"><h3>Upload</h3><span className="muted">Add a file to the current folder</span></div>
-      <div className="row">
-        <label>
-          Upload file{" "}
-          <input type="file" onChange={(e) => void onUpload(e)} disabled={uploading} />
-        </label>
-        {uploading && <span className="muted">Uploading…</span>}
+      <div className="file-actions-grid">
+      <div className="file-action-panel"><div className="eyebrow">Bring files in</div><h3>Upload a file</h3><p className="muted">Add a file to <code>{displayPath(path)}</code>. Large uploads are streamed by the manager.</p><label className="file-dropzone"><span>{uploading ? "Uploading…" : "Choose a file"}</span><small>Any file type · max 1 GiB</small><input type="file" onChange={(e) => void onUpload(e)} disabled={uploading} /></label></div>
+      <div className="file-action-panel"><div className="eyebrow">Create a folder</div><h3>New directory</h3><p className="muted">Create a folder in the current path for worlds, configs, or server assets.</p>
+        <form className="inline-file-form" onSubmit={onMkdir}>
+          <label>Name<input value={mkdirName} onChange={(e) => setMkdirName(e.target.value)} placeholder="dirname" /></label>
+          <button type="submit" disabled={mkdirMutation.isPending}>{mkdirMutation.isPending ? "Creating…" : "Create"}</button>
+        </form>
       </div>
-
-      <div className="section-heading"><h3>New directory</h3><span className="muted">Create a folder in the current path</span></div>
-      <form onSubmit={onMkdir}>
-        <label>
-          Name <input value={mkdirName} onChange={(e) => setMkdirName(e.target.value)} placeholder="dirname" />
-        </label>{" "}
-        <button type="submit" disabled={mkdirMutation.isPending}>
-          {mkdirMutation.isPending ? "Creating…" : "Create"}
-        </button>
-      </form>
+      </div>
 
       {renameSource && (
         <>
@@ -347,7 +352,8 @@ export default function Files() {
         </>
       )}
 
-      <div className="section-heading"><h3>Import / export</h3><span className="muted">Archive the current path</span></div>
+      <div className="file-safety-note">
+      <div className="eyebrow">Safety boundary</div>
       <p className="muted">
         server desired_state:{" "}
         {serverQuery.isLoading ? "loading…" : (desiredState ?? "unknown")}
@@ -359,6 +365,7 @@ export default function Files() {
           server before importing an archive.
         </p>
       )}
+      </div>
     </section>
   );
 }
