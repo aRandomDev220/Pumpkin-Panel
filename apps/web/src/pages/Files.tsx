@@ -206,10 +206,10 @@ export default function Files() {
       </div>
       <nav className="workspace-tabs" aria-label="Server sections">
         <Link to={`/servers/${encodeURIComponent(id)}`}>Overview</Link>
-        <a href={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</a>
+        <Link to={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</Link>
         <Link to={`/servers/${encodeURIComponent(id)}/config`}>Configuration</Link>
         <span className="active">Files</span>
-        <a href={`/servers/${encodeURIComponent(id)}#backups`}>Backups</a>
+        <Link to={`/servers/${encodeURIComponent(id)}#backups`}>Backups</Link>
       </nav>
        <div className="files-toolbar"><div className="files-path-summary"><span className="eyebrow">Protected root</span><code>{displayPath(path)}</code><span className="muted">Server must be stopped before importing an archive.</span></div><div className="files-toolbar-actions"><button className="button-secondary" type="button" onClick={() => void onExport()}>Export folder</button><label className={importBlocked ? "file-action-button is-disabled" : "file-action-button"} title={!canWrite ? "Your role cannot modify files" : importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>{!canWrite ? "Import archive" : importBlocked ? "Stop server to import" : importing ? "Importing…" : "Import archive"}<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing || !canWrite} /></label></div></div>
 

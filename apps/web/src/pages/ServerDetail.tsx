@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import {
+  fetchCapabilities,
   fetchServerLogs,
   fetchServerSettings,
   fetchServerTasks,
@@ -678,6 +679,13 @@ export default function ServerDetail() {
   });
 
   const hasContainer = Boolean(serverQuery.data?.container_id);
+  const capabilitiesQuery = useQuery({
+    queryKey: ["servers", id, "capabilities"],
+    queryFn: () => fetchCapabilities(id ?? ""),
+    enabled: !!id,
+    retry: 1,
+  });
+
   const logsQuery = useQuery({
     queryKey: ["servers", id, "logs", logTail],
     queryFn: () => fetchServerLogs(id ?? "", logTail),
@@ -911,7 +919,21 @@ export default function ServerDetail() {
       )}
 
       <div id="console" className="section-heading"><h3>Console & logs</h3><span className="muted">Read-only until Pumpkin command input is verified</span></div>
-      <div className="console-capability"><span className="capability-icon">i</span><span>Pumpkin’s remote command interface is not verified for this build, so this workspace is safely read-only. Live streaming is the next event-layer upgrade.</span></div>
+      <div className="console-capability"><span className="capability-icon">i</span><span>{capabilitiesQuery.data?.capabilities.remote_console?.status === "verified" ? "Remote command input is verified for this runtime." : capabilitiesQuery.data?.capabilities.remote_console?.status === "not-supported" ? "This runtime does not support remote command input." : "Pumpkin’s remote command interface is not verified for this build, so this workspace is safely read-only."}</span></div>
+      {capabilitiesQuery.data && (
+        <details className="advanced-debug">
+          <summary>Runtime capabilities</summary>
+          <ul>
+            {Object.entries(capabilitiesQuery.data.capabilities).map(([name, capability]) => (
+              <li key={name}>
+                <code>{name}</code>{" "}
+                <span className="badge">{capability.status}</span>{" "}
+                <span className="muted">{capability.detail}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       <div className="row">
         <label>
           Tail{" "}

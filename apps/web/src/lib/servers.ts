@@ -280,6 +280,26 @@ export async function fetchStatus(id: string): Promise<ServerStatus> {
   return parseJson<ServerStatus>(res, "get server status");
 }
 
+export interface CapabilityEntry {
+  status: string;
+  detail: string;
+}
+
+export interface ServerCapabilities {
+  runtime: string;
+  profile_version: number;
+  capabilities: Record<string, CapabilityEntry>;
+}
+
+export async function fetchCapabilities(
+  id: string,
+): Promise<ServerCapabilities> {
+  const res = await authFetch(
+    `/api/v1/servers/${encodeURIComponent(id)}/capabilities`,
+  );
+  return parseJson<ServerCapabilities>(res, "get server capabilities");
+}
+
 export async function fetchServerTasks(
   id: string,
   limit = 10,

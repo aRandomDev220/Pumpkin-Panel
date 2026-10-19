@@ -274,10 +274,10 @@ export default function Config() {
       </div>
       <nav className="workspace-tabs" aria-label="Server sections">
         <Link to={`/servers/${encodeURIComponent(id)}`}>Overview</Link>
-        <a href={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</a>
+        <Link to={`/servers/${encodeURIComponent(id)}#console`}>Console & logs</Link>
         <span className="active">Configuration</span>
         <Link to={`/servers/${encodeURIComponent(id)}/files`}>Files</Link>
-        <a href={`/servers/${encodeURIComponent(id)}#backups`}>Backups</a>
+        <Link to={`/servers/${encodeURIComponent(id)}#backups`}>Backups</Link>
       </nav>
 
       {configQuery.isLoading && <p>Loading config…</p>}
