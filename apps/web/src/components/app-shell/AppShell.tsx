@@ -154,6 +154,15 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
     window.localStorage.setItem("pumpkin-theme", theme);
   }, [theme]);
 
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sidebarOpen]);
+
   async function onChangePassword(event: FormEvent): Promise<void> {
     event.preventDefault();
     setPasswordError(null);
@@ -191,8 +200,9 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
 
   return (
     <div className="app-shell">
+      <a className="sr-only skip-link" href="#main">Skip to content</a>
       {sidebarOpen && <button className="sidebar-backdrop" type="button" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
-      <aside className={sidebarOpen ? "sidebar open" : "sidebar"}>
+      <aside id="app-sidebar" className={sidebarOpen ? "sidebar open" : "sidebar"}>
         <div className="brand-lockup">
           <PumpkinMark />
           <span className="brand-copy"><strong>Pumpkin</strong><small>World control</small></span>
@@ -218,7 +228,7 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
 
       <div className="app-main">
         <header className="topbar">
-          <button className="menu-toggle" type="button" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
+          <button className="menu-toggle" type="button" aria-label={sidebarOpen ? "Close navigation" : "Open navigation"} aria-expanded={sidebarOpen} aria-controls="app-sidebar" onClick={() => setSidebarOpen((open) => !open)}>
             <span /><span /><span />
           </button>
           <div className="topbar-context"><span className="context-kicker">Control room</span><span className="context-divider">/</span><span>Home node</span></div>
@@ -253,7 +263,7 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
             </details>
           </div>
         </header>
-        <main className="page-content">{children}</main>
+        <main id="main" className="page-content">{children}</main>
       </div>
     </div>
   );

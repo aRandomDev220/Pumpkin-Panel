@@ -66,7 +66,7 @@ export function MetricHistoryBars({
               style={{
                 width: 8,
                 height: BAR_TRACK_HEIGHT,
-                border: "1px dashed #3a4a42",
+                border: "1px dashed var(--line-strong)",
                 borderRadius: 2,
                 boxSizing: "border-box",
               }}
@@ -87,7 +87,7 @@ export function MetricHistoryBars({
               height: BAR_TRACK_HEIGHT,
               display: "inline-flex",
               alignItems: "flex-end",
-              background: "#141c19",
+              background: "var(--paper-raised)",
               borderRadius: 2,
             }}
           >
@@ -96,7 +96,7 @@ export function MetricHistoryBars({
                 display: "block",
                 width: "100%",
                 height: `${height}%`,
-                background: "#7dd8a8",
+                background: "var(--signal)",
                 borderRadius: 2,
               }}
             />
@@ -161,7 +161,7 @@ export function PlayersHistoryLine({
       style={{
         width: "100%",
         height,
-        background: "#141c19",
+        background: "var(--paper-raised)",
         borderRadius: 4,
         display: "block",
       }}
@@ -171,7 +171,7 @@ export function PlayersHistoryLine({
           key={i}
           points={seg.map((p) => `${p.x},${p.y}`).join(" ")}
           fill="none"
-          stroke="#7dd8a8"
+          stroke="var(--signal)"
           strokeWidth={1.5}
           vectorEffect="non-scaling-stroke"
         />
@@ -229,7 +229,9 @@ function latestAvailable(
   pick: (s: MetricSample) => number | null,
 ): number | null {
   for (let i = samples.length - 1; i >= 0; i -= 1) {
-    const v = pick(samples[i]);
+    const sample = samples[i];
+    if (sample === undefined) continue;
+    const v = pick(sample);
     if (v !== null) return v;
   }
   return null;
@@ -358,7 +360,9 @@ export default function Monitoring() {
         <div className="cards" aria-label="Host stats">
           <div className="card">
             <div className="card-num">
-              {summaryQuery.data.host.cpu_percent.toFixed(1)}%
+              {summaryQuery.data.host.cpu_percent == null
+                ? "—"
+                : `${summaryQuery.data.host.cpu_percent.toFixed(1)}%`}
             </div>
             <div className="muted">host CPU</div>
           </div>

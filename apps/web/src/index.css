@@ -113,6 +113,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .muted { color: var(--muted); }
 .err { color: var(--danger); }
 .warn { color: var(--warning); }
+.skip-link:focus { position: fixed; left: 12px; top: 12px; width: auto; height: auto; clip: auto; clip-path: none; padding: 10px 14px; background: var(--paper-raised); color: var(--ink); border-radius: 8px; z-index: 1000; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
 .eyebrow { margin-bottom: 11px; color: var(--signal); font-size: 10px; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }
 .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 34px; }

@@ -195,7 +195,9 @@ export default function Overview(): React.JSX.Element {
             </div>
           </div>
 
-          {metricsQuery.data && <><div className="section-heading"><h3>Node capacity</h3><Link className="section-link" to="/monitoring">View monitoring</Link></div><div className="host-summary"><div className="card"><div className="card-num">{metricsQuery.data.host.cpu_percent.toFixed(1)}%</div><div className="muted">Host CPU</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.memory_used_bytes)}</div><div className="muted">Memory used of {formatBytes(metricsQuery.data.host.memory_total_bytes)}</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.disk_free_bytes)}</div><div className="muted">Disk available</div></div></div></>}
+          {metricsQuery.data && <><div className="section-heading"><h3>Node capacity</h3><Link className="section-link" to="/monitoring">View monitoring</Link></div><div className="host-summary"><div className="card"><div className="card-num">{metricsQuery.data.host.cpu_percent == null
+              ? "—"
+              : `${metricsQuery.data.host.cpu_percent.toFixed(1)}%`}</div><div className="muted">Host CPU</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.memory_used_bytes)}</div><div className="muted">Memory used of {formatBytes(metricsQuery.data.host.memory_total_bytes)}</div></div><div className="card"><div className="card-num">{formatBytes(metricsQuery.data.host.disk_free_bytes)}</div><div className="muted">Disk available</div></div></div></>}
 
           <div className="section-heading"><h3>Recent activity</h3><Link className="section-link" to="/monitoring">All activity</Link></div>
           {recentTaskQueries.some((query) => query.isLoading) && <div className="panel"><p className="muted">Loading recent activity…</p></div>}

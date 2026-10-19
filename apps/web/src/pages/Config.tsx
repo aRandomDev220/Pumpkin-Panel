@@ -66,7 +66,8 @@ function patchTopLevel(content: string, key: string, value: string | number | bo
   if (firstHeader < 0) firstHeader = lines.length;
   const re = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`);
   for (let i = 0; i < firstHeader; i++) {
-    if (re.test(lines[i])) {
+    const line = lines[i];
+    if (line !== undefined && re.test(line)) {
       lines[i] = keyLine(key, value);
       return lines.join("\n");
     }
@@ -91,13 +92,15 @@ function patchSection(
   }
   let end = out.length;
   for (let i = headerIdx + 1; i < out.length; i++) {
-    if (isSectionHeader(out[i])) {
+    const line = out[i];
+    if (line !== undefined && isSectionHeader(line)) {
       end = i;
       break;
     }
   }
   for (let i = headerIdx + 1; i < end; i++) {
-    if (re.test(out[i])) {
+    const line = out[i];
+    if (line !== undefined && re.test(line)) {
       out[i] = keyLine(key, value);
       return out;
     }
