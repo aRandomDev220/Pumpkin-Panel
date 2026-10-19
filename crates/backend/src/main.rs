@@ -301,6 +301,12 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/v1/users/:id/reset-password",
+            post(routes_admin::reset_user_password).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::UsersManage),
+            )),
+        )
+        .route(
             "/api/v1/servers/:id/backups",
             get(routes_backup::list_backups).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),

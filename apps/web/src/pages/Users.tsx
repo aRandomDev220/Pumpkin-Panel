@@ -8,6 +8,7 @@ import {
   deleteUser,
   errMsg,
   listUsers,
+  resetUserPassword,
   updateUser,
 } from "../lib/admin";
 import type { AdminUser } from "../lib/admin";
@@ -89,6 +90,9 @@ export default function Users() {
   const [opError, setOpError] = useState<string | null>(null);
   const [lastOwnerBanner, setLastOwnerBanner] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [resetTargetId, setResetTargetId] = useState<string | null>(null);
+  const [resetPassword, setResetPassword] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
 
   const usersQuery = useQuery({
     queryKey: ["admin", "users"],
@@ -136,6 +140,18 @@ export default function Users() {
     onSuccess: () => {
       setOpError(null);
       qc.invalidateQueries({ queryKey: ["admin", "users"] });
+    },
+    onError: handleOpError,
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: ({ id, password }: { id: string; password: string }) =>
+      resetUserPassword(id, password),
+    onSuccess: () => {
+      setResetTargetId(null);
+      setResetPassword("");
+      setOpError(null);
+      setNotice("Password reset. The user's sessions were revoked.");
     },
     onError: handleOpError,
   });
@@ -223,6 +239,11 @@ export default function Users() {
           {opError}
         </p>
       )}
+      {notice && (
+        <p className="muted" role="status">
+          {notice}
+        </p>
+      )}
 
       {usersQuery.isLoading && <p>Loading users…</p>}
       {usersQuery.error && (
@@ -287,7 +308,59 @@ export default function Users() {
                           ? "Confirm delete"
                           : "Delete"}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setResetTargetId(u.id);
+                          setResetPassword("");
+                          setNotice(null);
+                        }}
+                      >
+                        Reset password
+                      </button>
                     </div>
+                    {resetTargetId === u.id && (
+                      <form
+                        className="row"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (resetPassword.length < 8) {
+                            setOpError(
+                              "Password must be at least 8 characters.",
+                            );
+                            return;
+                          }
+                          resetMutation.mutate({
+                            id: u.id,
+                            password: resetPassword,
+                          });
+                        }}
+                      >
+                        <input
+                          type="password"
+                          value={resetPassword}
+                          onChange={(e) => setResetPassword(e.target.value)}
+                          placeholder="new password (min 8)"
+                          aria-label={`New password for ${u.username}`}
+                          autoComplete="new-password"
+                        />
+                        <button
+                          type="submit"
+                          disabled={resetMutation.isPending}
+                        >
+                          {resetMutation.isPending ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setResetTargetId(null);
+                            setResetPassword("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </form>
+                    )}
                   </td>
                 </tr>
               );

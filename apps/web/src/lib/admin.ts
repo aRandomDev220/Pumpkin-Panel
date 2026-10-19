@@ -121,6 +121,33 @@ export async function updateUser(id: string, patch: UpdateUserPatch): Promise<vo
   await parseJson<unknown>(res, "update user");
 }
 
+export async function resetUserPassword(
+  id: string,
+  password: string,
+): Promise<void> {
+  const res = await authFetch(
+    `/api/v1/users/${encodeURIComponent(id)}/reset-password`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    },
+  );
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = (await res.json()) as ErrorBody;
+      detail = body.error_code ?? body.error ?? body.message ?? detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new AdminApiError(
+      `reset password failed (${res.status}): ${detail}`,
+      res.status,
+    );
+  }
+}
+
 export async function deleteUser(id: string): Promise<void> {
   const res = await authFetch(`/api/v1/users/${encodeURIComponent(id)}`, {
     method: "DELETE",

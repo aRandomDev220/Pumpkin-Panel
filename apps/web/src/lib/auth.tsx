@@ -116,6 +116,30 @@ export async function postSetup(
   return parseJson<SessionResponse>(res);
 }
 
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  const res = await authFetch("/api/v1/auth/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = (await res.json()) as { error_code?: string; message?: string };
+      detail = body.error_code ?? body.message ?? detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`change password failed (${res.status}): ${detail}`);
+  }
+}
+
 export async function postLogout(): Promise<void> {
   const res = await authFetch("/api/v1/auth/logout", { method: "POST" });
   if (!res.ok && res.status !== 401) {

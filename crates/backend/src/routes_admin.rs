@@ -526,6 +526,120 @@ pub async fn create_user(
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub password: String,
+}
+
+/// POST /api/v1/users/:id/reset-password — owner-set password. Revokes every
+/// session for the target so a compromised account cannot stay signed in.
+pub async fn reset_user_password(
+    State(state): State<AppState>,
+    actor: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Response {
+    let request_id = audit::request_id();
+    if crate::routes_auth::validate_password(&body.password, true).is_err() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WEAK_PASSWORD",
+            "password must be 8-1024 characters",
+        );
+    }
+    let password_hash = match crate::auth::hash_password(&body.password) {
+        Ok(hash) => hash,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to hash password",
+            )
+        }
+    };
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to reset password",
+            )
+        }
+    };
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?",
+    )
+    .bind(&password_hash)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            return error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user");
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            tracing::warn!(user_id = %id, error = %e, "password reset failed");
+            audit::record(
+                &state.pool,
+                Some(&actor.id),
+                "users.reset_password",
+                "user",
+                &id,
+                "failed",
+                &request_id,
+                serde_json::json!({}),
+            )
+            .await;
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to reset password",
+            );
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if let Err(e) =
+        sqlx::query("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
+            .bind(&now)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+    {
+        let _ = tx.rollback().await;
+        tracing::warn!(user_id = %id, error = %e, "session revocation failed");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to revoke sessions",
+        );
+    }
+    if tx.commit().await.is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to reset password",
+        );
+    }
+    audit::record(
+        &state.pool,
+        Some(&actor.id),
+        "users.reset_password",
+        "user",
+        &id,
+        "ok",
+        &request_id,
+        serde_json::json!({ "sessions_revoked": true }),
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// DELETE /api/v1/users/:id — delete a user (controller applies
 /// `UsersManage`). Refuses to delete the final active owner (409
 /// `LAST_OWNER`, same guard as the update path) and revokes every session
@@ -1388,6 +1502,12 @@ mod tests {
                     crate::auth::require_permission(Permission::ServerLifecycle),
                 )),
             )
+            .route(
+                "/api/v1/users/:id/reset-password",
+                post(super::reset_user_password).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::UsersManage),
+                )),
+            )
             .route_layer(middleware::from_fn_with_state(
                 pool,
                 crate::auth::auth_middleware,
@@ -1784,5 +1904,40 @@ mod tests {
             .authorization_bearer(&fx.token)
             .await;
         assert_eq!(res.status_code(), 409, "{}", res.text());
+    }
+    #[tokio::test]
+    async fn owner_can_reset_a_user_password() {
+        let fx = admin_fixture().await;
+        let viewer_id: String =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer1'")
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        let res = fx
+            .server
+            .post(&format!("/api/v1/users/{viewer_id}/reset-password"))
+            .authorization_bearer(&fx.token)
+            .json(&serde_json::json!({ "password": "newpassword1" }))
+            .await;
+        assert_eq!(res.status_code(), 204, "{}", res.text());
+
+        let old = fx
+            .server
+            .post("/api/v1/auth/login")
+            .json(&serde_json::json!({
+                "username": "viewer1",
+                "password": "supersecret1"
+            }))
+            .await;
+        assert_eq!(old.status_code(), 401, "old password must stop working");
+        let new = fx
+            .server
+            .post("/api/v1/auth/login")
+            .json(&serde_json::json!({
+                "username": "viewer1",
+                "password": "newpassword1"
+            }))
+            .await;
+        assert_eq!(new.status_code(), 200, "new password must work");
     }
 }

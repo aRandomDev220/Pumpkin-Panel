@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
+import type { FormEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchHealth } from "../../lib/api";
-import { useAuth } from "../../lib/auth";
+import { changePassword, useAuth } from "../../lib/auth";
 
 type Theme = "dark" | "light";
 
@@ -140,11 +141,46 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [passwordNotice, setPasswordNotice] = useState<string | null>(null);
+  const [passwordBusy, setPasswordBusy] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("pumpkin-theme", theme);
   }, [theme]);
+
+  async function onChangePassword(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    setPasswordError(null);
+    setPasswordNotice(null);
+    if (newPassword.length < 8) {
+      setPasswordError("New password must be at least 8 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("New passwords do not match.");
+      return;
+    }
+    setPasswordBusy(true);
+    try {
+      await changePassword(currentPassword, newPassword);
+      setPasswordNotice("Password changed. Other sessions were signed out.");
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      setPasswordError(
+        err instanceof Error ? err.message : "Password change failed.",
+      );
+    } finally {
+      setPasswordBusy(false);
+    }
+  }
 
   async function onLogout(): Promise<void> {
     await logout();
@@ -199,6 +235,19 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
               </summary>
               <div className="user-menu-popover">
                 <div className="user-menu-meta"><span>Signed in as</span><strong>{user.username}</strong></div>
+                <button className="button-secondary" type="button" onClick={() => setPasswordOpen((open) => !open)}>
+                  {passwordOpen ? "Cancel password change" : "Change password"}
+                </button>
+                {passwordOpen && (
+                  <form onSubmit={(event) => void onChangePassword(event)}>
+                    <label>Current password<input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /></label>
+                    <label>New password<input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" required /></label>
+                    <label>Confirm new password<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" required /></label>
+                    {passwordError && <p className="err" role="alert">{passwordError}</p>}
+                    {passwordNotice && <p className="muted" role="status">{passwordNotice}</p>}
+                    <button type="submit" disabled={passwordBusy}>{passwordBusy ? "Saving…" : "Save password"}</button>
+                  </form>
+                )}
                 <button className="button-secondary" type="button" onClick={() => void onLogout()}>Sign out</button>
               </div>
             </details>
