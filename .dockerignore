@@ -1,0 +1,25 @@
+# Build context hygiene: the Dockerfile copies source trees explicitly, and
+# host build products must never overwrite the Alpine/musl bindings installed
+# by `npm ci` inside the image.
+target/
+**/node_modules/
+**/dist/
+**/.vite/
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/blob-report/
+
+.git/
+.github/
+.opencode/
+.superpowers/
+.commandcode/
+.cargo/
+
+**/.env
+dev.db
+dev-data/
+release/
+docs/
+*.md
+*.log

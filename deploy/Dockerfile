@@ -10,13 +10,13 @@ RUN npm ci --include=optional
 COPY apps/web/ ./
 RUN npm run build
 
-FROM rust:1.90-alpine@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS apibuild
+FROM rust:1.99-alpine@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 AS apibuild
 RUN apk add --no-cache musl-dev sqlite-dev pkgconfig
 WORKDIR /app
-# The builder image is itself pinned to Rust 1.90 above. Do not copy the
-# workspace rust-toolchain.toml here: that file pins the local development
-# toolchain and would make rustup download a second toolchain (and components)
-# inside this Alpine build, where it can appear to hang for a long time.
+# Keep this image in lockstep with rust-toolchain.toml and CI (1.99.0). The
+# workspace rust-toolchain.toml is deliberately not copied: the builder image
+# already provides the pinned toolchain, and copying it would make rustup
+# download a second toolchain (and components) inside Alpine.
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
 COPY migrations/ ./migrations/
