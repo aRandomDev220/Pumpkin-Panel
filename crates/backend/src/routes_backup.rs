@@ -846,7 +846,30 @@ pub(crate) async fn retention_rule(pool: &SqlitePool, server_id: &str) -> (usize
 /// in-progress rows are never listed, per the canonical semantics. The
 /// executor (file + row deletion, per-row audit) stays here. Best-effort —
 /// never fails the task.
-async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>) {
+/// Validate a `backups.storage_path` before touching the filesystem. A
+/// restored or tampered row must not be able to unlink or serve a file
+/// outside the manager's backup directory.
+fn validated_storage_path(
+    backup_dir: &Path,
+    backup_id: &str,
+    storage_path: &str,
+) -> Option<PathBuf> {
+    let candidate = PathBuf::from(storage_path);
+    let expected = format!("{backup_id}.tar.gz");
+    if candidate.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return None;
+    }
+    let parent = candidate.parent()?.canonicalize().ok()?;
+    let root = backup_dir.canonicalize().ok()?;
+    (parent == root).then_some(candidate)
+}
+
+async fn prune_retention(
+    pool: &SqlitePool,
+    backup_dir: &Path,
+    server_id: &str,
+    actor: Option<&str>,
+) {
     let rows = sqlx::query_as::<_, RetentionRow>(
         "SELECT id, state, completed_at, protected, storage_path FROM backups
          WHERE server_id = ? ORDER BY created_at DESC",
@@ -877,7 +900,15 @@ async fn prune_retention(pool: &SqlitePool, server_id: &str, actor: Option<&str>
     for id in &delete {
         if let Some(row) = rows.iter().find(|r| &r.id == id) {
             if !row.storage_path.is_empty() {
-                let _ = tokio::fs::remove_file(&row.storage_path).await;
+                match validated_storage_path(backup_dir, &row.id, &row.storage_path) {
+                    Some(path) => {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    None => tracing::warn!(
+                        backup_id = %row.id,
+                        "refusing to unlink a backup outside the backup dir"
+                    ),
+                }
             }
         }
         let _ = sqlx::query("DELETE FROM backups WHERE id = ?")
@@ -955,7 +986,7 @@ async fn execute_backup(
                 .await;
                 return;
             }
-            prune_retention(pool, server_id, actor).await;
+            prune_retention(pool, backup_dir, server_id, actor).await;
             // No second `backup.complete` audit here: `run_backup_capture`
             // already records it (with size/entries/consistency). Emitting it
             // twice was duplicate audit noise.
@@ -1738,7 +1769,15 @@ pub async fn download_backup(
             "backup file is not available",
         );
     }
-    let file = match tokio::fs::File::open(&backup.storage_path).await {
+    let Some(path) = validated_storage_path(&state.backup_dir, &id, &backup.storage_path) else {
+        tracing::warn!(backup_id = %id, "refusing to serve a backup outside the backup dir");
+        return error(
+            StatusCode::NOT_FOUND,
+            "BACKUP_NOT_FOUND",
+            "backup file is not available",
+        );
+    };
+    let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => {
             return error(
@@ -1848,7 +1887,15 @@ pub async fn delete_backup(
         );
     }
     if !backup.storage_path.is_empty() {
-        let _ = tokio::fs::remove_file(&backup.storage_path).await;
+        match validated_storage_path(&state.backup_dir, &id, &backup.storage_path) {
+            Some(path) => {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            None => tracing::warn!(
+                backup_id = %id,
+                "refusing to unlink a backup outside the backup dir"
+            ),
+        }
     }
     audit::record(
         &state.pool,
@@ -3191,7 +3238,7 @@ mod tests {
             crate::scheduler::preview_for(&fx.pool, &id, 2, 0).await;
         assert_eq!(would_delete.len(), 3, "preview: {would_delete:?}");
 
-        prune_retention(&fx.pool, &id, None).await;
+        prune_retention(&fx.pool, &fx.backup_dir, &id, None).await;
 
         let remaining = backup_ids(&fx, &id).await;
         let mut deleted: Vec<String> = ["c1", "c2", "c3", "c4", "c5"]
@@ -3207,5 +3254,26 @@ mod tests {
         assert!(remaining.contains(&"c4".to_string()));
         assert!(remaining.contains(&"c5".to_string()));
         assert!(!fx.backup_dir.join("c1.tar.gz").exists());
+    }
+    #[test]
+    fn backup_storage_path_must_stay_inside_backup_dir() {
+        let root = std::env::temp_dir().join(format!("pm-bak-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "b1";
+        let inside = root.join(format!("{id}.tar.gz"));
+        std::fs::write(&inside, b"x").unwrap();
+        assert!(validated_storage_path(&root, id, &inside.to_string_lossy()).is_some());
+        assert!(validated_storage_path(&root, id, "/etc/passwd").is_none());
+        assert!(
+            validated_storage_path(&root, id, &root.join("other.tar.gz").to_string_lossy())
+                .is_none()
+        );
+        assert!(validated_storage_path(
+            &root,
+            id,
+            &root.join(format!("../{id}.tar.gz")).to_string_lossy()
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
