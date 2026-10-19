@@ -17,10 +17,7 @@ use std::{
     },
 };
 
-use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
     extract::{FromRequestParts, State},
     http::{header, request::Parts, HeaderMap, Method, StatusCode},
@@ -184,11 +181,8 @@ pub enum AuthError {
 
 /// Hash a password with Argon2id + fresh 128-bit salt. Returns PHC string.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
-    let mut salt_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| AuthError::HashFailed)?;
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|_| AuthError::HashFailed)
 }
