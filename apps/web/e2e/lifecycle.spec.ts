@@ -122,12 +122,12 @@ test.describe.serial("full user journey", () => {
     await seedSession(page, session);
     await page.goto("/servers");
     await page.getByLabel("Name", { exact: true }).fill(SERVER_NAME);
-    await page.getByLabel("Game port", { exact: true }).fill(String(GAME_PORT));
+    await page.getByLabel("Java port", { exact: true }).fill(String(GAME_PORT));
     const [createResp] = await Promise.all([
       page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().endsWith("/api/v1/servers"),
       ),
-      page.getByRole("button", { name: "Create", exact: true }).click(),
+      page.getByRole("button", { name: "Create world", exact: true }).click(),
     ]);
     expect(createResp.status()).toBe(201);
     await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
@@ -198,7 +198,7 @@ test.describe.serial("full user journey", () => {
     await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
     await page
       .locator("li", { hasText: SERVER_NAME })
-      .getByRole("button", { name: "Delete…" })
+      .getByRole("button", { name: "Delete", exact: true })
       .click();
     await expect(page.getByLabel("retain data")).toBeChecked();
     const [delResp] = await Promise.all([
