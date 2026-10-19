@@ -123,8 +123,8 @@ fn default_retain() -> bool {
     true
 }
 
-const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const DEFAULT_CPU_LIMIT: f64 = 2.0;
+pub(crate) const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_CPU_LIMIT: f64 = 2.0;
 
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
@@ -194,6 +194,15 @@ async fn taken_ports(pool: &SqlitePool) -> Result<HashSet<i64>, sqlx::Error> {
         set.insert(p + 1); // bedrock convention: game_port + 1
     }
     Ok(set)
+}
+
+/// Whether an observed runtime state already satisfies a desired state.
+fn observed_matches_desired(desired: &str, observed: &str) -> bool {
+    match desired {
+        "running" => matches!(observed, "running" | "starting"),
+        "stopped" => matches!(observed, "exited" | "created" | "missing"),
+        _ => false,
+    }
 }
 
 async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
@@ -862,9 +871,14 @@ pub async fn lifecycle(
             "server has no container; recreate it first",
         );
     }
-    // Idempotency: desired state already matches → report, don't enqueue.
+    // Idempotency: only short-circuit when the observed runtime agrees. A
+    // previous failed start leaves desired=running while observed=exited;
+    // reporting "already" there made the server impossible to start again.
     let want = if op == "stop" { "stopped" } else { "running" };
-    if server.desired_state == want && op != "restart" {
+    if server.desired_state == want
+        && observed_matches_desired(want, &server.observed_state)
+        && op != "restart"
+    {
         return Json(serde_json::json!({
             "status": "already",
             "desired_state": want,
@@ -922,6 +936,7 @@ async fn lifecycle_inner(
             "a task is already queued/running for this server",
         ));
     }
+    let previous_desired = server.desired_state.clone();
     let _ = sqlx::query(
         "UPDATE servers SET desired_state = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
@@ -935,6 +950,14 @@ async fn lifecycle_inner(
         Ok(record) => Ok(record.id),
         Err(e) => {
             tracing::warn!(server_id = %server.id, error = %e, "task enqueue failed");
+            // The request was not accepted; do not leave desired_state lying.
+            let _ = sqlx::query(
+                "UPDATE servers SET desired_state = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(&previous_desired)
+            .bind(&server.id)
+            .execute(&state.pool)
+            .await;
             Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "TASK_QUEUE_FULL",
@@ -1357,6 +1380,19 @@ mod tests {
             assert!(!msg.contains(leak), "message leaked {leak:?}: {msg}");
         }
         assert_eq!(body["error_code"], "DOCKER_API_ERROR");
+    }
+
+    #[test]
+    fn idempotency_requires_observed_agreement() {
+        // A failed start leaves desired=running / observed=exited. It must
+        // still enqueue a new start rather than report "already".
+        assert!(!observed_matches_desired("running", "exited"));
+        assert!(!observed_matches_desired("running", "missing"));
+        assert!(observed_matches_desired("running", "running"));
+        assert!(observed_matches_desired("running", "starting"));
+        assert!(!observed_matches_desired("stopped", "running"));
+        assert!(observed_matches_desired("stopped", "exited"));
+        assert!(observed_matches_desired("stopped", "missing"));
     }
 
     #[test]

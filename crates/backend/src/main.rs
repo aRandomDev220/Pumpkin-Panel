@@ -15,6 +15,7 @@ mod metrics_collector;
 mod op_lock;
 mod ratelimit;
 mod readiness;
+mod reconcile;
 mod routes_admin;
 mod routes_auth;
 mod routes_backup;
@@ -675,12 +676,19 @@ async fn main() -> anyhow::Result<()> {
         let pool = pool.clone();
         let adapter = adapter.clone();
         let backup_root = backup_root.clone();
+        let reconcile_runner = runner.clone();
         tokio::spawn(async move {
+            let mut reconciler = reconcile::Reconciler::default();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // A slow pass must not cause the next tick to fire immediately.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
                 scheduler::tick_once(&pool, adapter.as_deref(), &backup_root).await;
                 metrics_collector::sample_all(&pool, adapter.as_deref()).await;
+                reconciler
+                    .tick(&pool, adapter.as_deref(), reconcile_runner.as_ref())
+                    .await;
             }
         });
     }

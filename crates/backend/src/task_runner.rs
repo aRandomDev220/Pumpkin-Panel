@@ -478,6 +478,129 @@ async fn container_for_server(
     }
 }
 
+/// Rebuild a server's container from its persisted row and settings.
+///
+/// Used by reconciliation when the container was lost (manager crash between
+/// image swap and create, out-of-band removal, or a failed initial create).
+/// Adopts an existing `pumpkin-<slug>` container if the daemon still has one.
+async fn recreate_container<A: super::runtime::RuntimeAdapter>(
+    pool: &sqlx::SqlitePool,
+    adapter: &A,
+    server_id: &str,
+) -> Result<String, RuntimeError> {
+    use sqlx::Row;
+
+    let row = sqlx::query(
+        "SELECT s.id, s.name, s.slug, s.image_reference, s.image_digest, s.data_path,
+                s.game_port, s.bind_address, ss.memory_limit_bytes, ss.cpu_limit
+         FROM servers s LEFT JOIN server_settings ss ON ss.server_id = s.id
+         WHERE s.id = ? AND s.deleted_at IS NULL",
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| RuntimeError::Database(e.to_string()))?;
+    let Some(row) = row else {
+        return Err(RuntimeError::InvalidConfiguration(format!(
+            "server {server_id} not found"
+        )));
+    };
+
+    let id: String = row
+        .try_get("id")
+        .map_err(|e| RuntimeError::Database(e.to_string()))?;
+    let data_path: String = row
+        .try_get("data_path")
+        .map_err(|e| RuntimeError::Database(e.to_string()))?;
+    let game_port: i64 = row
+        .try_get("game_port")
+        .map_err(|e| RuntimeError::Database(e.to_string()))?;
+    let memory_limit_bytes = row
+        .try_get::<Option<i64>, _>("memory_limit_bytes")
+        .ok()
+        .flatten()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(crate::routes_servers::DEFAULT_MEMORY_LIMIT_BYTES);
+    let cpu_limit = row
+        .try_get::<Option<f64>, _>("cpu_limit")
+        .ok()
+        .flatten()
+        .unwrap_or(crate::routes_servers::DEFAULT_CPU_LIMIT);
+    let server_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| RuntimeError::InvalidConfiguration("server id is not a UUID".into()))?;
+    // The stored data path already lives under the manager root; using its
+    // parent as the containment root keeps validation meaningful without
+    // threading AppState through the worker.
+    let server_root = std::path::Path::new(&data_path).parent().map_or_else(
+        || std::path::PathBuf::from("/"),
+        std::path::Path::to_path_buf,
+    );
+
+    let input = crate::runtime::ServerSpecInput {
+        server_id: server_uuid,
+        name: row
+            .try_get("name")
+            .map_err(|e| RuntimeError::Database(e.to_string()))?,
+        slug: row
+            .try_get("slug")
+            .map_err(|e| RuntimeError::Database(e.to_string()))?,
+        image_reference: row
+            .try_get("image_reference")
+            .map_err(|e| RuntimeError::Database(e.to_string()))?,
+        image_digest: row
+            .try_get("image_digest")
+            .map_err(|e| RuntimeError::Database(e.to_string()))?,
+        game_port: u16::try_from(game_port)
+            .map_err(|_| RuntimeError::InvalidConfiguration("invalid game port".into()))?,
+        bind_address: row
+            .try_get("bind_address")
+            .map_err(|e| RuntimeError::Database(e.to_string()))?,
+        data_path: data_path.clone(),
+        memory_limit_bytes,
+        cpu_limit,
+    };
+    let spec = crate::runtime::validate_spec(input, &server_root)
+        .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?;
+
+    let name = DockerAdapter::container_name(&spec.slug);
+    match adapter.inspect(&name).await {
+        Ok(snap) => {
+            let _ = sqlx::query(
+                "UPDATE servers SET container_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(&snap.container_id)
+            .bind(&id)
+            .execute(pool)
+            .await;
+            if snap.status != "running" {
+                adapter.start(&snap.container_id).await?;
+            }
+            return Ok(format!("adopted container {}", snap.container_id));
+        }
+        Err(RuntimeError::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+
+    let pull_ref =
+        crate::runtime::pinned_image_reference(&spec.image_reference, &spec.image_digest);
+    adapter.pull_image(&pull_ref).await?;
+    let handle = adapter.create(&spec).await?;
+    if let Err(e) = sqlx::query(
+        "UPDATE servers SET container_id = ?, observed_state = 'created', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(&handle.container_id)
+    .bind(&id)
+    .execute(pool)
+    .await
+    {
+        // Do not leave a container the DB does not know about.
+        let _ = adapter.remove(&handle.container_id).await;
+        return Err(RuntimeError::Database(e.to_string()));
+    }
+    adapter.start(&handle.container_id).await?;
+    Ok(format!("recreated container {}", handle.container_id))
+}
+
 /// Execute a single task to a terminal state.
 ///
 /// Handles runtime ops (`start`/`stop`/`restart`/`remove`) and Phase 7 image
@@ -512,6 +635,32 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
     };
 
     match task.task_type.as_str() {
+        "recreate" => {
+            let Some(server_id) = task.server_id.clone() else {
+                fail_task(
+                    pool,
+                    task_id,
+                    "INVALID_CONFIGURATION",
+                    "task has no server_id",
+                )
+                .await?;
+                return Ok(());
+            };
+            mark_running(pool, task_id, "recreating container").await?;
+            match recreate_container(pool, adapter, &server_id).await {
+                Ok(msg) => {
+                    mark_succeeded(pool, task_id, &msg).await?;
+                    let _ = sqlx::query(
+                        "UPDATE servers SET desired_state = 'running', observed_state = 'running',
+                                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    )
+                    .bind(&server_id)
+                    .execute(pool)
+                    .await;
+                }
+                Err(e) => fail_task(pool, task_id, e.code(), &e.to_string()).await?,
+            }
+        }
         "start" | "stop" | "restart" | "remove" => {
             let Some(server_id) = task.server_id.clone() else {
                 fail_task(
