@@ -43,16 +43,18 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 
-// NOTE: bollard 0.18 API (pinned in the workspace). The 0.19+ `models::`
-// `ContainerCreateBody` / `query_parameters` builders do not exist here:
-// container configuration is `container::Config<String>` and every
-// operation takes a plain options struct from `container::`.
-use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions, LogOutput,
-    LogsOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
-    StatsOptions, StopContainerOptions,
+// NOTE: bollard 0.21 API. Container configuration is
+// `models::ContainerCreateBody`; operation options live in
+// `query_parameters`.
+use bollard::container::LogOutput;
+use bollard::models::{
+    ContainerCreateBody, HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
-use bollard::models::{HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum};
+use bollard::query_parameters::{
+    CreateContainerOptions, InspectContainerOptions, ListContainersOptions, LogsOptions,
+    RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StatsOptions,
+    StopContainerOptions,
+};
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -704,7 +706,7 @@ impl DockerAdapter {
     /// I/O enabled (`OpenStdin`/`StdinOnce`/`Tty`) because the web
     /// console attaches to the container's stdio.
     #[must_use]
-    pub fn build_create_config(spec: &ValidatedServerSpec) -> Config<String> {
+    pub fn build_create_config(spec: &ValidatedServerSpec) -> ContainerCreateBody {
         Self::build_create_config_with_runtime_user(spec, None)
     }
 
@@ -717,7 +719,7 @@ impl DockerAdapter {
     pub fn build_create_config_with_runtime_user(
         spec: &ValidatedServerSpec,
         runtime_user: Option<&str>,
-    ) -> Config<String> {
+    ) -> ContainerCreateBody {
         let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::from([
             (
                 format!("{CONTAINER_JAVA_PORT}/tcp"),
@@ -757,15 +759,15 @@ impl DockerAdapter {
             ..Default::default()
         };
 
-        Config {
+        ContainerCreateBody {
             image: Some(pinned_image_reference(
                 &spec.image_reference,
                 &spec.image_digest,
             )),
-            exposed_ports: Some(HashMap::from([
-                (format!("{CONTAINER_JAVA_PORT}/tcp"), HashMap::new()),
-                (format!("{CONTAINER_BEDROCK_PORT}/udp"), HashMap::new()),
-            ])),
+            exposed_ports: Some(vec![
+                format!("{CONTAINER_JAVA_PORT}/tcp"),
+                format!("{CONTAINER_BEDROCK_PORT}/udp"),
+            ]),
             // Console support (Phase 0 requirement): the web console
             // attaches to stdin, so the container must keep it open.
             open_stdin: Some(true),
@@ -800,8 +802,8 @@ impl RuntimeAdapter for DockerAdapter {
             let config =
                 Self::build_create_config_with_runtime_user(&spec, self.runtime_user.as_deref());
             let options = CreateContainerOptions {
-                name: name.clone(),
-                platform: None,
+                name: Some(name.clone()),
+                ..Default::default()
             };
             let response = docker
                 .create_container(Some(options), config)
@@ -820,7 +822,7 @@ impl RuntimeAdapter for DockerAdapter {
         let container_id = container_id.to_string();
         async move {
             docker
-                .start_container(&container_id, None::<StartContainerOptions<String>>)
+                .start_container(&container_id, None::<StartContainerOptions>)
                 .await
                 .map_err(RuntimeError::from_bollard)
         }
@@ -835,7 +837,8 @@ impl RuntimeAdapter for DockerAdapter {
         let container_id = container_id.to_string();
         async move {
             let options = StopContainerOptions {
-                t: timeout_secs as i64,
+                t: Some(timeout_secs as i32),
+                ..Default::default()
             };
             docker
                 .stop_container(&container_id, Some(options))
@@ -849,7 +852,8 @@ impl RuntimeAdapter for DockerAdapter {
         let container_id = container_id.to_string();
         async move {
             let options = RestartContainerOptions {
-                t: STOP_TIMEOUT_SECS as isize,
+                t: Some(STOP_TIMEOUT_SECS as i32),
+                ..Default::default()
             };
             docker
                 .restart_container(&container_id, Some(options))
@@ -944,7 +948,7 @@ impl RuntimeAdapter for DockerAdapter {
         let docker = self.docker.clone();
         let reference = reference.to_string();
         async move {
-            use bollard::image::CreateImageOptions;
+            use bollard::query_parameters::CreateImageOptions;
             use futures_util::TryStreamExt;
 
             // Split `name[:tag]` explicitly: an empty `tag` query param
@@ -959,8 +963,8 @@ impl RuntimeAdapter for DockerAdapter {
                 },
             };
             let options = CreateImageOptions {
-                from_image,
-                tag,
+                from_image: Some(from_image.to_string()),
+                tag: Some(tag.to_string()),
                 ..Default::default()
             };
             let mut stream = docker.create_image(Some(options), None, None);
@@ -1000,28 +1004,26 @@ impl RuntimeAdapter for DockerAdapter {
             // Docker-CLI-style CPU estimate. One-shot samples carry an
             // empty `precpu_stats`, in which case we report 0.0 rather
             // than lie.
-            let cpu_delta = sample
-                .cpu_stats
-                .cpu_usage
-                .total_usage
-                .saturating_sub(sample.precpu_stats.cpu_usage.total_usage)
-                as f64;
-            let sys_delta = sample
-                .cpu_stats
-                .system_cpu_usage
+            let cpu_stats = sample.cpu_stats.as_ref();
+            let precpu_stats = sample.precpu_stats.as_ref();
+            let cpu_usage = cpu_stats.and_then(|s| s.cpu_usage.as_ref());
+            let precpu_usage = precpu_stats.and_then(|s| s.cpu_usage.as_ref());
+            let cpu_delta = cpu_usage
+                .and_then(|u| u.total_usage)
                 .unwrap_or(0)
-                .saturating_sub(sample.precpu_stats.system_cpu_usage.unwrap_or(0))
+                .saturating_sub(precpu_usage.and_then(|u| u.total_usage).unwrap_or(0))
                 as f64;
-            let cpus = sample
-                .cpu_stats
-                .online_cpus
+            let sys_delta = cpu_stats
+                .and_then(|s| s.system_cpu_usage)
+                .unwrap_or(0)
+                .saturating_sub(precpu_stats.and_then(|s| s.system_cpu_usage).unwrap_or(0))
+                as f64;
+            let cpus = cpu_stats
+                .and_then(|s| s.online_cpus)
                 .map(|c| c as f64)
                 .or_else(|| {
-                    sample
-                        .cpu_stats
-                        .cpu_usage
-                        .percpu_usage
-                        .as_ref()
+                    cpu_usage
+                        .and_then(|u| u.percpu_usage.as_ref())
                         .map(|p| p.len() as f64)
                 })
                 .unwrap_or(1.0);
@@ -1031,10 +1033,11 @@ impl RuntimeAdapter for DockerAdapter {
                 0.0
             };
 
+            let memory_stats = sample.memory_stats.as_ref();
             Ok(RuntimeStats {
                 cpu_percent,
-                memory_bytes: sample.memory_stats.usage.unwrap_or(0),
-                memory_limit: sample.memory_stats.limit.unwrap_or(0),
+                memory_bytes: memory_stats.and_then(|m| m.usage).unwrap_or(0),
+                memory_limit: memory_stats.and_then(|m| m.limit).unwrap_or(0),
             })
         }
     }
@@ -1106,7 +1109,7 @@ pub async fn reconcile(
         all: true,
         limit: None,
         size: false,
-        filters,
+        filters: Some(filters),
     };
     let containers = adapter
         .docker
@@ -1437,8 +1440,8 @@ mod tests {
             Some("ghcr.io/pumpkin-mc/pumpkin:master")
         );
         let exposed = cfg.exposed_ports.expect("exposed ports");
-        assert!(exposed.contains_key("25565/tcp"));
-        assert!(exposed.contains_key("19132/udp"));
+        assert!(exposed.contains(&"25565/tcp".to_string()));
+        assert!(exposed.contains(&"19132/udp".to_string()));
 
         // Console I/O (Phase 0 requirement).
         assert_eq!(cfg.open_stdin, Some(true));
