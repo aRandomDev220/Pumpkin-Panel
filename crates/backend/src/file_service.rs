@@ -489,6 +489,26 @@ fn check_link_target(link_rel: &Path, target: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Validate a hardlink target. Tar linknames for hardlinks are relative to the
+/// archive root, not to the link's parent, so no `..` may climb above it.
+fn check_hardlink_target(target: &Path) -> Result<(), FileError> {
+    let mut depth: i64 = 0;
+    for comp in target.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => return Err(FileError::OutsideRoot),
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(FileError::OutsideRoot);
+                }
+            }
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+        }
+    }
+    Ok(())
+}
+
 /// Every written path (and each ancestor up to `dest_full`) must exist
 /// symlink-free; an existing symlink at any of these positions is refused so
 /// extraction can never write through a link that escapes.
@@ -618,7 +638,7 @@ fn extract_tar_reader<R: std::io::Read>(
                 .map_err(|e| FileError::Io(e.to_string()))?
                 .ok_or_else(|| FileError::Io("hardlink without target".to_string()))?
                 .into_owned();
-            check_link_target(&rel, &target)?;
+            check_hardlink_target(&target)?;
             hardlinks.push((rel, target));
         } else {
             // Device nodes, fifos, sockets, and anything unrecognized are
@@ -685,7 +705,17 @@ fn extract_tar_reader<R: std::io::Read>(
         if std::fs::symlink_metadata(&full).is_ok() {
             remove_existing(&full)?;
         }
-        std::fs::hard_link(dest_full.join(target), &full).map_err(map_io)?;
+        let target_full = dest_full.join(target);
+        ensure_writable_location(dest_full, &target_full)?;
+        match std::fs::symlink_metadata(&target_full) {
+            Ok(md) if md.file_type().is_file() => {}
+            _ => {
+                return Err(FileError::Io(
+                    "hardlink target is not an extracted regular file".to_string(),
+                ))
+            }
+        }
+        std::fs::hard_link(&target_full, &full).map_err(map_io)?;
     }
 
     Ok(files.len() + symlinks.len() + hardlinks.len())
@@ -988,6 +1018,31 @@ mod tests {
             export_tar_gz(&root1, &["/abs"]),
             Err(FileError::OutsideRoot)
         );
+    }
+
+    #[test]
+    fn hardlink_target_escaping_archive_root_is_rejected() {
+        let (root, _g) = temp_root();
+        // A hardlink's linkname is archive-root-relative, but validation used
+        // to measure it from the link's own parent. `a/link -> ../secret.txt`
+        // therefore passed validation and escaped `dest` into `root`.
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, b"top-secret").unwrap();
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header("a/link", "../secret.txt", b'1', 0));
+        raw.extend_from_slice(&[0u8; 1024]);
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&raw).unwrap();
+        let data = enc.finish().unwrap();
+
+        assert_eq!(
+            import_tar_gz(&root, "dest", &data, &DEFAULT_ARCHIVE_LIMITS),
+            Err(FileError::OutsideRoot)
+        );
+        assert!(std::fs::symlink_metadata(root.join("dest/a/link")).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"top-secret");
     }
 
     #[test]
