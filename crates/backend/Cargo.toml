@@ -34,4 +34,4 @@ flate2.workspace = true
 cron.workspace = true
 
 [dev-dependencies]
-axum-test = "16"
+axum-test = "17"

@@ -83,7 +83,6 @@ pub struct SessionResponse {
 /// and behind some proxies, where the key falls back to a shared bucket.
 pub struct PeerAddr(pub Option<SocketAddr>);
 
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for PeerAddr
 where
     S: Send + Sync,

@@ -137,37 +137,37 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id",
+            "/api/v1/servers/{id}",
             get(routes_servers::get_server).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id",
+            "/api/v1/servers/{id}",
             delete(routes_servers::delete_server).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerDelete),
             )),
         )
         .route(
-            "/api/v1/servers/:id/:op",
+            "/api/v1/servers/{id}/{op}",
             post(routes_servers::lifecycle).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerLifecycle),
             )),
         )
         .route(
-            "/api/v1/servers/:id/status",
+            "/api/v1/servers/{id}/status",
             get(routes_servers::server_status).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/logs",
+            "/api/v1/servers/{id}/logs",
             get(routes_servers::server_logs).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/tasks",
+            "/api/v1/servers/{id}/tasks",
             get(routes_servers::server_tasks).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
@@ -179,7 +179,7 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id/metrics",
+            "/api/v1/servers/{id}/metrics",
             get(routes_metrics::server_metrics).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
@@ -191,19 +191,19 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id/scheduled-tasks",
+            "/api/v1/servers/{id}/scheduled-tasks",
             get(scheduler::list_scheduled_tasks).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerLifecycle),
             )),
         )
         .route(
-            "/api/v1/servers/:id/scheduled-tasks",
+            "/api/v1/servers/{id}/scheduled-tasks",
             post(scheduler::create_scheduled_task).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerLifecycle),
             )),
         )
         .route(
-            "/api/v1/scheduled-tasks/:id",
+            "/api/v1/scheduled-tasks/{id}",
             delete(scheduler::delete_scheduled_task).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerLifecycle),
             )),
@@ -215,19 +215,19 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id/capabilities",
+            "/api/v1/servers/{id}/capabilities",
             get(routes_servers::server_capabilities).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/tasks/:id",
+            "/api/v1/tasks/{id}",
             get(routes_admin::get_task).route_layer(middleware::from_fn(auth::require_permission(
                 Permission::ServerRead,
             ))),
         )
         .route(
-            "/api/v1/tasks/:id/cancel",
+            "/api/v1/tasks/{id}/cancel",
             post(routes_admin::cancel_task).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerLifecycle),
             )),
@@ -239,7 +239,7 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/users/:id",
+            "/api/v1/users/{id}",
             axum::routing::patch(routes_admin::update_user).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::UsersManage),
             )),
@@ -257,19 +257,19 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id/update/preview",
+            "/api/v1/servers/{id}/update/preview",
             post(update_service::preview_image_update).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerUpdate),
             )),
         )
         .route(
-            "/api/v1/servers/:id/update",
+            "/api/v1/servers/{id}/update",
             post(update_service::update_server).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerUpdate),
             )),
         )
         .route(
-            "/api/v1/servers/:id/rollback",
+            "/api/v1/servers/{id}/rollback",
             post(update_service::rollback_server).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerUpdate),
             )),
@@ -281,7 +281,7 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/users/:id",
+            "/api/v1/users/{id}",
             delete(routes_admin::delete_user).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::UsersManage),
             )),
@@ -299,133 +299,133 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/servers/:id/backups",
+            "/api/v1/servers/{id}/backups",
             get(routes_backup::list_backups).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/backups",
+            "/api/v1/servers/{id}/backups",
             post(routes_backup::create_backup).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
-            "/api/v1/backups/:id",
+            "/api/v1/backups/{id}",
             get(routes_backup::get_backup).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/backups/:id/download",
+            "/api/v1/backups/{id}/download",
             get(routes_backup::download_backup).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/backups/:id",
+            "/api/v1/backups/{id}",
             delete(routes_backup::delete_backup).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
-            "/api/v1/backups/:id/restore",
+            "/api/v1/backups/{id}/restore",
             post(routes_backup::restore_backup).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupRestore),
             )),
         )
         .route(
-            "/api/v1/servers/:id/backup-policies",
+            "/api/v1/servers/{id}/backup-policies",
             get(scheduler::list_policies).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/backup-policies",
+            "/api/v1/servers/{id}/backup-policies",
             post(scheduler::create_policy).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
-            "/api/v1/servers/:id/backup-policies/preview",
+            "/api/v1/servers/{id}/backup-policies/preview",
             post(scheduler::retention_preview).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
             )),
         )
         .route(
-            "/api/v1/backup-policies/:id",
+            "/api/v1/backup-policies/{id}",
             axum::routing::patch(scheduler::update_policy).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
-            "/api/v1/backup-policies/:id",
+            "/api/v1/backup-policies/{id}",
             delete(scheduler::delete_policy).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerBackupCreate),
             )),
         )
         .route(
-            "/api/v1/servers/:id/config",
+            "/api/v1/servers/{id}/config",
             get(routes_config::get_config).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerConfigRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/config",
+            "/api/v1/servers/{id}/config",
             put(routes_config::put_config).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerConfigWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/config/validate",
+            "/api/v1/servers/{id}/config/validate",
             post(routes_config::validate_config).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerConfigRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/config/revisions",
+            "/api/v1/servers/{id}/config/revisions",
             get(routes_config::list_revisions).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerConfigRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/config/revert",
+            "/api/v1/servers/{id}/config/revert",
             post(routes_config::revert_config).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerConfigWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files",
+            "/api/v1/servers/{id}/files",
             get(routes_files::list_files).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files/download",
+            "/api/v1/servers/{id}/files/download",
             get(routes_files::download_file).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesRead),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files/directory",
+            "/api/v1/servers/{id}/files/directory",
             post(routes_files::create_directory).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files/rename",
+            "/api/v1/servers/{id}/files/rename",
             post(routes_files::rename_entry).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files",
+            "/api/v1/servers/{id}/files",
             delete(routes_files::delete_entry).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files/export",
+            "/api/v1/servers/{id}/files/export",
             get(routes_files::export_archive).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesRead),
             )),
@@ -450,13 +450,13 @@ pub fn build_router(state: AppState) -> Router {
     // running cap remain the real enforcement (streamed, never buffered).
     let protected_uploads = Router::new()
         .route(
-            "/api/v1/servers/:id/files/upload",
+            "/api/v1/servers/{id}/files/upload",
             post(routes_files::upload_files).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesWrite),
             )),
         )
         .route(
-            "/api/v1/servers/:id/files/import",
+            "/api/v1/servers/{id}/files/import",
             post(routes_files::import_archive).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerFilesWrite),
             )),

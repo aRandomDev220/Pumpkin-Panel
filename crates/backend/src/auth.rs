@@ -270,7 +270,6 @@ impl AuthUser {
 
 // Direct extractor: `async fn handler(user: AuthUser)`. Rejects 401 when the
 // middleware did not attach an identity (e.g. route missing the layer).
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,

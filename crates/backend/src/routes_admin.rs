@@ -1198,7 +1198,7 @@ mod tests {
                 )),
             )
             .route(
-                "/api/v1/users/:id",
+                "/api/v1/users/{id}",
                 delete(super::delete_user).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::UsersManage),
                 )),
