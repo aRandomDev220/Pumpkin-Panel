@@ -208,6 +208,8 @@ struct RetentionRow {
     id: String,
     state: String,
     completed_at: Option<String>,
+    created_at: String,
+    checksum: String,
     protected: i64,
     storage_path: String,
 }
@@ -289,6 +291,12 @@ fn backup_json(b: &BackupRow) -> serde_json::Value {
 /// tasks; the rows stay as evidence).
 pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
     clean_staging(backup_root.to_path_buf()).await;
+    let live_rows: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM backups WHERE state = 'in_progress'")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    clean_orphan_parts(backup_root.to_path_buf(), live_rows.into_iter().collect()).await;
     // The backup root can also hold recovery leftovers (should not normally,
     // but never assume): report them, never delete.
     report_recovery_leftovers(pool, backup_root).await;
@@ -307,6 +315,30 @@ pub async fn startup_cleanup(pool: &SqlitePool, backup_root: &Path) {
         clean_staging(parent.clone()).await;
         report_recovery_leftovers(pool, &parent).await;
     }
+}
+
+/// Remove `.tar.gz.part` files with no matching in-progress backup row. A
+/// crash mid-backup leaves these behind forever otherwise; a live backup's
+/// `.part` is preserved.
+async fn clean_orphan_parts(dir: PathBuf, live: HashSet<String>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".tar.gz.part") else {
+                continue;
+            };
+            if live.contains(id) {
+                continue;
+            }
+            if std::fs::remove_file(entry.path()).is_ok() {
+                tracing::info!(file = %name, "removed orphan backup .part file");
+            }
+        }
+    })
+    .await;
 }
 
 /// Run the (blocking) scratch-directory sweep off the async runtime.
@@ -785,7 +817,7 @@ pub(crate) async fn run_backup_capture(
     let archive_entries = verified.files as usize;
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE backups SET state = 'completed', storage_path = ?, size_bytes = ?,
                 checksum_algorithm = 'sha256', checksum = ?, completed_at = ?
          WHERE id = ?",
@@ -796,7 +828,27 @@ pub(crate) async fn run_backup_capture(
     .bind(&now)
     .bind(backup_id)
     .execute(pool)
-    .await;
+    .await
+    {
+        // The archive is verified but the row could not be completed. Remove
+        // the orphan so retention cannot mistake it for a live backup, and
+        // fail loudly; a stuck in_progress row would report success.
+        let _ = tokio::fs::remove_file(&final_path).await;
+        audit::record(
+            pool,
+            actor,
+            "backup.complete",
+            "backup",
+            backup_id,
+            "failed",
+            &audit::request_id(),
+            serde_json::json!({ "error": e.to_string() }),
+        )
+        .await;
+        return Err(BackupError::Failed(format!(
+            "failed to record completed backup: {e}"
+        )));
+    }
     audit::record(
         pool,
         actor,
@@ -842,7 +894,7 @@ pub(crate) async fn retention_rule(pool: &SqlitePool, server_id: &str) -> (usize
     .await
     .unwrap_or(None);
     match row {
-        Some((keep, age)) => (keep.max(0) as usize, age.max(0) as u64),
+        Some((keep, age)) => (keep.max(1) as usize, age.max(0) as u64),
         None => (DEFAULT_RETENTION_COUNT, DEFAULT_MAX_AGE_DAYS),
     }
 }
@@ -878,23 +930,27 @@ async fn prune_retention(
     actor: Option<&str>,
 ) {
     let rows = sqlx::query_as::<_, RetentionRow>(
-        "SELECT id, state, completed_at, protected, storage_path FROM backups
-         WHERE server_id = ? ORDER BY created_at DESC",
+        "SELECT id, state, completed_at, created_at, checksum, protected, storage_path
+         FROM backups
+         WHERE server_id = ?
+         ORDER BY COALESCE(completed_at, created_at) DESC, id DESC",
     )
     .bind(server_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let inputs: Vec<backup_service::RetentionInput> = rows
+    let sources: Vec<backup_service::RetentionSource> = rows
         .iter()
-        .map(|r| backup_service::RetentionInput {
+        .map(|r| backup_service::RetentionSource {
             id: r.id.clone(),
+            state: r.state.clone(),
             completed_at: r.completed_at.clone(),
-            verified: r.state == "completed",
+            created_at: r.created_at.clone(),
+            checksum: r.checksum.clone(),
             protected: r.protected != 0,
-            in_progress: r.state == "in_progress",
         })
         .collect();
+    let inputs = backup_service::retention_inputs(&sources);
     let (keep, max_age_days) = retention_rule(pool, server_id).await;
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2871,9 +2927,11 @@ mod tests {
         std::fs::create_dir_all(dir.join(".tmp-stale-1")).unwrap();
         std::fs::write(dir.join(".tmp-stale-1/chunk"), b"x").unwrap();
         std::fs::write(dir.join("real-backup.tar.gz"), b"keep").unwrap();
+        std::fs::write(dir.join("orphan.tar.gz.part"), b"x").unwrap();
         startup_cleanup(&pool, &dir).await;
         assert!(!dir.join(".tmp-stale-1").exists());
         assert!(dir.join("real-backup.tar.gz").exists());
+        assert!(!dir.join("orphan.tar.gz.part").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

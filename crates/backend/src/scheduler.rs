@@ -37,7 +37,9 @@ use sqlx::SqlitePool;
 
 use crate::audit;
 use crate::auth::AuthUser;
-use crate::backup_service::{cron_is_valid, select_for_deletion, RetentionInput};
+use crate::backup_service::{
+    cron_is_valid, retention_inputs, select_for_deletion, RetentionInput, RetentionSource,
+};
 use crate::routes_backup::{enqueue_backup, BackupError};
 use crate::runtime::{DockerAdapter, RuntimeAdapter};
 use crate::task_runner;
@@ -260,11 +262,11 @@ pub async fn create_policy(
             "timezone must be a non-empty string (interpreted as UTC)",
         );
     }
-    if body.retention_count < 0 || body.max_age_days < 0 {
+    if body.retention_count < 1 || body.max_age_days < 0 {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "INVALID_RETENTION",
-            "retention_count and max_age_days must be >= 0",
+            "retention_count must be >= 1 and max_age_days >= 0",
         );
     }
     let now = Utc::now();
@@ -385,11 +387,11 @@ pub async fn update_policy(
             "timezone must be a non-empty string (interpreted as UTC)",
         );
     }
-    if retention_count < 0 || max_age_days < 0 {
+    if retention_count < 1 || max_age_days < 0 {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "INVALID_RETENTION",
-            "retention_count and max_age_days must be >= 0",
+            "retention_count must be >= 1 and max_age_days >= 0",
         );
     }
     // Recompute the next run whenever the schedule changed.
@@ -495,29 +497,30 @@ pub async fn delete_policy(
 /// Completed backups as canonical Task 1 retention inputs (newest first),
 /// plus the protected count for the preview response.
 async fn load_completed_inputs(pool: &SqlitePool, server_id: &str) -> (Vec<RetentionInput>, usize) {
-    let rows = sqlx::query_as::<_, (String, Option<String>, String, String, i64)>(
-        "SELECT id, completed_at, created_at, checksum, protected FROM backups
-         WHERE server_id = ? AND state = 'completed'
-         ORDER BY COALESCE(completed_at, created_at) DESC",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String, i64)>(
+        "SELECT id, state, completed_at, created_at, checksum, protected FROM backups
+         WHERE server_id = ?
+         ORDER BY COALESCE(completed_at, created_at) DESC, id DESC",
     )
     .bind(server_id)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let protected_kept = rows.iter().filter(|r| r.4 != 0).count();
-    let inputs = rows
+    let protected_kept = rows.iter().filter(|row| row.5 != 0).count();
+    let sources: Vec<RetentionSource> = rows
         .into_iter()
         .map(
-            |(id, completed_at, created_at, checksum, protected)| RetentionInput {
+            |(id, state, completed_at, created_at, checksum, protected)| RetentionSource {
                 id,
-                completed_at: completed_at.or(Some(created_at)),
-                verified: !checksum.is_empty(),
+                state,
+                completed_at,
+                created_at,
+                checksum,
                 protected: protected != 0,
-                in_progress: false,
             },
         )
         .collect();
-    (inputs, protected_kept)
+    (retention_inputs(&sources), protected_kept)
 }
 
 /// Evaluate one retention rule over the server's completed backups with the
@@ -577,11 +580,11 @@ pub async fn retention_preview(
         Some(draft) if draft.retention_count.is_some() || draft.max_age_days.is_some() => {
             let keep = draft.retention_count.unwrap_or(worker_keep as i64);
             let age = draft.max_age_days.unwrap_or(worker_age as i64);
-            if keep < 0 || age < 0 {
+            if keep < 1 || age < 0 {
                 return error(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "INVALID_RETENTION",
-                    "retention_count and max_age_days must be >= 0",
+                    "retention_count must be >= 1 and max_age_days >= 0",
                 );
             }
             (keep as usize, age as u64, "draft")

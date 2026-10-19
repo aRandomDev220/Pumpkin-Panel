@@ -71,6 +71,36 @@ pub struct RetentionInput {
     pub in_progress: bool,
 }
 
+/// One DB row as needed by retention, before verification semantics are
+/// applied. Shared by the preview and the worker so they cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionSource {
+    pub id: String,
+    pub state: String,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub checksum: String,
+    pub protected: bool,
+}
+
+/// Map DB rows to retention inputs with a single definition of "verified"
+/// (completed with a recorded checksum) and "in progress".
+#[must_use]
+pub fn retention_inputs(rows: &[RetentionSource]) -> Vec<RetentionInput> {
+    rows.iter()
+        .map(|row| RetentionInput {
+            id: row.id.clone(),
+            completed_at: row
+                .completed_at
+                .clone()
+                .or_else(|| Some(row.created_at.clone())),
+            verified: row.state == "completed" && !row.checksum.is_empty(),
+            protected: row.protected,
+            in_progress: row.state == "in_progress",
+        })
+        .collect()
+}
+
 /// Decide which backups to delete. Input must be newest-first.
 ///
 /// A backup is deletion-eligible when it is beyond `keep_count` (position
@@ -239,19 +269,29 @@ fn build_archive(
         .map_err(|e| BackupError::Io(format!("cannot create backup file: {e}")))?;
     let encoder = GzEncoder::new(out, Compression::default());
     let mut builder = tar::Builder::new(encoder);
+    let mut skipped: u64 = 0;
     for dir in &dirs {
-        builder
-            .append_dir(dir, data_dir.join(dir))
-            .map_err(|e| BackupError::Io(format!("cannot archive dir: {e}")))?;
+        match builder.append_dir(dir, data_dir.join(dir)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => skipped += 1,
+            Err(e) => return Err(BackupError::Io(format!("cannot archive dir: {e}"))),
+        }
     }
     if total == 0 {
         let _ = progress_tx.send((0, 0));
     }
     for (i, rel) in files.iter().enumerate() {
-        builder
-            .append_path_with_name(data_dir.join(rel), rel)
-            .map_err(|e| BackupError::Io(format!("cannot archive file: {e}")))?;
+        match builder.append_path_with_name(data_dir.join(rel), rel) {
+            Ok(()) => {}
+            // A live world rotates/deletes files while we walk it; a missing
+            // entry is a skipped file, not a failed backup.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => skipped += 1,
+            Err(e) => return Err(BackupError::Io(format!("cannot archive file: {e}"))),
+        }
         let _ = progress_tx.send((i as u64 + 1, total));
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "backup skipped entries that vanished mid-walk");
     }
     let encoder = builder
         .into_inner()
