@@ -71,6 +71,12 @@ pub const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// Only images built by the Pumpkin project may run as game servers.
 pub const IMAGE_ALLOWLIST_PREFIX: &str = "ghcr.io/pumpkin-mc/pumpkin:";
 
+/// UID/GID baked into the pinned Pumpkin image. Used only when the manager
+/// runs as root and no explicit `PUMPKIN_RUNTIME_USER` is configured.
+pub const IMAGE_DEFAULT_UID: u32 = 2613;
+/// GID counterpart of [`IMAGE_DEFAULT_UID`].
+pub const IMAGE_DEFAULT_GID: u32 = 2613;
+
 /// Lowest/highest host port a Java game port may bind.
 pub const MIN_GAME_PORT: u16 = 25565;
 /// `u16::MAX - 1` so `bedrock_port = game_port + 1` cannot overflow.
@@ -559,6 +565,32 @@ fn is_valid_runtime_user(value: &str) -> bool {
     valid_id(uid) && valid_id(gid)
 }
 
+/// Parse a validated numeric `uid:gid` override.
+fn parse_runtime_user(value: &str) -> Option<(u32, u32)> {
+    if !is_valid_runtime_user(value) {
+        return None;
+    }
+    let (uid, gid) = value.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// Decide the child identity from the deployment override and the leaf's
+/// actual owner. A non-root manager keeps its own identity so the bind mount
+/// is writable by construction; a root manager hands the directory to the
+/// image's default user.
+#[cfg(unix)]
+fn effective_child_identity(
+    configured: Option<&str>,
+    leaf_uid: u32,
+    leaf_gid: u32,
+) -> (u32, u32, Option<String>) {
+    match configured.and_then(parse_runtime_user) {
+        Some((uid, gid)) => (uid, gid, Some(format!("{uid}:{gid}"))),
+        None if leaf_uid == 0 => (IMAGE_DEFAULT_UID, IMAGE_DEFAULT_GID, None),
+        None => (leaf_uid, leaf_gid, Some(format!("{leaf_uid}:{leaf_gid}"))),
+    }
+}
+
 /// Read the optional child user from deployment environment.
 fn configured_runtime_user() -> Result<Option<String>, RuntimeError> {
     match std::env::var("PUMPKIN_RUNTIME_USER") {
@@ -678,6 +710,41 @@ impl DockerAdapter {
         }
     }
 
+    /// Create the data directory with an owner the child container can write.
+    /// Returns the container `User` override (if any) so ownership and the
+    /// process identity cannot drift apart.
+    #[cfg(unix)]
+    fn prepare_data_dir(
+        path: &str,
+        configured: Option<&str>,
+    ) -> Result<Option<String>, RuntimeError> {
+        use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::metadata(path).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        let (uid, gid, container_user) =
+            effective_child_identity(configured, metadata.uid(), metadata.gid());
+        if (uid, gid) != (metadata.uid(), metadata.gid()) {
+            chown(path, Some(uid), Some(gid)).map_err(|e| {
+                RuntimeError::CapabilityUnavailable(format!(
+                    "cannot hand server data dir to {uid}:{gid}: {e}"
+                ))
+            })?;
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o750);
+        std::fs::set_permissions(path, permissions).map_err(|e| RuntimeError::Io(e.to_string()))?;
+        Ok(container_user)
+    }
+
+    #[cfg(not(unix))]
+    fn prepare_data_dir(
+        path: &str,
+        configured: Option<&str>,
+    ) -> Result<Option<String>, RuntimeError> {
+        let _ = path;
+        Ok(configured.map(str::to_owned))
+    }
+
     /// Docker container name for a server slug. Always prefixed so manager
     /// containers are recognisable in `docker ps`.
     #[must_use]
@@ -780,6 +847,30 @@ impl DockerAdapter {
     }
 }
 
+/// Whether a container status means it should be stopped before removal.
+fn is_running_status(status: &str) -> bool {
+    matches!(status, "running" | "restarting")
+}
+
+/// Stop a running container gracefully (SIGTERM, world flush) before removing
+/// it. Deleting a live world must not SIGKILL it.
+pub async fn stop_then_remove<A: RuntimeAdapter>(
+    adapter: &A,
+    container_id: &str,
+) -> Result<(), RuntimeError> {
+    match adapter.inspect(container_id).await {
+        Ok(snapshot) if is_running_status(&snapshot.status) => {
+            match adapter.stop(container_id, STOP_TIMEOUT_SECS as u32).await {
+                Ok(()) | Err(RuntimeError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(_) | Err(RuntimeError::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    adapter.remove(container_id).await
+}
+
 impl RuntimeAdapter for DockerAdapter {
     fn create(
         &self,
@@ -788,17 +879,17 @@ impl RuntimeAdapter for DockerAdapter {
         let spec = spec.clone();
         let docker = self.docker.clone();
         async move {
-            // The image runs as an unprivileged user; make sure the host dir
-            // exists so the bind-mount does not surface as root-owned.
-            // (Recursive chown to the pumpkin UID is a deploy/entrypoint
-            // concern — this crate intentionally takes no `nix` dependency.)
+            // The container must be able to write its world/config. Create
+            // the leaf and hand it to the same identity the container runs
+            // as (explicit override, manager identity for non-root dev, or
+            // the image default when the manager is root).
             tokio::fs::create_dir_all(&spec.data_path)
                 .await
                 .map_err(|e| RuntimeError::Io(e.to_string()))?;
+            let child_user = Self::prepare_data_dir(&spec.data_path, self.runtime_user.as_deref())?;
 
             let name = Self::container_name(&spec.slug);
-            let config =
-                Self::build_create_config_with_runtime_user(&spec, self.runtime_user.as_deref());
+            let config = Self::build_create_config_with_runtime_user(&spec, child_user.as_deref());
             let options = CreateContainerOptions {
                 name: name.clone(),
                 platform: None,
@@ -1486,6 +1577,36 @@ mod tests {
 
         let labels = cfg.labels.expect("labels");
         assert_eq!(labels.get(LABEL_MANAGED).map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn child_identity_matches_data_dir_ownership() {
+        assert_eq!(parse_runtime_user("100:101"), Some((100, 101)));
+        assert_eq!(parse_runtime_user("0:101"), None);
+        assert_eq!(parse_runtime_user("nope"), None);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                effective_child_identity(Some("100:101"), 0, 0),
+                (100, 101, Some("100:101".to_string()))
+            );
+            assert_eq!(
+                effective_child_identity(None, 0, 0),
+                (IMAGE_DEFAULT_UID, IMAGE_DEFAULT_GID, None)
+            );
+            assert_eq!(
+                effective_child_identity(None, 1000, 1000),
+                (1000, 1000, Some("1000:1000".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn only_live_containers_are_stopped_before_removal() {
+        assert!(is_running_status("running"));
+        assert!(is_running_status("restarting"));
+        assert!(!is_running_status("exited"));
+        assert!(!is_running_status("created"));
     }
 
     #[test]

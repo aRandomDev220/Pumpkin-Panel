@@ -4,7 +4,6 @@ import { join } from "node:path";
 import {
   E2E_BASE_URL,
   api,
-  chownLeaf,
   dumpContainerLogs,
   removeContainer,
   removeScratchDir,
@@ -144,8 +143,6 @@ test.describe.serial("full user journey", () => {
     expect(match.length).toBe(1);
     serverId = match[0].id;
 
-    // Pumpkin runs as UID 2613; the manager-owned data dir must be handed over.
-    await chownLeaf(join(backend.dataDir, serverId));
   });
 
   test("(d) start reaches online", async ({ page }) => {

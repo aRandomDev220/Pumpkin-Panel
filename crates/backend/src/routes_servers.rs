@@ -829,7 +829,7 @@ async fn delete_server_inner(
                 "no runtime attached; cannot remove container",
             ));
         };
-        if let Err(e) = adapter.remove(&server.container_id).await {
+        if let Err(e) = runtime::stop_then_remove(adapter.as_ref(), &server.container_id).await {
             // Removing an already-gone container is success.
             if !matches!(e, RuntimeError::NotFound(_)) {
                 return Err(runtime_error(e));

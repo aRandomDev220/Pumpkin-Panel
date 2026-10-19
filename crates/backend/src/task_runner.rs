@@ -712,8 +712,7 @@ pub async fn dispatch_task<A: super::runtime::RuntimeAdapter>(
                     .await
                     .map(|()| "server restarted".to_string()),
                 // Data survives: servers use bind-mounts, never volumes.
-                "remove" => adapter
-                    .remove(&container_id)
+                "remove" => crate::runtime::stop_then_remove(adapter, &container_id)
                     .await
                     .map(|()| "container removed".to_string()),
                 // The outer `match` only routes the four lifecycle ops here,
