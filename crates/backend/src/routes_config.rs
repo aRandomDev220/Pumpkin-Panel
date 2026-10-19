@@ -18,9 +18,6 @@
 //! Dead-code lints are silenced until the controller wires these handlers
 //! into `main.rs` (same transient state as the other Phase 4 task modules).
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -29,7 +26,6 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
 
 use crate::{
     audit,
@@ -167,22 +163,6 @@ async fn current_state(pool: &SqlitePool, server_id: &str) -> (i64, Option<Strin
     .await
     .unwrap_or(1);
     (revision, None)
-}
-
-/// Try to claim the per-server op lock (same pattern as `routes_servers`).
-/// `false` = a conflicting save is in flight; the caller must fail fast
-/// with `SERVER_BUSY` instead of queuing behind I/O.
-async fn try_lock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) -> bool {
-    let mut guard = locks.lock().await;
-    if guard.contains(server_id) {
-        return false;
-    }
-    guard.insert(server_id.to_string());
-    true
-}
-
-async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
-    locks.lock().await.remove(server_id);
 }
 
 /// Short hash prefix for human-facing divergence messages (never bodies).
@@ -438,16 +418,16 @@ async fn save_new_revision(
     expected_revision: i64,
     new_content: String,
 ) -> Response {
-    if !try_lock(&state.op_locks, &server.id).await {
+    // RAII: the guard releases on every exit path, including a dropped
+    // request future, so one aborted save cannot brick the server.
+    let Some(_guard) = crate::op_lock::try_acquire(&state.op_locks, &server.id).await else {
         return error(
             StatusCode::CONFLICT,
             "SERVER_BUSY",
             "another config save is in flight for this server",
         );
-    }
-    let response = save_inner(state, user, server, expected_revision, new_content).await;
-    unlock(&state.op_locks, &server.id).await;
-    response
+    };
+    save_inner(state, user, server, expected_revision, new_content).await
 }
 
 /// Revision check → validate → pre-change copy → atomic rename → re-read +
@@ -506,15 +486,20 @@ async fn save_inner(
             )
         }
     };
-    if sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .is_err()
-    {
+    if let Err(e) = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+        let message = e.to_string();
+        if message.contains("locked") || message.contains("busy") {
+            return error(
+                StatusCode::CONFLICT,
+                "SERVER_BUSY",
+                "another config save is in flight; retry",
+            );
+        }
+        tracing::warn!(server_id = %server.id, error = %message, "config begin failed");
         return error(
-            StatusCode::CONFLICT,
-            "SERVER_BUSY",
-            "another config save is in flight; retry",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "database unavailable",
         );
     }
     let outcome: Result<(), Response> = async {
@@ -586,8 +571,18 @@ async fn save_inner(
                 ));
             }
         }
-        let tmp = path.with_extension(format!("toml.{}.tmp", uuid::Uuid::new_v4()));
-        if let Err(e) = tokio::fs::write(&tmp, new_content.as_bytes()).await {
+        // Fixed hidden tempfile (the op lock serializes writers): a crash
+        // leaves at most one stale file, and the next save overwrites it.
+        let tmp = path.with_file_name(".pumpkin.toml.tmp");
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let write = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, new_content.as_bytes()).await?;
+            file.sync_all().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(e) = write {
             let _ = tokio::fs::remove_file(&tmp).await;
             tracing::warn!(server_id = %server.id, error = %e, "config tempfile write failed");
             return Err(error(
@@ -604,6 +599,15 @@ async fn save_inner(
                 "INTERNAL",
                 "failed to replace pumpkin.toml",
             ));
+        }
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            })
+            .await;
         }
         // Re-read + verify: the bytes on disk must hash to what we saved.
         let reread = tokio::fs::read_to_string(&path).await.map_err(|_| {
@@ -642,7 +646,19 @@ async fn save_inner(
     .await;
     match outcome {
         Ok(()) => {
-            let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+            if sqlx::query("COMMIT").execute(&mut *conn).await.is_err() {
+                // The file is already on disk but the revision was rolled
+                // back. Put the previous bytes back so the file does not
+                // silently diverge from its recorded baseline.
+                let _ = tokio::fs::write(&path, old_content.as_bytes()).await;
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                tracing::warn!(server_id = %server.id, "config commit failed; file restored");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "pumpkin.toml was written but the revision could not be committed",
+                );
+            }
         }
         Err(resp) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
