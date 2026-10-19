@@ -185,7 +185,7 @@ pub enum AuthError {
 /// Hash a password with Argon2id + fresh 128-bit salt. Returns PHC string.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
     let mut salt_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt_bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut salt_bytes);
     let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| AuthError::HashFailed)?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -226,7 +226,7 @@ pub fn verify_dummy(password: &str) {
 /// Generate a raw 256-bit session token, hex-encoded (64 chars).
 pub fn generate_session_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     hex_encode(&bytes)
 }
 
