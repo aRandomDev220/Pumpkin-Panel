@@ -35,7 +35,7 @@ use crate::{
     audit,
     auth::AuthUser,
     config_profile::{content_hash, guided_from_doc, parse_and_validate, profile_for_version},
-    AppState,
+    file_service, AppState,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,8 +107,33 @@ async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerRow>, 
     Ok(row)
 }
 
-fn config_path(server: &ServerRow) -> std::path::PathBuf {
-    std::path::Path::new(&server.data_path).join("pumpkin.toml")
+/// Resolve the server data root, matching the file-manager fallback for
+/// legacy rows whose `data_path` was never populated.
+fn server_data_root(server: &ServerRow, server_root: &std::path::Path) -> std::path::PathBuf {
+    if server.data_path.is_empty() {
+        server_root.join(&server.id)
+    } else {
+        std::path::PathBuf::from(&server.data_path)
+    }
+}
+
+/// Resolve `pumpkin.toml` through the sandbox: a symlink in the data dir
+/// pointing outside the server root must not be readable or writable.
+fn config_path(
+    server: &ServerRow,
+    server_root: &std::path::Path,
+) -> Result<std::path::PathBuf, file_service::FileError> {
+    let root = server_data_root(server, server_root);
+    file_service::resolve(&root, "pumpkin.toml")
+}
+
+fn config_path_error(e: file_service::FileError) -> Response {
+    let status = match e {
+        file_service::FileError::OutsideRoot => StatusCode::BAD_REQUEST,
+        file_service::FileError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error(status, e.code(), "cannot access pumpkin.toml")
 }
 
 /// Current `(configuration_revision, content_hash baseline)`, creating the
@@ -187,7 +212,11 @@ pub async fn get_config(
         return error(StatusCode::NOT_FOUND, "SERVER_NOT_FOUND", "no such server");
     };
     let profile = profile_json(&server.runtime_version);
-    let content = match tokio::fs::read_to_string(config_path(&server)).await {
+    let path = match config_path(&server, &state.server_root) {
+        Ok(path) => path,
+        Err(e) => return config_path_error(e),
+    };
+    let content = match tokio::fs::read_to_string(path).await {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Fresh server: Pumpkin never booted, no file yet. The profile
@@ -456,7 +485,10 @@ async fn save_inner(
             .into_response();
     }
 
-    let path = config_path(server);
+    let path = match config_path(server, &state.server_root) {
+        Ok(path) => path,
+        Err(e) => return config_path_error(e),
+    };
     let old_content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
     let old_hash = content_hash(&old_content);
     let new_hash = content_hash(&new_content);
@@ -1294,5 +1326,39 @@ mod tests {
             json!("INVALID_CONFIGURATION")
         );
         assert_eq!(read_pumpkin_toml(&data_path), GARBAGE);
+    }
+    #[test]
+    fn config_path_rejects_symlink_outside_server_root() {
+        let root = std::env::temp_dir().join(format!("pm-cfg-{}", uuid::Uuid::new_v4()));
+        let data = root.join("s1");
+        std::fs::create_dir_all(&data).unwrap();
+        let outside = root.join("secret.toml");
+        std::fs::write(&outside, b"top-secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, data.join("pumpkin.toml")).unwrap();
+        let row = ServerRow {
+            id: "s1".to_string(),
+            data_path: data.to_string_lossy().into_owned(),
+            runtime_version: String::new(),
+        };
+        assert_eq!(
+            config_path(&row, &root),
+            Err(file_service::FileError::OutsideRoot)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_path_falls_back_to_server_root_for_empty_data_path() {
+        let root = std::env::temp_dir().join(format!("pm-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("s2")).unwrap();
+        let row = ServerRow {
+            id: "s2".to_string(),
+            data_path: String::new(),
+            runtime_version: String::new(),
+        };
+        let path = config_path(&row, &root).expect("resolves under the server root");
+        assert!(path.starts_with(root.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
