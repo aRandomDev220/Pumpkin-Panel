@@ -18,6 +18,26 @@ pub async fn connect(database_url: &str) -> anyhow::Result<sqlx::SqlitePool> {
     Ok(pool)
 }
 
+/// Delete expired/revoked sessions and audit rows older than 90 days.
+/// Called from the scheduler loop so both tables stop growing forever.
+pub async fn prune_ephemeral(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM sessions
+         WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            OR (revoked_at IS NOT NULL
+                AND revoked_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day'))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM audit_events
+         WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Migration / schema-integrity tests
 // ---------------------------------------------------------------------------
@@ -400,6 +420,73 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == want), "missing index {want}");
         }
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn prune_ephemeral_removes_expired_sessions_and_old_audit() {
+        let (dir, pool) = migrated_pool().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role) VALUES ('u1','u1','h','owner')",
+        )
+        .execute(&pool)
+        .await
+        .expect("user");
+        let recent = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        for (id, expires, revoked) in [
+            ("expired", "2000-01-01T00:00:00.000Z", None),
+            ("valid", "2099-01-01T00:00:00.000Z", None),
+            (
+                "revoked-old",
+                "2099-01-01T00:00:00.000Z",
+                Some("2000-01-01T00:00:00.000Z"),
+            ),
+            (
+                "revoked-recent",
+                "2099-01-01T00:00:00.000Z",
+                Some(recent.as_str()),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (id, user_id, token_hash, expires_at, revoked_at)
+                 VALUES (?, 'u1', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("hash-{id}"))
+            .bind(expires)
+            .bind(revoked)
+            .execute(&pool)
+            .await
+            .expect("session");
+        }
+        sqlx::query(
+            "INSERT INTO audit_events (id, action, target_type, target_id, outcome, request_id, created_at)
+             VALUES ('old','x','y','z','ok','r','2020-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("old audit");
+        sqlx::query(
+            "INSERT INTO audit_events (id, action, target_type, target_id, outcome, request_id)
+             VALUES ('recent','x','y','z','ok','r')",
+        )
+        .execute(&pool)
+        .await
+        .expect("recent audit");
+
+        prune_ephemeral(&pool).await.expect("prune");
+
+        let sessions: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions, vec!["revoked-recent", "valid"]);
+        let audits: Vec<String> = sqlx::query_scalar("SELECT id FROM audit_events ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("audit");
+        assert_eq!(audits, vec!["recent"]);
+
         drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
     }

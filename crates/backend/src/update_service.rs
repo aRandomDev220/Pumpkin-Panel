@@ -385,21 +385,6 @@ async fn unlock(locks: &Arc<Mutex<HashSet<String>>>, server_id: &str) {
     locks.lock().await.remove(server_id);
 }
 
-/// Heuristic for "Docker is unreachable" (mirrors `routes_backup`).
-fn is_daemon_down(e: &RuntimeError) -> bool {
-    match e {
-        RuntimeError::Docker(inner) => {
-            let msg = inner.to_string();
-            msg.contains("Socket")
-                || msg.contains("socket")
-                || msg.contains("connection refused")
-                || msg.contains("No such file")
-                || msg.contains("os error")
-        }
-        _ => false,
-    }
-}
-
 /// Sum of regular-file sizes under `path` (blocking, symlink-free walk).
 fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
@@ -1055,7 +1040,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         match adapter.inspect(&server.container_id).await {
             Ok(snap) => was_running = snap.status == "running",
             Err(RuntimeError::NotFound(_)) => container_gone = true,
-            Err(e) if is_daemon_down(&e) => {
+            Err(e) if crate::runtime::is_daemon_down(&e) => {
                 terminal_fail(
                     pool,
                     task_id,
@@ -1084,7 +1069,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         {
             match e {
                 RuntimeError::NotFound(_) => container_gone = true,
-                _ if is_daemon_down(&e) => {
+                _ if crate::runtime::is_daemon_down(&e) => {
                     terminal_fail(
                         pool,
                         task_id,
@@ -1236,7 +1221,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         if was_running && !container_gone {
             let _ = adapter.start(&server.container_id).await;
         }
-        if is_daemon_down(&e) {
+        if crate::runtime::is_daemon_down(&e) {
             terminal_fail(
                 pool,
                 task_id,
@@ -1610,7 +1595,7 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
         match adapter.inspect(&server.container_id).await {
             Ok(snap) => was_running = snap.status == "running",
             Err(RuntimeError::NotFound(_)) => container_gone = true,
-            Err(e) if is_daemon_down(&e) => {
+            Err(e) if crate::runtime::is_daemon_down(&e) => {
                 terminal_fail(
                     pool,
                     task_id,

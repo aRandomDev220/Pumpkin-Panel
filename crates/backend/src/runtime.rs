@@ -500,6 +500,28 @@ pub enum RuntimeError {
     Io(String),
 }
 
+/// Whether a runtime failure means the Docker daemon/socket is unreachable.
+/// Typed matching keeps permission errors actionable instead of hiding them
+/// behind "runtime unavailable".
+#[must_use]
+pub fn is_daemon_down(error: &RuntimeError) -> bool {
+    match error {
+        RuntimeError::Docker(bollard::errors::Error::IOError { err }) => matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+        ),
+        RuntimeError::Docker(inner) => {
+            // Some transports wrap the io error; keep a narrow textual
+            // fallback for those.
+            let message = inner.to_string();
+            message.contains("connection refused") || message.contains("No such file")
+        }
+        _ => false,
+    }
+}
+
 impl RuntimeError {
     /// Machine-facing error code for API error bodies.
     #[must_use]
@@ -1892,5 +1914,26 @@ mod tests {
         assert!((cpu_percent_from_deltas(50, 100, 1.0) - 50.0).abs() < 1e-9);
         assert_eq!(cpu_percent_from_deltas(0, 0, 1.0), 0.0);
         assert!((cpu_percent_from_deltas(100, 100, 2.0) - 200.0).abs() < 1e-9);
+    }
+    #[test]
+    fn daemon_down_is_typed_and_permission_errors_stay_actionable() {
+        let missing = RuntimeError::Docker(bollard::errors::Error::IOError {
+            err: std::io::Error::new(std::io::ErrorKind::NotFound, "no socket"),
+        });
+        assert!(is_daemon_down(&missing));
+        let refused = RuntimeError::Docker(bollard::errors::Error::IOError {
+            err: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        });
+        assert!(is_daemon_down(&refused));
+        let forbidden = RuntimeError::Docker(bollard::errors::Error::IOError {
+            err: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        });
+        assert!(
+            !is_daemon_down(&forbidden),
+            "permission errors must remain actionable"
+        );
+        assert!(!is_daemon_down(&RuntimeError::InvalidConfiguration(
+            "bad".to_string()
+        )));
     }
 }

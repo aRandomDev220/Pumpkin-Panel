@@ -210,7 +210,7 @@ async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
 
 fn runtime_error(e: RuntimeError) -> Response {
     // Daemon-down must read as degraded runtime, never as "stopped".
-    if is_daemon_down(&e) {
+    if runtime::is_daemon_down(&e) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "RUNTIME_UNAVAILABLE",
@@ -228,21 +228,6 @@ fn runtime_error(e: RuntimeError) -> Response {
         _ => StatusCode::BAD_GATEWAY,
     };
     error(status, code, e.client_message())
-}
-
-/// Heuristic for "Docker is unreachable" inside bollard's error strings.
-fn is_daemon_down(e: &RuntimeError) -> bool {
-    match e {
-        RuntimeError::Docker(inner) => {
-            let msg = inner.to_string();
-            msg.contains("Socket")
-                || msg.contains("socket")
-                || msg.contains("connection refused")
-                || msg.contains("No such file")
-                || msg.contains("os error")
-        }
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,23 +454,55 @@ pub async fn create_server(
         // to create the container; otherwise Docker returns a misleading
         // `No such image` 404 and the UI can only report a generic 502.
         let pull_ref = runtime::pinned_image_reference(&spec.image_reference, &spec.image_digest);
-        if let Err(e) = adapter.pull_image(&pull_ref).await {
-            let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
-                .bind(&server_id)
-                .execute(&state.pool)
+        // Bound the pull: a cold registry can take minutes, but the request
+        // must not hang forever behind a stalled registry connection.
+        let pulled = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            adapter.pull_image(&pull_ref),
+        )
+        .await;
+        match pulled {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
+                    .bind(&server_id)
+                    .execute(&state.pool)
+                    .await;
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "server.create",
+                    "server",
+                    &server_id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "name": name, "stage": "image_pull" }),
+                )
                 .await;
-            audit::record(
-                &state.pool,
-                Some(&user.id),
-                "server.create",
-                "server",
-                &server_id,
-                "failed",
-                &request_id,
-                serde_json::json!({ "name": name, "stage": "image_pull" }),
-            )
-            .await;
-            return runtime_error(e);
+                return runtime_error(e);
+            }
+            Err(_) => {
+                let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
+                    .bind(&server_id)
+                    .execute(&state.pool)
+                    .await;
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "server.create",
+                    "server",
+                    &server_id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "name": name, "stage": "image_pull_timeout" }),
+                )
+                .await;
+                return error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "IMAGE_PULL_TIMEOUT",
+                    "image pull timed out after 5 minutes; retry",
+                );
+            }
         }
         match adapter.create(&spec).await {
             Ok(handle) => {
@@ -1072,7 +1089,7 @@ pub async fn server_status(
                 Err(RuntimeError::NotFound(_)) => {
                     observed = "missing".to_string();
                 }
-                Err(e) if is_daemon_down(&e) => {
+                Err(e) if runtime::is_daemon_down(&e) => {
                     docker_available = false;
                     runtime_state_verified = false;
                 }

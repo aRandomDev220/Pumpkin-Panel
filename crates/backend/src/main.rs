@@ -714,6 +714,9 @@ async fn main() -> anyhow::Result<()> {
                 if futures_util::FutureExt::catch_unwind(tick).await.is_err() {
                     tracing::error!("scheduler tick panicked; continuing");
                 }
+                if let Err(e) = db::prune_ephemeral(&pool).await {
+                    tracing::warn!(error = %e, "ephemeral retention failed");
+                }
             }
         });
     }
@@ -745,7 +748,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         adapter,
         runner,
         server_root,
@@ -764,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
         "pumpkin-manager starting"
     );
 
+    let shutdown_pool = pool.clone();
     let app = build_router(state);
     let addr = settings.bind_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -771,8 +775,60 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Give in-flight tasks a bounded window to reach a safe point before the
+    // process exits; log honestly if some are still running.
+    tracing::warn!("http server stopped; waiting up to 30s for in-flight tasks");
+    for _ in 0..30 {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE state IN ('queued','running','cancel_requested')",
+        )
+        .fetch_one(&shutdown_pool)
+        .await
+        .unwrap_or(0);
+        if active == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    audit::record(
+        &shutdown_pool,
+        None,
+        "manager.shutdown",
+        "manager",
+        "shutdown",
+        "ok",
+        &audit::request_id(),
+        serde_json::json!({}),
+    )
+    .await;
     Ok(())
+}
+
+/// Resolve on SIGINT/SIGTERM so axum can drain HTTP connections.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::warn!("shutdown signal received; draining connections");
 }
 
 /// Sync `observed_state` from live container state (best-effort).

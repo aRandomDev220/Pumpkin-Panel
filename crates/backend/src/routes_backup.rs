@@ -665,21 +665,6 @@ async fn fail_backup(pool: &SqlitePool, task_id: &str, backup_id: &str, code: &s
     .await;
 }
 
-/// Heuristic for "Docker is unreachable" (mirrors `routes_servers`).
-fn is_daemon_down(e: &RuntimeError) -> bool {
-    match e {
-        RuntimeError::Docker(inner) => {
-            let msg = inner.to_string();
-            msg.contains("Socket")
-                || msg.contains("socket")
-                || msg.contains("connection refused")
-                || msg.contains("No such file")
-                || msg.contains("os error")
-        }
-        _ => false,
-    }
-}
-
 fn parent_of(data_path: &str) -> Option<PathBuf> {
     let path = Path::new(data_path);
     if data_path.is_empty() {
@@ -772,7 +757,7 @@ pub(crate) async fn run_backup_capture(
                     a.stop(&server.container_id, task_runner::TASK_STOP_TIMEOUT_SECS)
                         .await
                         .map_err(|e| {
-                            if is_daemon_down(&e) {
+                            if crate::runtime::is_daemon_down(&e) {
                                 BackupError::RuntimeUnavailable
                             } else {
                                 BackupError::Failed(format!(
@@ -784,7 +769,9 @@ pub(crate) async fn run_backup_capture(
                 }
             }
             Err(RuntimeError::NotFound(_)) => {}
-            Err(e) if is_daemon_down(&e) => return Err(BackupError::RuntimeUnavailable),
+            Err(e) if crate::runtime::is_daemon_down(&e) => {
+                return Err(BackupError::RuntimeUnavailable)
+            }
             Err(e) => {
                 return Err(BackupError::Failed(format!(
                     "failed to inspect container: {e}"
@@ -1276,7 +1263,9 @@ async fn execute_restore_inner(
                 }
                 Ok(_) => {}
                 Err(RuntimeError::NotFound(_)) => {}
-                Err(e) if is_daemon_down(&e) => return Err(BackupError::RuntimeUnavailable),
+                Err(e) if crate::runtime::is_daemon_down(&e) => {
+                    return Err(BackupError::RuntimeUnavailable)
+                }
                 Err(e) => {
                     return Err(BackupError::Failed(format!(
                         "failed to inspect container: {e}"
