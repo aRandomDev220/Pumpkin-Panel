@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useAuth } from "../lib/auth";
 import {
   checksumShort,
   createBackup,
@@ -39,6 +40,9 @@ export default function BackupsSection({
   serverId,
   observedState,
 }: BackupsSectionProps) {
+  const { can } = useAuth();
+  const canBackup = can("server.backup.create");
+  const canRestore = can("server.backup.restore");
   const qc = useQueryClient();
   const stopped = (observedState ?? "").toLowerCase() === "stopped";
 
@@ -323,7 +327,7 @@ export default function BackupsSection({
               setConsistency(e.target.value as BackupConsistency)
             }
             aria-label="Backup consistency"
-            disabled={backupBusy}
+            disabled={backupBusy || !canBackup}
           >
             <option value="stopped">stopped</option>
             <option value="live">live</option>
@@ -331,12 +335,18 @@ export default function BackupsSection({
         </label>
         <button
           type="button"
-          disabled={backupBusy}
+          disabled={backupBusy || !canBackup}
           onClick={() => backupMutation.mutate(consistency)}
         >
           {backupTaskId ? "Backing up… polling" : "Run full backup"}
         </button>
       </div>
+      {!canBackup && (
+        <p className="muted" role="note">
+          Your role can download backups but cannot create, delete, or restore
+          them.
+        </p>
+      )}
       {consistency === "live" && (
         <p className="warn" role="note">
           Live backups capture a running server and may be inconsistent — files
@@ -404,14 +414,14 @@ export default function BackupsSection({
                     </button>
                     <button
                       type="button"
-                      disabled={deleteMutation.isPending}
+                      disabled={deleteMutation.isPending || !canBackup}
                       onClick={() => onDelete(b.id, b.protected)}
                     >
                       Delete
                     </button>
                     <button
                       type="button"
-                      disabled={!stopped || restoreBusy}
+                      disabled={!stopped || restoreBusy || !canRestore}
                       title={
                         stopped
                           ? restoreArm === b.id

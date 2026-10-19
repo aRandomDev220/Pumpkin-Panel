@@ -498,7 +498,12 @@ pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> R
 /// GET /api/v1/auth/me — returns the authenticated user.
 #[allow(dead_code)]
 pub async fn me(auth_user: AuthUser) -> impl IntoResponse {
-    Json(auth_user)
+    Json(serde_json::json!({
+        "id": auth_user.id,
+        "username": auth_user.username,
+        "role": auth_user.role.as_str(),
+        "permissions": auth_user.permissions(),
+    }))
 }
 
 /// POST /api/v1/auth/change-password — verifies current password, rotates

@@ -92,7 +92,6 @@ impl Role {
 /// Permissions from spec 12.2. Config/files/backup variants are enforced
 /// by their workstreams (Phases 4-5); listed here so the matrix is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum Permission {
     ServerRead,
     ServerCreate,
@@ -111,7 +110,6 @@ pub enum Permission {
 }
 
 impl Permission {
-    #[allow(dead_code)] // surfaced by Phase 7 audit UI
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ServerRead => "server.read",
@@ -131,7 +129,6 @@ impl Permission {
         }
     }
 
-    #[allow(dead_code)] // surfaced by Phase 7 audit UI
     pub fn all() -> &'static [Self] {
         use Permission as P;
         &[
@@ -265,6 +262,17 @@ pub struct AuthUser {
 impl AuthUser {
     pub fn can(&self, permission: Permission) -> bool {
         has_permission(self.role, permission)
+    }
+
+    /// Effective permission strings for the SPA, derived from the same
+    /// central matrix the API enforces.
+    #[must_use]
+    pub fn permissions(&self) -> Vec<&'static str> {
+        Permission::all()
+            .iter()
+            .filter(|permission| has_permission(self.role, **permission))
+            .map(|permission| permission.as_str())
+            .collect()
     }
 }
 
@@ -741,5 +749,33 @@ mod tests {
             Some("csrfvalue")
         );
         assert_eq!(session_token_from_set_cookie(&HeaderMap::new()), None);
+    }
+    #[test]
+    fn permission_projection_matches_the_matrix() {
+        let owner = AuthUser {
+            id: "u1".to_string(),
+            username: "owner".to_string(),
+            role: Role::Owner,
+        };
+        assert_eq!(owner.permissions().len(), Permission::all().len());
+
+        let admin = AuthUser {
+            id: "u2".to_string(),
+            username: "admin".to_string(),
+            role: Role::Admin,
+        };
+        assert!(admin.permissions().contains(&"server.lifecycle"));
+        assert!(!admin.permissions().contains(&"users.manage"));
+        assert!(!admin.permissions().contains(&"settings.manage"));
+
+        let viewer = AuthUser {
+            id: "u3".to_string(),
+            username: "viewer".to_string(),
+            role: Role::Viewer,
+        };
+        assert_eq!(
+            viewer.permissions(),
+            vec!["server.read", "server.config.read", "server.files.read"]
+        );
     }
 }

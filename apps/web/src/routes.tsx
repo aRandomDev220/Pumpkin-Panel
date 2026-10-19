@@ -1,7 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { useAuth } from "./lib/auth";
-import { isPrivilegedRole } from "./lib/admin";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
 import Overview from "./pages/Overview";
@@ -23,18 +22,26 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-// Owner/admin-only pages. Viewers (and signed-out edge cases that reach here)
-// get an explicit denied state instead of a silent 404.
-function RequirePrivileged({ children }: { children: ReactNode }) {
-  const { user, isLoading } = useAuth();
+// Permission-gated pages. The check mirrors the backend matrix, so a user
+// never reaches a page whose API calls would all 403.
+function RequirePermission({
+  permission,
+  children,
+}: {
+  permission: string;
+  children: ReactNode;
+}) {
+  const { can, isLoading } = useAuth();
   if (isLoading) return <p>Loading…</p>;
-  if (!isPrivilegedRole(user?.role)) {
+  if (!can(permission)) {
+    const ownerOnly =
+      permission === "users.manage" || permission === "settings.manage";
     return (
       <section>
         <h2>Not available</h2>
         <p className="err" role="alert">
-          This page requires an owner or admin account. Viewers keep
-          Overview, Servers, and Monitoring.
+          This page requires {ownerOnly ? "an owner" : "an admin or owner"}{" "}
+          account.
         </p>
       </section>
     );
@@ -91,9 +98,9 @@ export default function AppRoutes() {
         path="/users"
         element={
           <RequireAuth>
-            <RequirePrivileged>
+            <RequirePermission permission="users.manage">
               <Users />
-            </RequirePrivileged>
+            </RequirePermission>
           </RequireAuth>
         }
       />
@@ -101,9 +108,9 @@ export default function AppRoutes() {
         path="/audit"
         element={
           <RequireAuth>
-            <RequirePrivileged>
+            <RequirePermission permission="audit.read">
               <Audit />
-            </RequirePrivileged>
+            </RequirePermission>
           </RequireAuth>
         }
       />
@@ -111,9 +118,9 @@ export default function AppRoutes() {
         path="/settings"
         element={
           <RequireAuth>
-            <RequirePrivileged>
+            <RequirePermission permission="settings.manage">
               <Settings />
-            </RequirePrivileged>
+            </RequirePermission>
           </RequireAuth>
         }
       />

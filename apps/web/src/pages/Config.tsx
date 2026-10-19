@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
+import { useAuth } from "../lib/auth";
 import {
   ConfigConflictError,
   ConfigValidationError,
@@ -144,6 +145,8 @@ function parseNumberOr(original: string, fallback: number | undefined): number |
 }
 
 export default function Config() {
+  const { can } = useAuth();
+  const canWrite = can("server.config.write");
   const { id } = useParams<{ id: string }>();
   const qc = useQueryClient();
   const [content, setContent] = useState("");
@@ -474,7 +477,12 @@ export default function Config() {
               style={{ display: "block", width: "100%", fontFamily: "monospace" }}
             />
           </label>
-           <div className="config-actions">
+           {!canWrite && (
+            <p className="muted" role="note">
+              Your role can inspect this config but cannot save or revert it.
+            </p>
+          )}
+          <div className="config-actions">
             <button
               type="button"
               disabled={validateMutation.isPending}
@@ -488,7 +496,7 @@ export default function Config() {
             </button>
             <button
               type="button"
-              disabled={saveMutation.isPending}
+              disabled={saveMutation.isPending || !canWrite}
               onClick={() => {
                 setSaveErrors([]);
                 saveMutation.mutate(content);
@@ -539,7 +547,7 @@ export default function Config() {
                     </span>{" "}
                     <button
                       type="button"
-                      disabled={revertMutation.isPending}
+                      disabled={revertMutation.isPending || !canWrite}
                       onClick={() => {
                         if (window.confirm(`Revert config to revision ${r.revision}?`)) {
                           revertMutation.mutate(r.revision);

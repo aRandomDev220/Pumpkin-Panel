@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { FormEvent } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
+import { useAuth } from "../lib/auth";
 import { createServer, deleteServer, digestWarning, fetchStatus, listServers, validateCreateServer } from "../lib/servers";
 
 const RECOMMENDED_IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
@@ -20,6 +21,9 @@ function stateClass(state: string): string {
 }
 
 export default function Servers(): React.JSX.Element {
+  const { can } = useAuth();
+  const canCreate = can("server.create");
+  const canDelete = can("server.delete");
   const qc = useQueryClient();
   const serversQuery = useQuery({ queryKey: ["servers"], queryFn: listServers });
   const [name, setName] = useState("");
@@ -73,7 +77,7 @@ export default function Servers(): React.JSX.Element {
     <section>
       <div className="page-heading">
         <div><div className="eyebrow">Worlds · Pumpkin runtime</div><h2>Servers</h2><p>Run, inspect, and protect the worlds living on your home node.</p></div>
-        <div className="heading-actions"><a className="button-link" href="#create-server">Create a server</a></div>
+        {canCreate && <div className="heading-actions"><a className="button-link" href="#create-server">Create a server</a></div>}
       </div>
 
       <div className="server-overview-strip">
@@ -110,7 +114,7 @@ export default function Servers(): React.JSX.Element {
                   <button type="submit" disabled={deleteMutation.isPending}>Confirm delete</button>
                   <button className="button-secondary" type="button" onClick={() => setDeleteTarget(null)}>Cancel</button>
                   {deleteMutation.isError && <span className="err">Delete failed.</span>}
-                </form> : <button className="button-danger" type="button" onClick={() => setDeleteTarget(server.id)}>Delete</button>}
+                </form> : canDelete ? <button className="button-danger" type="button" onClick={() => setDeleteTarget(server.id)}>Delete</button> : null}
               </div>
             </li>;
           })}
@@ -121,21 +125,22 @@ export default function Servers(): React.JSX.Element {
         <div className="form-panel-heading"><div><div className="eyebrow">New world</div><h3>Create a Pumpkin server</h3><p>Start with the verified build. Advanced image selection is available when you need it.</p></div><span className="form-panel-badge">Pumpkin / Java</span></div>
         <form onSubmit={onCreate}>
           <div className="form-grid">
-            <label>Name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="survival" required /></label>
-            <label>Java port<input value={gamePort} onChange={(event) => setGamePort(event.target.value)} inputMode="numeric" placeholder="25565" required /></label>
+            <label>Name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="survival" disabled={!canCreate} required /></label>
+            <label>Java port<input value={gamePort} onChange={(event) => setGamePort(event.target.value)} inputMode="numeric" placeholder="25565" disabled={!canCreate} required /></label>
             <label>Build
-              <select value={customImage ? "custom" : "recommended"} onChange={(event) => setCustomImage(event.target.value === "custom")}>
+              <select value={customImage ? "custom" : "recommended"} disabled={!canCreate} onChange={(event) => setCustomImage(event.target.value === "custom")}>
                 <option value="recommended">Verified Pumpkin build</option>
                 <option value="custom">Custom image (advanced)</option>
               </select>
             </label>
           </div>
           {!customImage && <p className="subtle-note">Uses the tested Pumpkin build for Linux/amd64. The image digest is pinned for repeatable updates.</p>}
-          {customImage && <label className="advanced-field">Image reference (advanced)<input value={imageReference} onChange={(event) => { setImageReference(event.target.value); setImageDigest(""); }} placeholder="ghcr.io/pumpkin-mc/pumpkin:tag" required /><small>Only allowlisted Pumpkin images are accepted. Pin a digest for reproducible deploys.</small></label>}
+          {customImage && <label className="advanced-field">Image reference (advanced)<input value={imageReference} disabled={!canCreate} onChange={(event) => { setImageReference(event.target.value); setImageDigest(""); }} placeholder="ghcr.io/pumpkin-mc/pumpkin:tag" required /><small>Only allowlisted Pumpkin images are accepted. Pin a digest for reproducible deploys.</small></label>}
           {warning && <p className="warn" role="note">{warning}</p>}
           {formError && <p className="err" role="alert">{formError}</p>}
-          <div className="form-actions"><button type="submit" disabled={createMutation.isPending}>{createMutation.isPending ? "Creating world…" : "Create world"}</button></div>
+          <div className="form-actions"><button type="submit" disabled={createMutation.isPending || !canCreate}>{createMutation.isPending ? "Creating world…" : "Create world"}</button></div>
         </form>
+        {!canCreate && <p className="muted">Your role cannot create servers.</p>}
       </div>
     </section>
   );

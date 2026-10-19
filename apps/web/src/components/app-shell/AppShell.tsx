@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchHealth } from "../../lib/api";
-import { isPrivilegedRole } from "../../lib/admin";
 import { useAuth } from "../../lib/auth";
 
 type Theme = "dark" | "light";
@@ -12,6 +11,7 @@ type NavItem = {
   to: string;
   icon: string;
   exact?: boolean;
+  permission?: string;
 };
 
 const operationalNav: NavItem[] = [
@@ -21,9 +21,19 @@ const operationalNav: NavItem[] = [
 ];
 
 const adminNav: NavItem[] = [
-  { label: "Users & roles", to: "/users", icon: "users" },
-  { label: "Audit log", to: "/audit", icon: "list" },
-  { label: "Settings", to: "/settings", icon: "settings" },
+  {
+    label: "Users & roles",
+    to: "/users",
+    icon: "users",
+    permission: "users.manage",
+  },
+  { label: "Audit log", to: "/audit", icon: "list", permission: "audit.read" },
+  {
+    label: "Settings",
+    to: "/settings",
+    icon: "settings",
+    permission: "settings.manage",
+  },
 ];
 
 function Icon({ name }: { name: string }): React.JSX.Element {
@@ -123,7 +133,10 @@ function initialTheme(): Theme {
 }
 
 export default function AppShell({ children }: { children: React.ReactNode }): React.JSX.Element {
-  const { user, logout } = useAuth();
+  const { user, logout, can } = useAuth();
+  const visibleAdminNav = adminNav.filter(
+    (item) => !item.permission || can(item.permission),
+  );
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
@@ -154,10 +167,10 @@ export default function AppShell({ children }: { children: React.ReactNode }): R
           <SidebarNav items={operationalNav} onNavigate={() => setSidebarOpen(false)} />
         </div>
 
-        {isPrivilegedRole(user.role) && (
+        {visibleAdminNav.length > 0 && (
           <div className="sidebar-section">
             <span className="sidebar-heading">Administer</span>
-            <SidebarNav items={adminNav} onNavigate={() => setSidebarOpen(false)} />
+            <SidebarNav items={visibleAdminNav} onNavigate={() => setSidebarOpen(false)} />
           </div>
         )}
 

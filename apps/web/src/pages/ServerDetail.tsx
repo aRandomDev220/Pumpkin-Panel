@@ -59,6 +59,8 @@ function UpdateSection({
   server: object;
 }) {
   const qc = useQueryClient();
+  const { can } = useAuth();
+  const canUpdate = can("server.update");
   const [target, setTarget] = useState("");
   const [digest, setDigest] = useState("");
   const [preview, setPreview] = useState<UpdatePreview | null>(null);
@@ -266,7 +268,8 @@ function UpdateSection({
       <div className="row">
         <button
           type="button"
-          disabled={target.trim() === "" || updateMutation.isPending}
+          disabled={target.trim() === "" || updateMutation.isPending || !canUpdate}
+          title={canUpdate ? undefined : "Your role cannot update images"}
           onClick={() => updateMutation.mutate()}
         >
           {updateTaskId ? "Updating… polling" : "Update to this image"}
@@ -305,11 +308,13 @@ function UpdateSection({
       <div className="row">
         <button
           type="button"
-          disabled={previous === null || rollbackMutation.isPending}
+          disabled={previous === null || rollbackMutation.isPending || !canUpdate}
           title={
-            previous === null
-              ? "No previous image recorded — rollback unavailable"
-              : `Roll back to ${previous}`
+            !canUpdate
+              ? "Your role cannot roll back images"
+              : previous === null
+                ? "No previous image recorded — rollback unavailable"
+                : `Roll back to ${previous}`
           }
           onClick={() => {
             if (
@@ -473,6 +478,8 @@ function readinessClass(state: string): string {
 
 export default function ServerDetail() {
   const { id } = useParams<{ id: string }>();
+  const { can } = useAuth();
+  const canLifecycle = can("server.lifecycle");
   const qc = useQueryClient();
   const [taskId, setTaskId] = useState("");
   const [submittedTaskId, setSubmittedTaskId] = useState<string | null>(null);
@@ -651,8 +658,14 @@ export default function ServerDetail() {
             <button
               key={op}
               type="button"
-              disabled={opBusy}
-              title={opBusy ? "An operation is already in flight" : `Set desired state via ${op}`}
+              disabled={opBusy || !canLifecycle}
+              title={
+                !canLifecycle
+                  ? "Your role cannot run lifecycle operations"
+                  : opBusy
+                    ? "An operation is already in flight"
+                    : `Set desired state via ${op}`
+              }
               onClick={() => runLifecycle(op)}
             >
               {lifecycleMutation.isPending && activeOp === null ? "Sending…" : activeTaskId && activeOp === op ? `${op}… polling` : op}

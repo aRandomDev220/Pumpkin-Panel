@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
+import { useAuth } from "../lib/auth";
 import {
   createDirectory,
   deleteEntry,
@@ -48,6 +49,8 @@ function formatSize(bytes: number): string {
 }
 
 export default function Files() {
+  const { can } = useAuth();
+  const canWrite = can("server.files.write");
   const { id } = useParams<{ id: string }>();
   const qc = useQueryClient();
   const [path, setPath] = useState("");
@@ -208,7 +211,7 @@ export default function Files() {
         <span className="active">Files</span>
         <a href={`/servers/${encodeURIComponent(id)}#backups`}>Backups</a>
       </nav>
-       <div className="files-toolbar"><div className="files-path-summary"><span className="eyebrow">Protected root</span><code>{displayPath(path)}</code><span className="muted">Server must be stopped before importing an archive.</span></div><div className="files-toolbar-actions"><button className="button-secondary" type="button" onClick={() => void onExport()}>Export folder</button><label className={importBlocked ? "file-action-button is-disabled" : "file-action-button"} title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>{importBlocked ? "Stop server to import" : importing ? "Importing…" : "Import archive"}<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing} /></label></div></div>
+       <div className="files-toolbar"><div className="files-path-summary"><span className="eyebrow">Protected root</span><code>{displayPath(path)}</code><span className="muted">Server must be stopped before importing an archive.</span></div><div className="files-toolbar-actions"><button className="button-secondary" type="button" onClick={() => void onExport()}>Export folder</button><label className={importBlocked ? "file-action-button is-disabled" : "file-action-button"} title={!canWrite ? "Your role cannot modify files" : importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>{!canWrite ? "Import archive" : importBlocked ? "Stop server to import" : importing ? "Importing…" : "Import archive"}<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing || !canWrite} /></label></div></div>
 
       <nav aria-label="Breadcrumb" className="path-breadcrumb">
         <button type="button" onClick={() => setPath("")}>
@@ -295,7 +298,7 @@ export default function Files() {
                       </button>
                       <button
                         type="button"
-                        disabled={deleteMutation.isPending}
+                        disabled={deleteMutation.isPending || !canWrite}
                         onClick={() => {
                           if (window.confirm(`Delete ${entryPath}?`)) {
                             deleteMutation.mutate(entryPath);
@@ -316,11 +319,11 @@ export default function Files() {
       )}
 
       <div className="file-actions-grid">
-      <div className="file-action-panel"><div className="eyebrow">Bring files in</div><h3>Upload a file</h3><p className="muted">Add a file to <code>{displayPath(path)}</code>. Large uploads are streamed by the manager.</p><label className="file-dropzone"><span>{uploading ? "Uploading…" : "Choose a file"}</span><small>Any file type · max 1 GiB</small><input type="file" onChange={(e) => void onUpload(e)} disabled={uploading} /></label></div>
+      <div className="file-action-panel"><div className="eyebrow">Bring files in</div><h3>Upload a file</h3><p className="muted">Add a file to <code>{displayPath(path)}</code>. Large uploads are streamed by the manager.</p><label className="file-dropzone"><span>{uploading ? "Uploading…" : "Choose a file"}</span><small>Any file type · max 1 GiB</small><input type="file" onChange={(e) => void onUpload(e)} disabled={uploading || !canWrite} /></label></div>
       <div className="file-action-panel"><div className="eyebrow">Create a folder</div><h3>New directory</h3><p className="muted">Create a folder in the current path for worlds, configs, or server assets.</p>
         <form className="inline-file-form" onSubmit={onMkdir}>
           <label>Name<input value={mkdirName} onChange={(e) => setMkdirName(e.target.value)} placeholder="dirname" /></label>
-          <button type="submit" disabled={mkdirMutation.isPending}>{mkdirMutation.isPending ? "Creating…" : "Create"}</button>
+          <button type="submit" disabled={mkdirMutation.isPending || !canWrite}>{mkdirMutation.isPending ? "Creating…" : "Create"}</button>
         </form>
       </div>
       </div>
@@ -336,7 +339,7 @@ export default function Files() {
               New name{" "}
               <input value={renameTarget} onChange={(e) => setRenameTarget(e.target.value)} />
             </label>{" "}
-            <button type="submit" disabled={renameMutation.isPending}>
+            <button type="submit" disabled={renameMutation.isPending || !canWrite}>
               {renameMutation.isPending ? "Renaming…" : "Rename"}
             </button>{" "}
             <button
@@ -359,6 +362,11 @@ export default function Files() {
         {serverQuery.isLoading ? "loading…" : (desiredState ?? "unknown")}
       </p>
       <div className="row">{importing && <span className="muted">Importing…</span>}</div>
+      {!canWrite && (
+        <p className="muted" role="note">
+          Your role can browse and download files but cannot modify them.
+        </p>
+      )}
       {importBlocked && (
         <p className="warn" role="note">
           Import is disabled while the server desired_state is “{desiredState}”. Stop the

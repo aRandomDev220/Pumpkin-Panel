@@ -68,6 +68,8 @@ export interface AuthUser {
   id: string;
   username: string;
   role: string;
+  /** Effective permissions from the backend; absent on older servers. */
+  permissions?: string[];
 }
 
 export interface SetupStatusResponse {
@@ -121,10 +123,28 @@ export async function postLogout(): Promise<void> {
   }
 }
 
+const VIEWER_PERMISSIONS = [
+  "server.read",
+  "server.config.read",
+  "server.files.read",
+];
+
+/** Permission check with a role-based fallback for older backends. */
+function fallbackCan(user: AuthUser | null, permission: string): boolean {
+  if (!user) return false;
+  if (user.permissions) return user.permissions.includes(permission);
+  if (user.role === "owner") return true;
+  if (user.role === "admin") {
+    return permission !== "users.manage" && permission !== "settings.manage";
+  }
+  return VIEWER_PERMISSIONS.includes(permission);
+}
+
 interface AuthContextValue {
   user: AuthUser | null;
   isLoading: boolean;
   isAuthenticated: boolean;
+  can: (permission: string) => boolean;
   needsSetup: boolean | null;
   needsSetupLoading: boolean;
   loginPending: boolean;
@@ -158,6 +178,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const handleUnauthorized = () => {
       qc.setQueryData(["auth", "me"], null);
+      // Do not leave the previous account's servers/config/files in the
+      // singleton query cache for the next user on this browser.
+      qc.removeQueries({ predicate: (query) => query.queryKey[0] !== "auth" });
       setAuthVersion((version) => version + 1);
     };
     setUnauthorizedHandler(handleUnauthorized);
@@ -169,6 +192,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       postLogin(username, password),
     onSuccess: (data) => {
       qc.setQueryData(["auth", "me"], data.user);
+      // The session response carries no permission list; refetch /me so the
+      // UI can gate controls from the same matrix the API enforces.
+      void qc.invalidateQueries({ queryKey: ["auth", "me"] });
       setAuthVersion((version) => version + 1);
     },
   });
@@ -181,6 +207,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       qc.setQueryData<SetupStatusResponse>(["auth", "setup-status"], {
         needs_setup: false,
       });
+      void qc.invalidateQueries({ queryKey: ["auth", "me"] });
       setAuthVersion((version) => version + 1);
     },
   });
@@ -188,8 +215,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logoutMutation = useMutation({
     mutationFn: postLogout,
     onSettled: () => {
-      qc.setQueryData(["auth", "me"], null);
-      qc.removeQueries({ queryKey: ["auth", "me"] });
+      // Clear every cached resource, not just /me: on a shared browser the
+      // next account must never see the previous account's data.
+      qc.clear();
       setAuthVersion((version) => version + 1);
     },
   });
@@ -208,6 +236,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [setupMutation],
   );
 
+  const can = useCallback(
+    (permission: string): boolean =>
+      fallbackCan((meQuery.data as AuthUser | undefined) ?? null, permission),
+    [meQuery.data],
+  );
+
   const logout = useCallback(async (): Promise<void> => {
     try {
       await logoutMutation.mutateAsync();
@@ -222,6 +256,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: (meQuery.data as AuthUser | undefined) ?? null,
       isLoading: meQuery.isLoading,
       isAuthenticated: meQuery.data !== undefined && meQuery.data !== null,
+      can,
       needsSetup: setupStatusQuery.data?.needs_setup ?? null,
       needsSetupLoading: setupStatusQuery.isLoading,
       loginPending: loginMutation.isPending,
@@ -237,6 +272,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       meQuery.data,
       meQuery.isLoading,
+      can,
       setupStatusQuery.data,
       setupStatusQuery.isLoading,
       loginMutation.isPending,
