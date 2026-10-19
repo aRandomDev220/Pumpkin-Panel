@@ -667,6 +667,15 @@ pub trait RuntimeAdapter: Send + Sync {
             )))
         }
     }
+
+    /// Resolve the registry digest for a locally present image. The default
+    /// keeps non-Docker test fakes compiling; Docker returns `repo_digests`.
+    fn resolved_image_digest(
+        &self,
+        _reference: &str,
+    ) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1081,22 @@ impl RuntimeAdapter for DockerAdapter {
             {}
             info!(%reference, "pulled image");
             Ok(())
+        }
+    }
+
+    fn resolved_image_digest(
+        &self,
+        reference: &str,
+    ) -> impl Future<Output = Option<String>> + Send {
+        let docker = self.docker.clone();
+        let reference = reference.to_string();
+        async move {
+            let info = docker.inspect_image(&reference).await.ok()?;
+            info.repo_digests?.iter().find_map(|digest| {
+                digest
+                    .split_once("@sha256:")
+                    .map(|(_, hash)| format!("sha256:{hash}"))
+            })
         }
     }
 

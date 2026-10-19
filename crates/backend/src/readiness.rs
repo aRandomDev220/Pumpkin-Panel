@@ -40,6 +40,16 @@ pub enum PingError {
 // Probe
 // ---------------------------------------------------------------------------
 
+/// Host to probe for a server bound to `bind_address`. Wildcard bindings
+/// answer on loopback; a specific address must be probed directly.
+#[must_use]
+pub fn probe_host(bind_address: &str) -> &str {
+    match bind_address.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    }
+}
+
 /// Ping a Java-edition server. `host` is a plain IP/hostname (no scheme),
 /// `port` the Java game port (usually 25565).
 pub async fn ping_java(host: &str, port: u16, timeout: Duration) -> Result<PingResult, PingError> {
@@ -313,5 +323,12 @@ mod live_tests {
             .expect("live ping");
         assert!(r.players_max > 0);
         assert!(!r.version_name.is_empty());
+    }
+    #[test]
+    fn probe_host_uses_loopback_only_for_wildcards() {
+        assert_eq!(probe_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(probe_host("::"), "127.0.0.1");
+        assert_eq!(probe_host(""), "127.0.0.1");
+        assert_eq!(probe_host("10.0.0.5"), "10.0.0.5");
     }
 }

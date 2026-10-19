@@ -733,6 +733,7 @@ async fn wait_ready<A: RuntimeAdapter>(
     adapter: &A,
     container_id: &str,
     game_port: u16,
+    bind_address: &str,
 ) -> Result<(), String> {
     let grace = Instant::now() + Duration::from_secs(START_GRACE_SECS);
     loop {
@@ -752,7 +753,13 @@ async fn wait_ready<A: RuntimeAdapter>(
     }
     let deadline = Instant::now() + Duration::from_secs(READINESS_WINDOW_SECS);
     loop {
-        match readiness::ping_java("127.0.0.1", game_port, Duration::from_secs(2)).await {
+        match readiness::ping_java(
+            readiness::probe_host(bind_address),
+            game_port,
+            Duration::from_secs(2),
+        )
+        .await
+        {
             Ok(_) => return Ok(()),
             Err(_) => {
                 if Instant::now() >= deadline {
@@ -885,7 +892,7 @@ async fn auto_rollback<A: RuntimeAdapter>(
             .await;
             return;
         }
-        if let Err(e) = wait_ready(adapter, &handle.container_id, game_port).await {
+        if let Err(e) = wait_ready(adapter, &handle.container_id, game_port, bind_address).await {
             let msg = format!(
                 "update to {new_ref} failed at {failed_stage}: {reason}; rolled back to {prev_ref} and it started, but readiness failed: {e}. Check the console or restore the pre-update backup. {DATA_FORMAT_WARNING}"
             );
@@ -1039,162 +1046,9 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         }
     }
 
-    // Mandatory protected auto-backup (reason: pre-update) through the
-    // canonical backup capture — the same code path `enqueue_backup` runs
-    // (tar, staging, checksum, verify, row lifecycle, audits).
-    // `enqueue_backup` itself cannot run here: its `conflicting_task` gate
-    // would self-conflict with this running update task.
-    let backup_id = Uuid::new_v4().to_string();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO backups
-            (id, server_id, type, state, consistency_method, protected, created_by)
-          VALUES (?, ?, 'full', 'in_progress', 'live', 1, ?)",
-    )
-    .bind(&backup_id)
-    .bind(server_id)
-    .bind(actor)
-    .execute(pool)
-    .await
-    {
-        terminal_fail(
-            pool,
-            task_id,
-            "BACKUP_FAILED",
-            &format!("update failed: cannot record pre-update backup: {e}"),
-        )
-        .await;
-        return;
-    }
-    audit_update(
-        pool,
-        actor,
-        "update.pre_backup",
-        server_id,
-        "started",
-        serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "reason": "pre-update" }),
-    )
-    .await;
-    let backup_server = routes_backup::ServerRow {
-        id: server.id.clone(),
-        data_path: server.data_path.clone(),
-        container_id: server.container_id.clone(),
-        desired_state: server.desired_state.clone(),
-    };
-    match routes_backup::run_backup_capture(
-        pool,
-        None,
-        &backup_root,
-        &backup_id,
-        &backup_server,
-        "live",
-        task_id,
-        actor,
-    )
-    .await
-    {
-        Ok((outcome, _resume)) => {
-            audit_update(
-                pool,
-                actor,
-                "update.pre_backup",
-                server_id,
-                "ok",
-                serde_json::json!({
-                    "task_id": task_id,
-                    "backup_id": backup_id,
-                    "reason": "pre-update",
-                    "size_bytes": outcome.size_bytes,
-                    "checksum": outcome.checksum,
-                }),
-            )
-            .await;
-        }
-        Err(BackupError::Cancelled) => {
-            let _ = task_runner::mark_cancelled(pool, task_id).await;
-            audit_update(
-                pool,
-                actor,
-                "update.pre_backup",
-                server_id,
-                "cancelled",
-                serde_json::json!({ "task_id": task_id, "backup_id": backup_id }),
-            )
-            .await;
-            return;
-        }
-        Err(e) => {
-            let _ =
-                sqlx::query("UPDATE backups SET state = 'failed', error_summary = ? WHERE id = ?")
-                    .bind(e.to_string().chars().take(500).collect::<String>())
-                    .bind(&backup_id)
-                    .execute(pool)
-                    .await;
-            terminal_fail(
-                pool,
-                task_id,
-                backup_task_code(&e),
-                &format!("update failed: pre-update backup failed, nothing was changed: {e}"),
-            )
-            .await;
-            audit_update(
-                pool,
-                actor,
-                "update.pre_backup",
-                server_id,
-                "failed",
-                serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "error": e.to_string() }),
-            )
-            .await;
-            return;
-        }
-    }
-
-    // Pull the target image in the worker.
-    let pull_ref = if target.image_digest.is_empty() {
-        target.image_reference.clone()
-    } else {
-        format!("{}@{}", target.image_reference, target.image_digest)
-    };
-    if let Err(e) = adapter.pull_image(&pull_ref).await {
-        if is_daemon_down(&e) {
-            terminal_fail(
-                pool,
-                task_id,
-                "RUNTIME_UNAVAILABLE",
-                "update failed: docker unavailable during image pull",
-            )
-            .await;
-        } else {
-            terminal_fail(
-                pool,
-                task_id,
-                "IMAGE_PULL_FAILED",
-                &format!("update failed: could not pull image {pull_ref}: {e}"),
-            )
-            .await;
-        }
-        audit_update(
-            pool,
-            actor,
-            "update.pull",
-            server_id,
-            "failed",
-            serde_json::json!({ "target": pull_ref, "error": e.to_string() }),
-        )
-        .await;
-        return;
-    }
-    audit_update(
-        pool,
-        actor,
-        "update.pull",
-        server_id,
-        "ok",
-        serde_json::json!({ "target": pull_ref }),
-    )
-    .await;
-
-    // Stop the current container (best-effort when already gone).
+    // Stop the current container BEFORE the backup so the pre-update archive
+    // is consistent. The container is recreated below; every failure before
+    // removal resumes it so an update cannot leave a live world down.
     let mut was_running = server.desired_state == "running";
     let mut container_gone = server.container_id.is_empty();
     if !container_gone {
@@ -1254,6 +1108,182 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         }
     }
 
+    // Mandatory protected auto-backup (reason: pre-update) through the
+    // canonical backup capture. The container is already stopped, so this is
+    // a consistent snapshot; `adapter: None` prevents the capture from
+    // resuming it before the update finishes.
+    let backup_id = Uuid::new_v4().to_string();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO backups
+            (id, server_id, type, state, consistency_method, protected, created_by)
+          VALUES (?, ?, 'full', 'in_progress', 'stopped', 1, ?)",
+    )
+    .bind(&backup_id)
+    .bind(server_id)
+    .bind(actor)
+    .execute(pool)
+    .await
+    {
+        if was_running && !container_gone {
+            let _ = adapter.start(&server.container_id).await;
+        }
+        terminal_fail(
+            pool,
+            task_id,
+            "BACKUP_FAILED",
+            &format!("update failed: cannot record pre-update backup: {e}"),
+        )
+        .await;
+        return;
+    }
+    audit_update(
+        pool,
+        actor,
+        "update.pre_backup",
+        server_id,
+        "started",
+        serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "reason": "pre-update" }),
+    )
+    .await;
+    let backup_server = routes_backup::ServerRow {
+        id: server.id.clone(),
+        data_path: server.data_path.clone(),
+        container_id: server.container_id.clone(),
+        desired_state: server.desired_state.clone(),
+    };
+    match routes_backup::run_backup_capture(
+        pool,
+        None,
+        &backup_root,
+        &backup_id,
+        &backup_server,
+        "stopped",
+        task_id,
+        actor,
+    )
+    .await
+    {
+        Ok((outcome, _resume)) => {
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "ok",
+                serde_json::json!({
+                    "task_id": task_id,
+                    "backup_id": backup_id,
+                    "reason": "pre-update",
+                    "size_bytes": outcome.size_bytes,
+                    "checksum": outcome.checksum,
+                }),
+            )
+            .await;
+        }
+        Err(BackupError::Cancelled) => {
+            if was_running && !container_gone {
+                let _ = adapter.start(&server.container_id).await;
+            }
+            let _ = task_runner::mark_cancelled(pool, task_id).await;
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "cancelled",
+                serde_json::json!({ "task_id": task_id, "backup_id": backup_id }),
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            if was_running && !container_gone {
+                let _ = adapter.start(&server.container_id).await;
+            }
+            let _ =
+                sqlx::query("UPDATE backups SET state = 'failed', error_summary = ? WHERE id = ?")
+                    .bind(e.to_string().chars().take(500).collect::<String>())
+                    .bind(&backup_id)
+                    .execute(pool)
+                    .await;
+            terminal_fail(
+                pool,
+                task_id,
+                backup_task_code(&e),
+                &format!("update failed: pre-update backup failed, nothing was changed: {e}"),
+            )
+            .await;
+            audit_update(
+                pool,
+                actor,
+                "update.pre_backup",
+                server_id,
+                "failed",
+                serde_json::json!({ "task_id": task_id, "backup_id": backup_id, "error": e.to_string() }),
+            )
+            .await;
+            return;
+        }
+    }
+
+    // Pull the target image in the worker.
+    let pull_ref = if target.image_digest.is_empty() {
+        target.image_reference.clone()
+    } else {
+        format!("{}@{}", target.image_reference, target.image_digest)
+    };
+    if let Err(e) = adapter.pull_image(&pull_ref).await {
+        if was_running && !container_gone {
+            let _ = adapter.start(&server.container_id).await;
+        }
+        if is_daemon_down(&e) {
+            terminal_fail(
+                pool,
+                task_id,
+                "RUNTIME_UNAVAILABLE",
+                "update failed: docker unavailable during image pull",
+            )
+            .await;
+        } else {
+            terminal_fail(
+                pool,
+                task_id,
+                "IMAGE_PULL_FAILED",
+                &format!("update failed: could not pull image {pull_ref}: {e}"),
+            )
+            .await;
+        }
+        audit_update(
+            pool,
+            actor,
+            "update.pull",
+            server_id,
+            "failed",
+            serde_json::json!({ "target": pull_ref, "error": e.to_string() }),
+        )
+        .await;
+        return;
+    }
+    audit_update(
+        pool,
+        actor,
+        "update.pull",
+        server_id,
+        "ok",
+        serde_json::json!({ "target": pull_ref }),
+    )
+    .await;
+    // Resolve the digest that was actually pulled so rollback targets an
+    // immutable image, even when the caller sent a bare tag.
+    let target_digest = if target.image_digest.is_empty() {
+        adapter
+            .resolved_image_digest(&target.image_reference)
+            .await
+            .unwrap_or_default()
+    } else {
+        target.image_digest.clone()
+    };
+
     // Remove. Past this point every failure rolls back to the previous image.
     if !container_gone {
         if let Err(e) = adapter.remove(&server.container_id).await {
@@ -1269,14 +1299,23 @@ async fn execute_update_inner<A: RuntimeAdapter>(
 
     // Persist previous FIRST, then swap to the target.
     let old_ref = server.image_reference.clone();
-    let old_digest = server.image_digest.clone();
+    // Preserve the digest of the image that was actually running, even if the
+    // row only carried a tag. Rollback must recreate the same bytes.
+    let old_digest = if server.image_digest.is_empty() {
+        adapter
+            .resolved_image_digest(&server.image_reference)
+            .await
+            .unwrap_or_default()
+    } else {
+        server.image_digest.clone()
+    };
     if let Err(e) = swap_images(
         pool,
         server_id,
         &old_ref,
         &old_digest,
         &target.image_reference,
-        &target.image_digest,
+        &target_digest,
     )
     .await
     {
@@ -1306,7 +1345,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
         memory_limit_bytes,
         cpu_limit,
         &target.image_reference,
-        &target.image_digest,
+        &target_digest,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -1318,7 +1357,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
                 &old_ref,
                 &old_digest,
                 &target.image_reference,
-                &target.image_digest,
+                &target_digest,
                 "spec",
                 &e,
                 should_start,
@@ -1346,7 +1385,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
                 &old_ref,
                 &old_digest,
                 &target.image_reference,
-                &target.image_digest,
+                &target_digest,
                 "create",
                 &e.to_string(),
                 should_start,
@@ -1374,7 +1413,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
                 &old_ref,
                 &old_digest,
                 &target.image_reference,
-                &target.image_digest,
+                &target_digest,
                 "start",
                 &e.to_string(),
                 should_start,
@@ -1390,7 +1429,14 @@ async fn execute_update_inner<A: RuntimeAdapter>(
             .await;
             return;
         }
-        if let Err(e) = wait_ready(adapter, &handle.container_id, game_port).await {
+        if let Err(e) = wait_ready(
+            adapter,
+            &handle.container_id,
+            game_port,
+            &server.bind_address,
+        )
+        .await
+        {
             auto_rollback(
                 pool,
                 adapter,
@@ -1399,7 +1445,7 @@ async fn execute_update_inner<A: RuntimeAdapter>(
                 &old_ref,
                 &old_digest,
                 &target.image_reference,
-                &target.image_digest,
+                &target_digest,
                 "readiness",
                 &e,
                 should_start,
@@ -1708,7 +1754,14 @@ async fn execute_rollback_inner<A: RuntimeAdapter>(
             set_observed(pool, server_id, "created").await;
             return;
         }
-        if let Err(e) = wait_ready(adapter, &handle.container_id, game_port).await {
+        if let Err(e) = wait_ready(
+            adapter,
+            &handle.container_id,
+            game_port,
+            &server.bind_address,
+        )
+        .await
+        {
             terminal_fail(pool, task_id, "ROLLBACK_FAILED", &format!("rollback to {prev_ref} started but readiness failed: {e}. Check the console. {DATA_FORMAT_WARNING}")).await;
             set_observed(pool, server_id, "running").await;
             return;

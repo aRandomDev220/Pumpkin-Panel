@@ -7,7 +7,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::readiness::ping_java;
+use crate::readiness::{ping_java, probe_host};
 use crate::runtime::RuntimeAdapter;
 
 /// Samples older than this are pruned (whichever bound bites first).
@@ -46,15 +46,24 @@ pub struct SampleRow {
 /// Generic over [`RuntimeAdapter`] (same pattern as `dispatch_task`) so the
 /// unreachable-daemon path is unit-testable without a socket.
 pub async fn sample_all<A: RuntimeAdapter>(pool: &SqlitePool, adapter: Option<&A>) {
-    let servers: Vec<(String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, container_id, game_port, observed_state \
+    let servers: Vec<(String, String, i64, String, String)> = sqlx::query_as(
+        "SELECT id, container_id, game_port, observed_state, bind_address \
          FROM servers WHERE deleted_at IS NULL",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    for (id, container_id, game_port, observed_state) in &servers {
-        sample_one(pool, adapter, id, container_id, *game_port, observed_state).await;
+    for (id, container_id, game_port, observed_state, bind_address) in &servers {
+        sample_one(
+            pool,
+            adapter,
+            id,
+            container_id,
+            *game_port,
+            observed_state,
+            bind_address,
+        )
+        .await;
     }
     prune_samples(pool).await;
 }
@@ -68,6 +77,7 @@ async fn sample_one<A: RuntimeAdapter>(
     container_id: &str,
     game_port: i64,
     observed_state: &str,
+    bind_address: &str,
 ) {
     // (state, cpu, mem_used, mem_limit, restart_count, players, latency)
     let row: SamplePoint = match (adapter, container_id.is_empty()) {
@@ -83,7 +93,7 @@ async fn sample_one<A: RuntimeAdapter>(
                         ),
                         Err(_) => (None, None, None),
                     };
-                    let (players, latency) = probe_players(game_port).await;
+                    let (players, latency) = probe_players(bind_address, game_port).await;
                     (
                         state,
                         cpu,
@@ -135,12 +145,18 @@ async fn sample_one<A: RuntimeAdapter>(
 
 /// Best-effort game probe: `None`s on any failure (server still booting,
 /// ping refused, port unconfigured). Never fails the sample.
-async fn probe_players(game_port: i64) -> (Option<i64>, Option<i64>) {
+async fn probe_players(bind_address: &str, game_port: i64) -> (Option<i64>, Option<i64>) {
     let port = match u16::try_from(game_port) {
         Ok(p) => p,
         Err(_) => return (None, None),
     };
-    match ping_java("127.0.0.1", port, std::time::Duration::from_secs(2)).await {
+    match ping_java(
+        probe_host(bind_address),
+        port,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    {
         Ok(p) => (Some(i64::from(p.players_online)), Some(p.latency_ms as i64)),
         Err(_) => (None, None),
     }

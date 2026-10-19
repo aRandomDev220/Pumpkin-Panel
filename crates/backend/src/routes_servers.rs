@@ -1084,12 +1084,12 @@ pub async fn server_status(
         }
     }
     // Game readiness: ping the Java port when the container claims to run.
-    // `bind_address` may be a LAN IP unreachable from here, so ping
-    // localhost — the published port answers there for 0.0.0.0 bindings.
+    // Wildcard bindings answer on loopback; a specific bind address must be
+    // probed directly, otherwise every IP-bound server looks permanently down.
     let mut ping_json = serde_json::Value::Null;
     if runtime_state_verified && observed == "running" {
         match crate::readiness::ping_java(
-            "127.0.0.1",
+            crate::readiness::probe_host(&server.bind_address),
             server.game_port as u16,
             std::time::Duration::from_secs(3),
         )
