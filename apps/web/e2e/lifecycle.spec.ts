@@ -84,7 +84,7 @@ test.describe.serial("full user journey", () => {
       page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().endsWith("/api/v1/auth/setup"),
       ),
-      page.getByRole("button", { name: "Create admin", exact: true }).click(),
+      page.getByRole("button", { name: "Create owner account", exact: true }).click(),
     ]);
     expect(setupResp.ok()).toBe(true);
     await expect(page).toHaveURL(/\/servers$/);
@@ -108,11 +108,11 @@ test.describe.serial("full user journey", () => {
 
     await page.getByLabel("Username", { exact: true }).fill(ADMIN);
     await page.getByLabel("Password", { exact: true }).fill("wrong-password");
-    await page.getByRole("button", { name: "Login", exact: true }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(page.getByText(/401/)).toBeVisible();
 
     await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
-    await page.getByRole("button", { name: "Login", exact: true }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(page).toHaveURL(/\/servers$/);
     session = await readSession(page);
   });

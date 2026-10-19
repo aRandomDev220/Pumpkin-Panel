@@ -207,7 +207,7 @@ export default function Config() {
   });
 
   const saveMutation = useMutation({
-    mutationFn: (text: string) => saveConfig(id ?? "", configQuery.data?.revision ?? 0, text),
+    mutationFn: (text: string) => saveConfig(id ?? "", syncedRevision ?? 0, text),
     onSuccess: (result) => {
       setConflict(false);
       setSaveErrors([]);
@@ -309,7 +309,20 @@ export default function Config() {
       {conflict && (
         <p className="err" role="alert">
           Save conflict (409): the config changed on the server.{" "}
-          <button type="button" onClick={() => configQuery.refetch()}>
+          <button
+            type="button"
+            onClick={() => {
+              if (
+                dirty &&
+                !window.confirm(
+                  "Discard unsaved edits and reload from the server?",
+                )
+              ) {
+                return;
+              }
+              void configQuery.refetch();
+            }}
+          >
             Reload
           </button>
         </p>

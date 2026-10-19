@@ -43,7 +43,10 @@ function RoleEditor({
       qc.invalidateQueries({ queryKey: ["admin", "users"] });
       onDone();
     },
-    onError,
+    onError: (err) => {
+      setRole(user.role);
+      onError(err);
+    },
   });
   if (user.role === role && !mutation.isPending) {
     return (

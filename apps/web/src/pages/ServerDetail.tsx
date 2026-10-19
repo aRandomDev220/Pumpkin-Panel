@@ -142,12 +142,17 @@ function UpdateSection({
       setUpdateTaskId(res.task_id);
     },
     onError: (err) => {
-      if (
-        err instanceof AdminApiError &&
-        (err.status === 409 || /UPDATE_NO_BACKUP/i.test(err.message))
-      ) {
+      if (err instanceof AdminApiError && /UPDATE_NO_BACKUP/i.test(err.message)) {
         setNoBackup(true);
         setUpdateError(null);
+      } else if (err instanceof AdminApiError && /SERVER_BUSY/i.test(err.message)) {
+        setNoBackup(false);
+        setUpdateError(
+          "Another operation is in progress for this server. Wait for it to finish and retry.",
+        );
+      } else if (err instanceof AdminApiError && /NO_ROLLBACK_TARGET/i.test(err.message)) {
+        setNoBackup(false);
+        setUpdateError("No previous image is recorded, so rollback is unavailable.");
       } else {
         setNoBackup(false);
         setUpdateError(errMsg(err));

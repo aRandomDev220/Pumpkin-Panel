@@ -1,11 +1,13 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 
 export default function Login() {
-  const { login, loginPending, loginError, needsSetup } = useAuth();
+  const { login, loginPending, loginError, needsSetup, sessionExpired } =
+    useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -15,7 +17,10 @@ export default function Login() {
     setError(null);
     try {
       await login(username.trim(), password);
-      navigate("/servers", { replace: true });
+      const from = (
+        location.state as { from?: { pathname?: string } } | null
+      )?.from;
+      navigate(from?.pathname ?? "/servers", { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed.");
     }
@@ -40,6 +45,11 @@ export default function Login() {
           <p className="auth-notice" role="status">
             You are using HTTP. LAN installs use non-secure cookies by default;
             use HTTPS with <code>PUMPKIN_INSECURE_COOKIES=0</code> for remote access.
+          </p>
+        )}
+        {sessionExpired && (
+          <p className="auth-notice" role="status">
+            Your session expired. Sign in again.
           </p>
         )}
         {needsSetup === true && (
@@ -73,7 +83,6 @@ export default function Login() {
           <button
             className="auth-submit"
             type="submit"
-            aria-label="Login"
             disabled={loginPending}
           >
             {loginPending ? "Signing in…" : "Sign in"}

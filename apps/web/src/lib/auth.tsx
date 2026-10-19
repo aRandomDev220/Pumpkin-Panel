@@ -168,6 +168,7 @@ interface AuthContextValue {
   user: AuthUser | null;
   isLoading: boolean;
   isAuthenticated: boolean;
+  sessionExpired: boolean;
   can: (permission: string) => boolean;
   needsSetup: boolean | null;
   needsSetupLoading: boolean;
@@ -185,6 +186,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
   const [, setAuthVersion] = useState(0);
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const setupStatusQuery = useQuery({
     queryKey: ["auth", "setup-status"],
@@ -202,6 +204,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const handleUnauthorized = () => {
       qc.setQueryData(["auth", "me"], null);
+      setSessionExpired(true);
       // Do not leave the previous account's servers/config/files in the
       // singleton query cache for the next user on this browser.
       qc.removeQueries({ predicate: (query) => query.queryKey[0] !== "auth" });
@@ -216,6 +219,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       postLogin(username, password),
     onSuccess: (data) => {
       qc.setQueryData(["auth", "me"], data.user);
+      setSessionExpired(false);
       // The session response carries no permission list; refetch /me so the
       // UI can gate controls from the same matrix the API enforces.
       void qc.invalidateQueries({ queryKey: ["auth", "me"] });
@@ -228,6 +232,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       postSetup(username, password),
     onSuccess: (data) => {
       qc.setQueryData(["auth", "me"], data.user);
+      setSessionExpired(false);
       qc.setQueryData<SetupStatusResponse>(["auth", "setup-status"], {
         needs_setup: false,
       });
@@ -242,6 +247,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Clear every cached resource, not just /me: on a shared browser the
       // next account must never see the previous account's data.
       qc.clear();
+      setSessionExpired(false);
       setAuthVersion((version) => version + 1);
     },
   });
@@ -280,6 +286,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: (meQuery.data as AuthUser | undefined) ?? null,
       isLoading: meQuery.isLoading,
       isAuthenticated: meQuery.data !== undefined && meQuery.data !== null,
+      sessionExpired,
       can,
       needsSetup: setupStatusQuery.data?.needs_setup ?? null,
       needsSetupLoading: setupStatusQuery.isLoading,
@@ -296,6 +303,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [
       meQuery.data,
       meQuery.isLoading,
+      sessionExpired,
       can,
       setupStatusQuery.data,
       setupStatusQuery.isLoading,

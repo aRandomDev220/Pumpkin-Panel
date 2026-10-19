@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { useAuth } from "./lib/auth";
 import Login from "./pages/Login";
@@ -15,10 +15,13 @@ import Settings from "./pages/Settings";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { isAuthenticated, isLoading, needsSetupLoading, needsSetup } = useAuth();
+  const location = useLocation();
   if (needsSetupLoading) return <p>Loading…</p>;
   if (needsSetup === true) return <Navigate to="/setup" replace />;
   if (isLoading) return <p>Loading…</p>;
-  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (!isAuthenticated) {
+    return <Navigate to="/login" state={{ from: location }} replace />;
+  }
   return <>{children}</>;
 }
 

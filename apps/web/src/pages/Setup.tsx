@@ -102,7 +102,6 @@ export default function Setup() {
           <button
             className="auth-submit"
             type="submit"
-            aria-label="Create admin"
             disabled={setupPending || needsSetupLoading}
           >
             {setupPending ? "Creating account…" : "Create owner account"}
