@@ -23,7 +23,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::auth::{self, AuthUser};
+use crate::{
+    audit,
+    auth::{self, AuthUser},
+};
 
 const SESSION_COOKIE: &str = "pm_session";
 const CSRF_COOKIE: &str = "pm_csrf";
@@ -124,7 +127,19 @@ pub async fn setup(
     headers: HeaderMap,
     Json(body): Json<SetupRequest>,
 ) -> Response {
+    let request_id = audit::request_id();
     if !same_origin_ok(&headers) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.setup",
+            "setup",
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("csrf"),
+        )
+        .await;
         return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
     }
     // Rate-limit first: junk payloads must consume a token too.
@@ -132,18 +147,64 @@ pub async fn setup(
         &app,
         &[client_key(peer.as_ref()), user_key("setup", &body.username)],
     ) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.setup",
+            "setup",
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("rate_limited"),
+        )
+        .await;
         return rate_limited(retry);
     }
     let username = match validate_username(&body.username) {
         Ok(u) => u,
-        Err(code) => return error(StatusCode::BAD_REQUEST, code),
+        Err(code) => {
+            audit_auth(
+                &app.pool,
+                None,
+                "auth.setup",
+                "setup",
+                "failed",
+                &request_id,
+                peer.as_ref(),
+                Some("invalid_input"),
+            )
+            .await;
+            return error(StatusCode::BAD_REQUEST, code);
+        }
     };
     if let Err(code) = validate_password(&body.password, true) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.setup",
+            "setup",
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("invalid_input"),
+        )
+        .await;
         return error(StatusCode::BAD_REQUEST, code);
     }
 
     let pool: SqlitePool = app.pool.clone();
     if !auth::needs_setup(&pool).await.unwrap_or(false) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.setup",
+            "setup",
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("setup_complete"),
+        )
+        .await;
         return error(StatusCode::CONFLICT, "SETUP_ALREADY_COMPLETE");
     }
     let password_hash = match auth::hash_password(&body.password) {
@@ -196,6 +257,17 @@ pub async fn setup(
 
     match issue_session(&pool, &id, app.session_ttl_secs).await {
         Ok(token) => {
+            audit_auth(
+                &pool,
+                Some(&id),
+                "auth.setup",
+                &id,
+                "ok",
+                &request_id,
+                peer.as_ref(),
+                None,
+            )
+            .await;
             let user = SessionUser {
                 id: id.clone(),
                 username: username.clone(),
@@ -223,7 +295,19 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
+    let request_id = audit::request_id();
     if !same_origin_ok(&headers) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.login",
+            &body.username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("csrf"),
+        )
+        .await;
         return error(StatusCode::FORBIDDEN, "CSRF_FAILED");
     }
     // Rate-limit first: junk payloads must consume a token too.
@@ -231,13 +315,48 @@ pub async fn login(
         &app,
         &[client_key(peer.as_ref()), user_key("login", &body.username)],
     ) {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.login",
+            &body.username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("rate_limited"),
+        )
+        .await;
         return rate_limited(retry);
     }
     let username = match validate_username(&body.username) {
         Ok(u) => u,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS"),
+        Err(_) => {
+            audit_auth(
+                &app.pool,
+                None,
+                "auth.login",
+                &body.username,
+                "failed",
+                &request_id,
+                peer.as_ref(),
+                Some("invalid_input"),
+            )
+            .await;
+            return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS");
+        }
     };
     if validate_password(&body.password, false).is_err() {
+        audit_auth(
+            &app.pool,
+            None,
+            "auth.login",
+            &username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("invalid_input"),
+        )
+        .await;
         return error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIALS");
     }
 
@@ -251,6 +370,17 @@ pub async fn login(
         Ok(None) => {
             // Equalize timing with a real verification before the generic error.
             auth::verify_dummy(&body.password);
+            audit_auth(
+                &app.pool,
+                None,
+                "auth.login",
+                &username,
+                "failed",
+                &request_id,
+                peer.as_ref(),
+                Some("unknown_user"),
+            )
+            .await;
             return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
         }
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
@@ -260,9 +390,31 @@ pub async fn login(
     let stored_hash: String = row.get("password_hash");
     let is_active: i64 = row.get("is_active");
     if is_active == 0 {
+        audit_auth(
+            &app.pool,
+            Some(&user_id),
+            "auth.login",
+            &username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("account_disabled"),
+        )
+        .await;
         return error(StatusCode::FORBIDDEN, "ACCOUNT_DISABLED");
     }
     if !auth::verify_password(&body.password, &stored_hash).unwrap_or(false) {
+        audit_auth(
+            &app.pool,
+            Some(&user_id),
+            "auth.login",
+            &username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("invalid_credentials"),
+        )
+        .await;
         return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
     }
     // A legitimate login clears the username bucket (typos forgiven).
@@ -284,6 +436,17 @@ pub async fn login(
         .await;
     match issue_session(&pool, &user_id, app.session_ttl_secs).await {
         Ok(token) => {
+            audit_auth(
+                &pool,
+                Some(&user_id),
+                "auth.login",
+                &user_id,
+                "ok",
+                &request_id,
+                peer.as_ref(),
+                None,
+            )
+            .await;
             let user = SessionUser {
                 id: user_id.clone(),
                 username,
@@ -304,6 +467,7 @@ pub async fn login(
 /// session cookies.
 #[allow(dead_code)]
 pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> Response {
+    let request_id = audit::request_id();
     let pool: SqlitePool = app.pool.clone();
     let Some(token) = auth::extract_token(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
@@ -316,6 +480,17 @@ pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> R
     .bind(&now)
     .bind(&token_hash)
     .execute(&pool)
+    .await;
+    audit_auth(
+        &pool,
+        None,
+        "auth.logout",
+        "session",
+        "ok",
+        &request_id,
+        None,
+        None,
+    )
     .await;
     clear_session_cookies(cookie_secure(app.secure_cookies, &headers))
 }
@@ -335,8 +510,20 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Response {
+    let request_id = audit::request_id();
     let pool: SqlitePool = app.pool.clone();
     if body.new_password.len() < MIN_PASSWORD_LEN || body.new_password.len() > MAX_PASSWORD_LEN {
+        audit_auth(
+            &pool,
+            Some(&auth_user.id),
+            "auth.password_change",
+            &auth_user.id,
+            "failed",
+            &request_id,
+            None,
+            Some("weak_password"),
+        )
+        .await;
         return error(StatusCode::BAD_REQUEST, "WEAK_PASSWORD");
     }
     if body.current_password.len() > MAX_PASSWORD_LEN {
@@ -356,6 +543,17 @@ pub async fn change_password(
         return error(StatusCode::UNAUTHORIZED, "AUTH_REQUIRED");
     };
     if !auth::verify_password(&body.current_password, &stored_hash).unwrap_or(false) {
+        audit_auth(
+            &pool,
+            Some(&auth_user.id),
+            "auth.password_change",
+            &auth_user.id,
+            "failed",
+            &request_id,
+            None,
+            Some("invalid_credentials"),
+        )
+        .await;
         return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
     }
     let new_hash = match auth::hash_password(&body.new_password) {
@@ -398,12 +596,50 @@ pub async fn change_password(
     if revoked.is_err() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL");
     }
+    audit_auth(
+        &pool,
+        Some(&auth_user.id),
+        "auth.password_change",
+        &auth_user.id,
+        "ok",
+        &request_id,
+        None,
+        None,
+    )
+    .await;
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Client IP for audit metadata (never the ephemeral port).
+fn peer_ip(peer: Option<&SocketAddr>) -> String {
+    peer.map_or_else(|| "unknown".to_string(), |addr| addr.ip().to_string())
+}
+
+/// Record an authentication event. Credentials are never included.
+#[allow(clippy::too_many_arguments)]
+async fn audit_auth(
+    pool: &SqlitePool,
+    actor: Option<&str>,
+    action: &str,
+    target: &str,
+    outcome: &str,
+    request_id: &str,
+    peer: Option<&SocketAddr>,
+    reason: Option<&str>,
+) {
+    let mut metadata = serde_json::json!({ "peer": peer_ip(peer) });
+    if let Some(reason) = reason {
+        metadata["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    audit::record(
+        pool, actor, action, "user", target, outcome, request_id, metadata,
+    )
+    .await;
+}
 
 /// Inserts a session row (TTL from config) and returns the raw token.
 async fn issue_session(
@@ -570,7 +806,7 @@ fn origin_authority(url: &str) -> Option<&str> {
 /// the fallback bucket rather than bypassing the limiter.
 fn client_key(peer: Option<&SocketAddr>) -> String {
     match peer {
-        Some(addr) => format!("ip:{addr}"),
+        Some(addr) => format!("ip:{}", addr.ip()),
         None => "ip:global".to_string(),
     }
 }
@@ -624,7 +860,7 @@ fn rate_limited(retry_after_secs: u64) -> Response {
         .into_response()
 }
 
-fn validate_username(raw: &str) -> Result<String, &'static str> {
+pub(crate) fn validate_username(raw: &str) -> Result<String, &'static str> {
     let username = raw.trim().to_owned();
     if username.is_empty()
         || username.chars().count() > MAX_USERNAME_LEN
@@ -635,7 +871,7 @@ fn validate_username(raw: &str) -> Result<String, &'static str> {
     Ok(username)
 }
 
-fn validate_password(password: &str, enforce_min: bool) -> Result<(), &'static str> {
+pub(crate) fn validate_password(password: &str, enforce_min: bool) -> Result<(), &'static str> {
     if password.len() > MAX_PASSWORD_LEN || (enforce_min && password.len() < MIN_PASSWORD_LEN) {
         return Err("INVALID_CREDENTIALS");
     }
@@ -673,5 +909,19 @@ mod cookie_tests {
             HeaderValue::from_static("https://panel.example.test"),
         );
         assert!(cookie_secure(true, &headers));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_key_ignores_ephemeral_port() {
+        let first: SocketAddr = "203.0.113.9:1000".parse().unwrap();
+        let second: SocketAddr = "203.0.113.9:2000".parse().unwrap();
+        assert_eq!(client_key(Some(&first)), "ip:203.0.113.9");
+        assert_eq!(client_key(Some(&first)), client_key(Some(&second)));
+        assert_eq!(client_key(None), "ip:global");
     }
 }

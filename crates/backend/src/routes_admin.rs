@@ -191,59 +191,177 @@ pub async fn update_user(
             );
         }
     }
-    let target: Option<(String, i64)> =
-        sqlx::query_as("SELECT role, is_active FROM users WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-    let Some((target_role, _)) = target else {
-        return error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user");
-    };
-    // Last-owner guard: any change that would deactivate or demote an
-    // owner requires another active owner to remain.
-    let demotes_owner = target_role == "owner"
-        && (body.role.as_deref().is_some_and(|r| r != "owner") || body.is_active == Some(false));
-    if demotes_owner {
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1 AND id != ?",
-        )
-        .bind(&id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
-        if others == 0 {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
             return error(
-                StatusCode::CONFLICT,
-                "LAST_OWNER",
-                "cannot demote or deactivate the last active owner",
-            );
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to update user",
+            )
+        }
+    };
+    // Guard and write in one statement so two concurrent demotions cannot
+    // leave the install with zero active owners.
+    if let Some(role) = &body.role {
+        let result = sqlx::query(
+            "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?
+               AND (role <> 'owner' OR ? = 'owner' OR EXISTS (
+                   SELECT 1 FROM users WHERE role = 'owner' AND is_active = 1 AND id <> ?
+               ))",
+        )
+        .bind(role)
+        .bind(&id)
+        .bind(role)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(r) if r.rows_affected() == 1 => {}
+            Ok(_) => {
+                let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE id = ?")
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .unwrap_or(None);
+                let _ = tx.rollback().await;
+                return if exists.is_some() {
+                    error(
+                        StatusCode::CONFLICT,
+                        "LAST_OWNER",
+                        "cannot demote or deactivate the last active owner",
+                    )
+                } else {
+                    error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user")
+                };
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                tracing::warn!(user_id = %id, error = %e, "role update failed");
+                audit::record(
+                    &state.pool,
+                    Some(&actor.id),
+                    "users.update",
+                    "user",
+                    &id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "stage": "role" }),
+                )
+                .await;
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "failed to update user",
+                );
+            }
         }
     }
-    if let Some(role) = &body.role {
-        let _ = sqlx::query("UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
-            .bind(role)
-            .bind(&id)
-            .execute(&state.pool)
-            .await;
-    }
     if let Some(active) = body.is_active {
-        let _ = sqlx::query("UPDATE users SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
-            .bind(if active { 1 } else { 0 })
-            .bind(&id)
-            .execute(&state.pool)
-            .await;
+        let active_flag = if active { 1i64 } else { 0i64 };
+        let result = sqlx::query(
+            "UPDATE users SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?
+               AND (? = 1 OR role <> 'owner' OR EXISTS (
+                   SELECT 1 FROM users WHERE role = 'owner' AND is_active = 1 AND id <> ?
+               ))",
+        )
+        .bind(active_flag)
+        .bind(&id)
+        .bind(active_flag)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(r) if r.rows_affected() == 1 => {}
+            Ok(_) => {
+                let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE id = ?")
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .unwrap_or(None);
+                let _ = tx.rollback().await;
+                return if exists.is_some() {
+                    error(
+                        StatusCode::CONFLICT,
+                        "LAST_OWNER",
+                        "cannot demote or deactivate the last active owner",
+                    )
+                } else {
+                    error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user")
+                };
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                tracing::warn!(user_id = %id, error = %e, "activation update failed");
+                audit::record(
+                    &state.pool,
+                    Some(&actor.id),
+                    "users.update",
+                    "user",
+                    &id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "stage": "is_active" }),
+                )
+                .await;
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "failed to update user",
+                );
+            }
+        }
         if !active {
-            // Deactivation revokes every session immediately.
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
             )
             .bind(&now)
             .bind(&id)
-            .execute(&state.pool)
-            .await;
+            .execute(&mut *tx)
+            .await
+            {
+                let _ = tx.rollback().await;
+                tracing::warn!(user_id = %id, error = %e, "session revocation failed");
+                audit::record(
+                    &state.pool,
+                    Some(&actor.id),
+                    "users.update",
+                    "user",
+                    &id,
+                    "failed",
+                    &request_id,
+                    serde_json::json!({ "stage": "revoke" }),
+                )
+                .await;
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "failed to revoke user sessions",
+                );
+            }
         }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(user_id = %id, error = %e, "user update commit failed");
+        audit::record(
+            &state.pool,
+            Some(&actor.id),
+            "users.update",
+            "user",
+            &id,
+            "failed",
+            &request_id,
+            serde_json::json!({ "stage": "commit" }),
+        )
+        .await;
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to update user",
+        );
     }
     audit::record(
         &state.pool,
@@ -276,19 +394,22 @@ pub async fn create_user(
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
     let request_id = audit::request_id();
-    let username = body.username.trim().to_owned();
-    if username.is_empty() {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "INVALID_USERNAME",
-            "username must not be empty",
-        );
-    }
-    if body.password.len() < 8 {
+    // Use the same rules as login so a created account can always sign in.
+    let username = match crate::routes_auth::validate_username(&body.username) {
+        Ok(username) => username,
+        Err(code) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                code,
+                "username must be 1-64 characters with no control characters",
+            )
+        }
+    };
+    if crate::routes_auth::validate_password(&body.password, true).is_err() {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "WEAK_PASSWORD",
-            "password must be at least 8 characters",
+            "password must be 8-1024 characters",
         );
     }
     let Some(role) = crate::auth::Role::from_str(body.role.trim()) else {
@@ -377,65 +498,51 @@ pub async fn delete_user(
     Path(id): Path<String>,
 ) -> Response {
     let request_id = audit::request_id();
-    let target: Option<(String, i64)> =
-        sqlx::query_as("SELECT role, is_active FROM users WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-    let Some((target_role, target_active)) = target else {
-        return error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user");
-    };
-    if target_role == "owner" && target_active != 0 {
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1 AND id != ?",
-        )
-        .bind(&id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
-        if others == 0 {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
             return error(
-                StatusCode::CONFLICT,
-                "LAST_OWNER",
-                "cannot delete the last active owner",
-            );
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to delete user",
+            )
         }
-    }
+    };
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    // Session revocation and the row delete must both succeed: a swallowed DB
-    // error here must surface as 5xx with a `failed` audit, never 204 + `ok`.
-    if sqlx::query("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL")
-        .bind(&now)
-        .bind(&id)
-        .execute(&state.pool)
-        .await
-        .is_err()
-    {
-        audit::record(
-            &state.pool,
-            Some(&actor.id),
-            "users.delete",
-            "user",
-            &id,
-            "failed",
-            &request_id,
-            serde_json::json!({ "stage": "revoke" }),
-        )
-        .await;
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL",
-            "failed to revoke user sessions",
-        );
-    }
-    match sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(&id)
-        .execute(&state.pool)
-        .await
-    {
+    // Guard and delete in one statement; the transaction serialises concurrent
+    // owner removals so the last active owner cannot disappear.
+    let deleted = sqlx::query(
+        "DELETE FROM users WHERE id = ?
+           AND (role <> 'owner' OR is_active = 0 OR EXISTS (
+               SELECT 1 FROM users WHERE role = 'owner' AND is_active = 1 AND id <> ?
+           ))",
+    )
+    .bind(&id)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await;
+    match deleted {
         Ok(r) if r.rows_affected() == 1 => {}
-        _ => {
+        Ok(_) => {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE id = ?")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .unwrap_or(None);
+            let _ = tx.rollback().await;
+            return if exists.is_some() {
+                error(
+                    StatusCode::CONFLICT,
+                    "LAST_OWNER",
+                    "cannot delete the last active owner",
+                )
+            } else {
+                error(StatusCode::NOT_FOUND, "USER_NOT_FOUND", "no such user")
+            };
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            tracing::warn!(user_id = %id, error = %e, "user delete failed");
             audit::record(
                 &state.pool,
                 Some(&actor.id),
@@ -454,6 +561,25 @@ pub async fn delete_user(
             );
         }
     }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(user_id = %id, error = %e, "user delete commit failed");
+        audit::record(
+            &state.pool,
+            Some(&actor.id),
+            "users.delete",
+            "user",
+            &id,
+            "failed",
+            &request_id,
+            serde_json::json!({ "stage": "commit" }),
+        )
+        .await;
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to delete user",
+        );
+    }
     audit::record(
         &state.pool,
         Some(&actor.id),
@@ -462,7 +588,7 @@ pub async fn delete_user(
         &id,
         "ok",
         &request_id,
-        serde_json::json!({}),
+        serde_json::json!({ "revoked_at": now }),
     )
     .await;
     StatusCode::NO_CONTENT.into_response()

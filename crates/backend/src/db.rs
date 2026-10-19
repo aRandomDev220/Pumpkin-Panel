@@ -1,11 +1,15 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
+use std::time::Duration;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<sqlx::SqlitePool> {
     // Allow `sqlite:/path` and `sqlite://` forms.
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // Concurrent owner/port guards wait for the write lock instead of
+        // surfacing SQLITE_BUSY as a 500.
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(opts)
