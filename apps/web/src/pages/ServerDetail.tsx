@@ -672,10 +672,12 @@ export default function ServerDetail() {
     retry: 1,
   });
 
+  const hasContainer = Boolean(serverQuery.data?.container_id);
   const logsQuery = useQuery({
     queryKey: ["servers", id, "logs", logTail],
     queryFn: () => fetchServerLogs(id ?? "", logTail),
-    enabled: !!id,
+    // A fresh server has no container yet; polling would 404 every 5s.
+    enabled: !!id && hasContainer,
     refetchInterval: 5_000,
     retry: 1,
   });
@@ -923,14 +925,27 @@ export default function ServerDetail() {
         <button
           type="button"
           onClick={copyLogs}
-          disabled={!logsQuery.data || logsQuery.data.logs.length === 0}
+          disabled={
+            !hasContainer ||
+            !logsQuery.data ||
+            logsQuery.data.logs.length === 0
+          }
         >
           {copied ? "Copied ✓" : "Copy"}
         </button>
         <span className="muted">auto-refreshes every 5s</span>
       </div>
-      {logsQuery.isLoading && <p>Loading logs…</p>}
-      {logsQuery.error && <p className="err">Failed to load logs.</p>}
+      {!hasContainer && !serverQuery.isLoading && (
+        <p className="muted">
+          No container yet — start the world to see logs.
+        </p>
+      )}
+      {hasContainer && logsQuery.isLoading && <p>Loading logs…</p>}
+      {hasContainer && logsQuery.error && (
+        <p className="muted" role="status">
+          Logs are unavailable right now (the container may not be running).
+        </p>
+      )}
       {logsQuery.data && logsQuery.data.logs.length === 0 && (
         <p className="muted">No log lines.</p>
       )}

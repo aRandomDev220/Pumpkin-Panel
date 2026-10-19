@@ -112,7 +112,7 @@ export default function Overview(): React.JSX.Element {
   const statusById = new Map<string, { dockerAvailable: boolean; containerMissing: boolean }>();
   servers.forEach((server, index) => {
     const status = statusQueries[index]?.data;
-    if (status) statusById.set(server.id, { dockerAvailable: status.docker_available, containerMissing: status.container === null || status.observed_state === "missing" });
+    if (status) statusById.set(server.id, { dockerAvailable: status.docker_available, containerMissing: status.docker_available && status.observed_state === "missing" });
   });
   const alerts = buildAlerts(servers, statusById, statusQueries.some((query) => query.isError));
   const readinessStates = servers.map((server, index) => {
