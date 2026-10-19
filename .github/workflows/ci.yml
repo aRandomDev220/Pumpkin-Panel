@@ -2,7 +2,12 @@ name: ci
 
 on:
   push:
+    branches: [main, nightly]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
@@ -15,11 +20,19 @@ jobs:
         with:
           toolchain: 1.99.0
           components: clippy, rustfmt
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target/
+          key: ${{ runner.os }}-cargo-backend-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo install cargo-audit --locked
       - run: cargo audit
       - run: cargo fmt --check
-      - run: cargo clippy -p pumpkin-manager-backend -- -D warnings
-      - run: cargo test -p pumpkin-manager-backend
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked -- --test-threads=1
 
   web:
     runs-on: ubuntu-latest
@@ -29,10 +42,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - run: npm ci
+        working-directory: apps/web
+      - run: npm run lint
         working-directory: apps/web
       - run: npm run build
         working-directory: apps/web
@@ -47,6 +62,35 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: docker build -f deploy/Dockerfile -t pumpkin-manager:ci .
+      - name: Smoke-test the built image
+        run: |
+          set -euo pipefail
+          data="$(mktemp -d)"
+          cleanup() {
+            docker rm -f pm-smoke >/dev/null 2>&1 || true
+            docker run --rm -v "$data:/s" alpine rm -rf /s >/dev/null 2>&1 || true
+            rmdir "$data" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name pm-smoke -p 18080:8080 \
+            -v "$data:/data" \
+            -e PUMPKIN_MANAGER_DATA_ROOT=/data \
+            -e PUMPKIN_INSECURE_COOKIES=1 \
+            pumpkin-manager:ci
+          live=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/v1/health/live >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 2
+          done
+          test "$live" = "1"
+          curl -fsS http://127.0.0.1:18080/ | grep -q 'id="root"'
+          # PID 1 must be the unprivileged app user, not root.
+          uid="$(docker exec pm-smoke sh -c "awk '/^Uid:/{print \$2}' /proc/1/status")"
+          test "$uid" != "0"
+          docker logs pm-smoke 2>&1 | tail -20
 
   e2e:
     runs-on: ubuntu-latest
@@ -61,21 +105,31 @@ jobs:
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
-            ~/.cargo
+            ~/.cargo/registry
+            ~/.cargo/git
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
-      - run: docker pull ghcr.io/pumpkin-mc/pumpkin:master
-      - run: npx playwright install --with-deps chromium
-        working-directory: apps/web
       - run: npm ci
         working-directory: apps/web
+      - run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+      - run: docker pull ghcr.io/pumpkin-mc/pumpkin:master
       - run: npm run build
         working-directory: apps/web
-      - run: cargo build -p pumpkin-manager-backend
+      - run: cargo build -p pumpkin-manager-backend --locked
       - run: npx playwright test --config playwright.config.ts
         working-directory: apps/web
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8 # v4.3.0
+        with:
+          name: playwright-results
+          path: |
+            apps/web/test-results
+            apps/web/playwright-report
+          if-no-files-found: ignore
