@@ -4,14 +4,10 @@ mod backup_service;
 mod config;
 mod config_profile;
 mod db;
-mod error;
 mod file_service;
 mod health;
 mod metrics;
 mod metrics_collector;
-// The RAII op-lock API is the frozen foundation Tasks 3-9 migrate onto; until
-// those land it has no non-test caller in the binary.
-#[allow(dead_code)]
 mod op_lock;
 mod ports;
 mod ratelimit;

@@ -7,12 +7,7 @@ export interface ReadyResponse {
 
 export async function fetchHealth(): Promise<ReadyResponse> {
   const res = await fetch("/api/v1/health/ready");
-  if (!res.ok) throw new Error(`health ${res.status}`);
-  return res.json();
-}
-
-export async function fetchServers(): Promise<{ servers: unknown[] }> {
-  const res = await fetch("/api/v1/servers");
-  if (!res.ok) throw new Error(`servers ${res.status}`);
+  // 503 still carries the degraded detail (database/docker fields).
+  if (!res.ok && res.status !== 503) throw new Error(`health ${res.status}`);
   return res.json();
 }

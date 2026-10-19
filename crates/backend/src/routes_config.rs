@@ -14,9 +14,6 @@
 //!
 //! Route wiring + permission layers are the controller's job; every handler
 //! here is a standalone `pub async fn` taking `State<AppState>`.
-//!
-//! Dead-code lints are silenced until the controller wires these handlers
-//! into `main.rs` (same transient state as the other Phase 4 task modules).
 
 use axum::{
     extract::{Path, Query, State},

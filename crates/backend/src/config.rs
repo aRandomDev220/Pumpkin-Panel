@@ -3,7 +3,6 @@ use std::{net::SocketAddr, path::PathBuf};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // metrics/session fields wired in Phase 6/2
 pub struct Settings {
     #[serde(default = "default_http_port")]
     pub http_port: u16,
