@@ -2101,30 +2101,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0010_port_reservations.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0005_backups.sql"),
-            include_str!("../../../migrations/0007_update.sql"),
-            include_str!("../../../migrations/0009_app_settings.sql"),
-        ] {
-            // Strip `--` comment lines first: headers may contain `;`
-            // (e.g. 0002's "immutable; new tables only"), which would split
-            // mid-comment into bogus chunks.
-            let stripped: String = file
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            for stmt in stripped.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() || stmt.to_uppercase().starts_with("PRAGMA") {
-                    continue;
-                }
-                sqlx::query(stmt).execute(&pool).await.unwrap();
-            }
-        }
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
         pool
     }
 

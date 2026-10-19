@@ -1297,24 +1297,14 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0010_port_reservations.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0009_app_settings.sql"),
-        ] {
-            for stmt in file.split(";\n") {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                if !stmt.to_uppercase().contains("CREATE") && !stmt.to_uppercase().contains("INDEX")
-                {
-                    continue;
-                }
-                sqlx::query(stmt).execute(&pool).await.unwrap();
-            }
-        }
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
         pool
     }
 
@@ -1437,25 +1427,10 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap();
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0010_port_reservations.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0009_app_settings.sql"),
-        ] {
-            let stripped: String = file
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            for stmt in stripped.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() || stmt.to_uppercase().starts_with("PRAGMA") {
-                    continue;
-                }
-                sqlx::query(stmt).execute(&pool).await.unwrap();
-            }
-        }
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
         pool
     }
 

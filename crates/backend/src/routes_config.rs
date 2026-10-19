@@ -722,31 +722,10 @@ mod tests {
     }
 
     async fn apply_migrations(pool: &SqlitePool) {
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0010_port_reservations.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0003_config_revisions.sql"),
-            include_str!("../../../migrations/0004_config_baseline_hash.sql"),
-            include_str!("../../../migrations/0007_update.sql"),
-            include_str!("../../../migrations/0009_app_settings.sql"),
-        ] {
-            // Strip `--` comment lines first: they may contain semicolons
-            // (e.g. "immutable; new tables only") that naive splitting
-            // would cut mid-sentence into a bogus statement.
-            let stripped: String = file
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            for stmt in stripped.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                sqlx::query(stmt).execute(pool).await.unwrap();
-            }
-        }
+        sqlx::migrate!("../../migrations")
+            .run(pool)
+            .await
+            .expect("migrate");
     }
 
     /// Test app: the full production router (config routes are wired in

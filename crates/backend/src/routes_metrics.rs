@@ -264,11 +264,6 @@ mod tests {
     use serde_json::{json, Value};
     use sqlx::SqlitePool;
 
-    /// Task 1 `metrics_samples` DDL, verbatim from the Phase 6 plan (Task 1
-    /// owns the real migration; tests stand it up locally so history queries
-    /// run against the frozen shape).
-    const METRICS_SQL: &str = "CREATE TABLE metrics_samples (id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE, sampled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), cpu_percent REAL, memory_usage_bytes INTEGER, memory_limit_bytes INTEGER, restart_count INTEGER NOT NULL DEFAULT -1, players_online INTEGER, latency_ms INTEGER, state TEXT NOT NULL DEFAULT 'unknown');\nCREATE INDEX idx_metrics_server_time ON metrics_samples(server_id, sampled_at);";
-
     const PINNED_IMAGE: &str = "ghcr.io/pumpkin-mc/pumpkin@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
     async fn test_pool() -> SqlitePool {
@@ -281,37 +276,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        for file in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0010_port_reservations.sql"),
-            include_str!("../../../migrations/0002_sessions_audit.sql"),
-            include_str!("../../../migrations/0005_backups.sql"),
-            include_str!("../../../migrations/0009_app_settings.sql"),
-            METRICS_SQL,
-        ] {
-            // Strip full-line `--` comments first: some carry `;` inside
-            // (e.g. "immutable; new tables only"), which would corrupt a
-            // naive `;` split.
-            let mut sql = String::new();
-            for line in file.lines() {
-                if line.trim_start().starts_with("--") {
-                    continue;
-                }
-                sql.push_str(line);
-                sql.push('\n');
-            }
-            for stmt in sql.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-                let upper = stmt.to_uppercase();
-                if !upper.contains("CREATE") && !upper.contains("INDEX") {
-                    continue;
-                }
-                sqlx::query(stmt).execute(&pool).await.unwrap();
-            }
-        }
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("migrate");
         pool
     }
 
