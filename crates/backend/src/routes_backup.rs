@@ -584,7 +584,14 @@ async fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
 static BACKUP_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 fn semaphore() -> &'static Semaphore {
-    BACKUP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+    BACKUP_SEMAPHORE.get_or_init(|| {
+        let permits = std::env::var("PUMPKIN_BACKUP_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
+        Semaphore::new(permits)
+    })
 }
 
 async fn cancel_requested(pool: &SqlitePool, task_id: &str) -> bool {

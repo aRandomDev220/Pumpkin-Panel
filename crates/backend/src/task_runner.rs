@@ -793,6 +793,7 @@ pub fn spawn_runner(
     pool: sqlx::SqlitePool,
     adapter: Arc<DockerAdapter>,
     concurrency: usize,
+    op_locks: crate::op_lock::OpLocks,
 ) -> RunnerHandle {
     let concurrency = if concurrency == 0 {
         DEFAULT_CONCURRENCY
@@ -808,8 +809,21 @@ pub fn spawn_runner(
             let pool = pool.clone();
             let adapter = adapter.clone();
             let semaphore = semaphore.clone();
+            let op_locks = op_locks.clone();
             tokio::spawn(async move {
                 let _permit = semaphore.acquire_owned().await;
+                // Hold the same per-server lock the HTTP handlers use, so a
+                // worker never races delete/config/backup on one server.
+                let row: Option<(Option<String>,)> =
+                    sqlx::query_as("SELECT server_id FROM tasks WHERE id = ?")
+                        .bind(&task_id)
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap_or(None);
+                let _guard = match row.and_then(|(server_id,)| server_id) {
+                    Some(server_id) => Some(crate::op_lock::acquire(&op_locks, &server_id).await),
+                    None => None,
+                };
                 if let Err(e) = dispatch_task(&pool, adapter.as_ref(), &task_id).await {
                     error!(%task_id, error = %e, "dispatch failed");
                 }

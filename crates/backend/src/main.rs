@@ -634,9 +634,10 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let op_locks: crate::op_lock::OpLocks = Arc::new(Mutex::new(HashSet::new()));
     let runner = adapter
         .as_ref()
-        .map(|a| task_runner::spawn_runner(pool.clone(), Arc::clone(a), 4));
+        .map(|a| task_runner::spawn_runner(pool.clone(), Arc::clone(a), 4, Arc::clone(&op_locks)));
 
     // Best-effort reconcile at startup: sync observed state, log drift.
     if let Some(a) = &adapter {
@@ -683,8 +684,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(path = %backup_root.display(), error = %e, "cannot create backup dir");
     }
     routes_backup::startup_cleanup(&pool, &backup_root).await;
-    // Single-node scheduler: one 60s loop per manager process (no second
-    // replica may run against the same DB — see spec §19.2).
+    // Single-node scheduler: one loop per manager process (no second replica
+    // may run against the same DB — see spec §19.2). A panic restarts the
+    // iteration instead of silently disabling every schedule for the process
+    // lifetime.
     {
         let pool = pool.clone();
         let adapter = adapter.clone();
@@ -693,15 +696,44 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut reconciler = reconcile::Reconciler::default();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            // A slow pass must not cause the next tick to fire immediately.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                scheduler::tick_once(&pool, adapter.as_deref(), &backup_root).await;
-                metrics_collector::sample_all(&pool, adapter.as_deref()).await;
-                reconciler
-                    .tick(&pool, adapter.as_deref(), reconcile_runner.as_ref())
+                let tick = std::panic::AssertUnwindSafe(async {
+                    scheduler::tick_once(
+                        &pool,
+                        adapter.as_deref(),
+                        &backup_root,
+                        reconcile_runner.as_ref(),
+                    )
                     .await;
+                    reconciler
+                        .tick(&pool, adapter.as_deref(), reconcile_runner.as_ref())
+                        .await;
+                });
+                if futures_util::FutureExt::catch_unwind(tick).await.is_err() {
+                    tracing::error!("scheduler tick panicked; continuing");
+                }
+            }
+        });
+    }
+    // Metrics are independent: a slow probe must never delay schedules.
+    {
+        let pool = pool.clone();
+        let adapter = adapter.clone();
+        let metrics_secs = settings.metrics_interval_seconds.max(10);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(metrics_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let tick = std::panic::AssertUnwindSafe(metrics_collector::sample_all(
+                    &pool,
+                    adapter.as_deref(),
+                ));
+                if futures_util::FutureExt::catch_unwind(tick).await.is_err() {
+                    tracing::error!("metrics tick panicked; continuing");
+                }
             }
         });
     }
@@ -719,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
         server_root,
         backup_dir: backup_root,
         web_root,
-        op_locks: Arc::new(Mutex::new(HashSet::new())),
+        op_locks,
         session_ttl_secs: settings.session_ttl_secs(),
         secure_cookies: !insecure_cookies,
         rate_limiter: new_rate_limiter(),

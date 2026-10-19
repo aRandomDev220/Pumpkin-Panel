@@ -833,7 +833,11 @@ pub async fn delete_scheduled_task(
 /// silent success. `next_run_at` is always recomputed strictly after now
 /// (single catch-up), so a manager reboot with a stale `next_run_at` runs
 /// exactly once and concurrent ticks cannot double-enqueue.
-pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
+pub async fn tick_restarts(
+    pool: &SqlitePool,
+    adapter: Option<&DockerAdapter>,
+    runner: Option<&task_runner::RunnerHandle>,
+) {
     let now = Utc::now();
     let now_str = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -894,6 +898,9 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
         // A busy server is SKIPPED (with the outcome recorded), never wedged.
         // The run slot is already advanced, so the next tick tries the next one.
         if server_busy(pool, &fresh.server_id).await {
+            // Do not lose the occurrence: retry shortly instead of waiting
+            // for the next cron boundary.
+            push_restart_retry(pool, &fresh.id, &now).await;
             audit::record(
                 pool,
                 fresh.created_by.as_deref(),
@@ -909,6 +916,57 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
         }
 
         let requested_by = fresh.created_by.clone();
+        if let Some(runner) = runner {
+            let _ = sqlx::query("UPDATE scheduled_tasks SET last_run_at = ? WHERE id = ?")
+                .bind(&now_str)
+                .bind(&fresh.id)
+                .execute(pool)
+                .await;
+            match task_runner::enqueue_and_submit(
+                pool,
+                runner,
+                "restart",
+                Some(&fresh.server_id),
+                requested_by.as_deref(),
+            )
+            .await
+            {
+                Ok(record) => {
+                    audit::record(
+                        pool,
+                        requested_by.as_deref(),
+                        "restart.scheduled",
+                        "task",
+                        &record.id,
+                        "ok",
+                        &audit::request_id(),
+                        serde_json::json!({
+                            "server_id": fresh.server_id,
+                            "scheduled_task_id": fresh.id,
+                        }),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    audit::record(
+                        pool,
+                        requested_by.as_deref(),
+                        "restart.scheduled",
+                        "scheduled_task",
+                        &fresh.id,
+                        "failed",
+                        &audit::request_id(),
+                        serde_json::json!({
+                            "server_id": fresh.server_id,
+                            "error_code": "TASK_QUEUE_FULL",
+                            "error": task_runner::sanitize_summary(&e.to_string()),
+                        }),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
         let record = match task_runner::enqueue(
             pool,
             "restart",
@@ -1042,6 +1100,27 @@ pub async fn tick_restarts(pool: &SqlitePool, adapter: Option<&DockerAdapter>) {
 /// Recompute a restart row's `next_run_at` strictly after `now`. On an
 /// unparseable schedule (should not happen — validated at write time) push
 /// one hour out so one bad row cannot spin the tick loop.
+/// Retry a busy scheduled run soon instead of consuming the occurrence.
+fn retry_at(now: &DateTime<Utc>) -> String {
+    (*now + chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+async fn push_restart_retry(pool: &SqlitePool, id: &str, now: &DateTime<Utc>) {
+    let _ = sqlx::query("UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND enabled != 0")
+        .bind(retry_at(now))
+        .bind(id)
+        .execute(pool)
+        .await;
+}
+
+async fn push_policy_retry(pool: &SqlitePool, id: &str, now: &DateTime<Utc>) {
+    let _ = sqlx::query("UPDATE backup_policies SET next_run_at = ? WHERE id = ? AND enabled != 0")
+        .bind(retry_at(now))
+        .bind(id)
+        .execute(pool)
+        .await;
+}
+
 async fn push_restart_next_run(pool: &SqlitePool, row: &ScheduledTaskRow, now: &DateTime<Utc>) {
     let next = next_run_after(&row.schedule, *now)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
@@ -1113,7 +1192,12 @@ async fn server_busy(pool: &SqlitePool, server_id: &str) -> bool {
 ///
 /// Scheduled restarts (`scheduled_tasks`, Phase 6 Task 3) run at the end of
 /// the same pass via [`tick_restarts`].
-pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backup_root: &Path) {
+pub async fn tick_once(
+    pool: &SqlitePool,
+    adapter: Option<&DockerAdapter>,
+    backup_root: &Path,
+    runner: Option<&task_runner::RunnerHandle>,
+) {
     // Archive storage is the configured backup dir, threaded into Task 2's
     // worker via `enqueue_backup` (single source of truth: `AppState::backup_dir`).
     let now = Utc::now();
@@ -1217,7 +1301,8 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
                 .await;
             }
             Err(BackupError::ServerBusy) => {
-                // Busy: SKIP and record (the run slot is already advanced).
+                // Busy: retry soon rather than consuming the occurrence.
+                push_policy_retry(pool, &fresh.id, &now).await;
                 audit::record(
                     pool,
                     requested_by.as_deref(),
@@ -1270,7 +1355,7 @@ pub async fn tick_once(pool: &SqlitePool, adapter: Option<&DockerAdapter>, backu
         }
     }
 
-    tick_restarts(pool, adapter).await;
+    tick_restarts(pool, adapter, runner).await;
 }
 
 /// Atomically claim a due backup-policy row by advancing `next_run_at`
@@ -1758,7 +1843,7 @@ mod tests {
         let id = make_server(&server, &t, "restart1", 25580).await;
         insert_due_restart(&pool, &id, 1).await;
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let rows: Vec<(String, String, Option<String>)> =
             sqlx::query_as("SELECT type, state, error_code FROM tasks WHERE server_id = ?")
@@ -1783,7 +1868,7 @@ mod tests {
             "next_run_at not pushed: {next}"
         );
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
         )
@@ -1809,7 +1894,7 @@ mod tests {
             .unwrap();
         insert_due_restart(&pool, &id, 1).await;
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT state, error_code FROM tasks WHERE server_id = ? AND type = 'restart'",
@@ -1850,7 +1935,7 @@ mod tests {
         .await
         .unwrap();
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
@@ -1871,7 +1956,7 @@ mod tests {
             "next_run_at not pushed: {next}"
         );
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
         )
@@ -1889,7 +1974,7 @@ mod tests {
         let id = make_server(&server, &t, "restart-disabled", 25583).await;
         insert_due_restart(&pool, &id, 0).await;
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
@@ -2026,7 +2111,7 @@ mod tests {
             .unwrap();
         insert_due_policy(&pool, &id).await;
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
         let (state, code) = poll_backup_task(&pool, &id).await;
         assert_eq!(state, "failed");
         assert_eq!(code.as_deref(), Some("RUNTIME_UNAVAILABLE"));
@@ -2053,7 +2138,7 @@ mod tests {
         std::fs::write(data_dir.join("level.dat"), b"hello-minecraft").unwrap();
         insert_due_policy(&pool, &id).await;
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         // The tick only enqueues; Task 2's worker completes the backup.
         let (state, code) = poll_backup_task(&pool, &id).await;
@@ -2101,7 +2186,7 @@ mod tests {
         .await
         .unwrap();
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         // `enqueue_backup` rejects before creating any row: no new backup,
         // no new task, next_run pushed, busy skip audited.
@@ -2167,7 +2252,7 @@ mod tests {
             .await
             .unwrap();
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let backups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups")
             .fetch_one(&pool)
@@ -2210,7 +2295,7 @@ mod tests {
         .await
         .unwrap();
 
-        tick_once(&pool, None, &backup_root).await;
+        tick_once(&pool, None, &backup_root, None).await;
 
         let restarts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE server_id = ? AND type = 'restart'",
