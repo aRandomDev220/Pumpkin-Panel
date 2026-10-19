@@ -8,8 +8,9 @@
 //!
 //! Archive handling is two-phase: [`import_tar_gz`] fully parses and
 //! validates every entry (names, device nodes, symlink/hardlink targets,
-//! count and byte caps) *before* creating or writing anything, and the write
-//! phase refuses to create anything through a pre-existing symlink.
+//! count and byte caps) while streaming payloads into a private staging
+//! directory, and only publishes them after the whole archive is valid. The
+//! write phase refuses to create anything through a pre-existing symlink.
 //!
 //! The async functions perform only metadata/small I/O on the async runtime.
 //! The blocking archive functions ([`export_tar_gz`], [`import_tar_gz`]) are
@@ -422,14 +423,30 @@ fn append_item<W: std::io::Write>(
 /// Pack `rel_paths` (paths relative to `root`) into a gzip-compressed tar.
 /// Every name is validated with [`resolve`]; absolute or `..` names are
 /// refused, so the produced archive only contains safe relative names.
+/// In-memory convenience used by tests; production streams via
+/// [`export_tar_gz_to`].
+#[cfg(test)]
 pub fn export_tar_gz(root: &Path, rel_paths: &[&str]) -> Result<Vec<u8>, FileError> {
+    let mut out = Vec::new();
+    export_tar_gz_to(root, rel_paths, &mut out)?;
+    Ok(out)
+}
+
+/// Streaming form of [`export_tar_gz`]: writes the gzip tar to `writer` so the
+/// archive is never held in memory. Callers should write to a temp file and
+/// serve that file as a stream.
+pub fn export_tar_gz_to<W: std::io::Write>(
+    root: &Path,
+    rel_paths: &[&str],
+    writer: W,
+) -> Result<(), FileError> {
     let mut items = Vec::new();
     for rel in rel_paths {
         let full = resolve(root, rel)?;
         let arc = PathBuf::from(rel);
         collect_export(&full, &arc, &mut items)?;
     }
-    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let enc = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
     for item in &items {
         // Skip the bare root entry itself (`arc == ""`): its children carry
@@ -442,7 +459,8 @@ pub fn export_tar_gz(root: &Path, rel_paths: &[&str]) -> Result<Vec<u8>, FileErr
     let enc = builder
         .into_inner()
         .map_err(|e| FileError::Io(e.to_string()))?;
-    enc.finish().map_err(|e| FileError::Io(e.to_string()))
+    enc.finish().map_err(|e| FileError::Io(e.to_string()))?;
+    Ok(())
 }
 
 /// Reject archive member names: must be relative with no `..` component.
@@ -546,8 +564,12 @@ fn remove_existing(full: &Path) -> Result<(), FileError> {
 /// Two phases: the whole archive is parsed and every entry validated
 /// (relative `..`-free names, no device/fifo/socket entries, symlink and
 /// hardlink targets confined to the destination, `max_files`/`max_bytes`
-/// caps) *before* anything is written. Returns the number of non-directory
-/// entries written (files + symlinks + hardlinks).
+/// caps) while streaming payloads into a private staging directory, and only
+/// publishes them once the whole archive is valid. Returns the number of
+/// non-directory entries written (files + symlinks + hardlinks).
+/// In-memory convenience used by tests; production streams via
+/// [`import_tar_gz_reader`].
+#[cfg(test)]
 pub fn import_tar_gz(
     root: &Path,
     dest: &str,
@@ -582,9 +604,23 @@ fn extract_tar_reader<R: std::io::Read>(
     limits: &ArchiveLimits,
 ) -> Result<usize, FileError> {
     // ---- Phase 1: parse + validate everything, no writes. ----
+    // Payloads are streamed into a private staging directory during
+    // validation, so a bomb cannot be materialised in memory and nothing is
+    // written into the destination until the whole archive is valid.
+    struct StagingDir(PathBuf);
+    impl Drop for StagingDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    std::fs::create_dir_all(dest_full).map_err(map_io)?;
+    let staging = StagingDir(dest_full.join(format!(".tmp-import-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&staging.0).map_err(map_io)?;
+
     let mut archive = tar::Archive::new(reader);
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut hardlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut entry_count: usize = 0;
@@ -609,19 +645,22 @@ fn extract_tar_reader<R: std::io::Read>(
         }
         let etype = entry.header().entry_type();
         if etype.is_file() {
-            // Cap allocation per entry at the remaining budget (+1 probe).
+            // Stream the payload to staging with a running byte budget. Only
+            // one `io::copy` buffer is resident, regardless of archive size.
             let remaining = limits.max_bytes.saturating_sub(total_bytes);
-            let mut buf = Vec::new();
-            entry
-                .by_ref()
-                .take(remaining.saturating_add(1))
-                .read_to_end(&mut buf)
-                .map_err(|e| FileError::Io(e.to_string()))?;
-            if buf.len() as u64 > remaining {
+            let staged_path = staging.0.join(format!("entry-{entry_count}"));
+            let mut out = std::fs::File::create(&staged_path).map_err(map_io)?;
+            let copied = std::io::copy(
+                &mut entry.by_ref().take(remaining.saturating_add(1)),
+                &mut out,
+            )
+            .map_err(map_io)?;
+            if copied > remaining {
                 return Err(FileError::TooLarge);
             }
-            total_bytes += buf.len() as u64;
-            files.push((rel, buf));
+            out.sync_all().map_err(map_io)?;
+            total_bytes += copied;
+            files.push((rel, staged_path));
         } else if etype == tar::EntryType::Directory {
             dirs.push(rel);
         } else if etype == tar::EntryType::Symlink {
@@ -647,11 +686,9 @@ fn extract_tar_reader<R: std::io::Read>(
         }
     }
 
-    // ---- Phase 2: write. `rel` names are validated relative/`..`-free, so
+    // ---- Phase 2: publish. `rel` names are validated relative/`..`-free, so
     // `dest_full.join(rel)` is lexically inside `dest_full`; the remaining
     // risk (pre-existing symlinks in `dest`) is checked per path. ----
-    std::fs::create_dir_all(dest_full).map_err(map_io)?;
-
     dirs.sort_by_key(|p| p.components().count());
     for d in &dirs {
         let full = dest_full.join(d);
@@ -665,7 +702,7 @@ fn extract_tar_reader<R: std::io::Read>(
             Err(e) => return Err(map_io(e)),
         }
     }
-    for (rel, bytes) in &files {
+    for (rel, staged) in &files {
         let full = dest_full.join(rel);
         ensure_writable_location(dest_full, &full)?;
         if let Some(parent) = full.parent() {
@@ -674,10 +711,8 @@ fn extract_tar_reader<R: std::io::Read>(
         if std::fs::symlink_metadata(&full).is_ok() {
             remove_existing(&full)?;
         }
-        let mut f = std::fs::File::create(&full).map_err(map_io)?;
-        use std::io::Write as _;
-        f.write_all(bytes).map_err(map_io)?;
-        f.sync_all().map_err(map_io)?;
+        // Same filesystem: staging lives under `dest_full`.
+        std::fs::rename(staged, &full).map_err(map_io)?;
     }
     for (rel, target) in &symlinks {
         let full = dest_full.join(rel);
@@ -1018,6 +1053,43 @@ mod tests {
             export_tar_gz(&root1, &["/abs"]),
             Err(FileError::OutsideRoot)
         );
+    }
+
+    #[test]
+    fn export_to_writer_round_trips_without_buffering_the_archive() {
+        let (root1, _g1) = temp_root();
+        let (root2, _g2) = temp_root();
+        std::fs::create_dir_all(root1.join("sub")).unwrap();
+        std::fs::write(root1.join("sub/a.txt"), b"alpha").unwrap();
+
+        let mut out = Vec::new();
+        export_tar_gz_to(&root1, &["sub"], &mut out).unwrap();
+        assert!(!out.is_empty());
+
+        let n = import_tar_gz(&root2, "restored", &out, &DEFAULT_ARCHIVE_LIMITS).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            std::fs::read(root2.join("restored/sub/a.txt")).unwrap(),
+            b"alpha"
+        );
+    }
+
+    #[test]
+    fn import_leaves_no_staging_directory() {
+        let (root, _g) = temp_root();
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut b = tar::Builder::new(enc);
+        let payload = b"data";
+        b.append(&reg_header("a.txt", payload.len() as u64), &payload[..])
+            .unwrap();
+        let data = b.into_inner().unwrap().finish().unwrap();
+        import_tar_gz(&root, "dest", &data, &DEFAULT_ARCHIVE_LIMITS).unwrap();
+        let leftovers = std::fs::read_dir(root.join("dest"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-import-"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

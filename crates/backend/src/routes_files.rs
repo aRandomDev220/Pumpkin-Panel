@@ -641,23 +641,25 @@ pub async fn import_archive(
         let _ = std::fs::remove_file(&archive.temp_path);
         return error(StatusCode::BAD_REQUEST, "FILE_ERROR", "empty archive");
     }
-    let data = match tokio::fs::read(&archive.temp_path).await {
-        Ok(d) => d,
-        Err(e) => {
-            for extra in &staged {
-                let _ = std::fs::remove_file(&extra.temp_path);
-            }
-            return file_error(FileError::Io(e.to_string()));
-        }
-    };
+    // Stream the staged archive through the decoder: the upload is already on
+    // disk and must not be copied into memory again.
+    let archive_path = archive.temp_path.clone();
+    let dest = query.path.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        let dest_full = file_service::resolve(&root, &dest)?;
+        let file = std::fs::File::open(&archive_path)
+            .map_err(|e| file_service::FileError::Io(e.to_string()))?;
+        let reader = flate2::read::GzDecoder::new(file);
+        file_service::import_tar_gz_reader(
+            reader,
+            &dest_full,
+            &file_service::DEFAULT_ARCHIVE_LIMITS,
+        )
+    })
+    .await;
     for extra in &staged {
         let _ = std::fs::remove_file(&extra.temp_path);
     }
-    let dest = query.path.clone();
-    let extracted = tokio::task::spawn_blocking(move || {
-        file_service::import_tar_gz(&root, &dest, &data, &file_service::DEFAULT_ARCHIVE_LIMITS)
-    })
-    .await;
     let count = match extracted {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return file_error(e),
@@ -695,22 +697,79 @@ pub async fn export_archive(
         Err(resp) => return resp,
     };
     let rel_path = query.path.clone();
-    let bytes = match tokio::task::spawn_blocking(move || {
-        let rel = [rel_path.as_str()];
-        file_service::export_tar_gz(&root, &rel)
+    // Build the archive in a private temp file, then stream it off disk. The
+    // archive is never buffered in memory, however large the subtree is.
+    let tmp = std::env::temp_dir().join(format!("pm-export-{}.tar.gz", uuid::Uuid::new_v4()));
+    let write_tmp = tmp.clone();
+    let write_root = root.clone();
+    let written = tokio::task::spawn_blocking(move || -> Result<(), FileError> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&write_tmp)
+            .map_err(|e| FileError::Io(e.to_string()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        file_service::export_tar_gz_to(&write_root, &[rel_path.as_str()], &mut writer)?;
+        use std::io::Write as _;
+        writer.flush().map_err(|e| FileError::Io(e.to_string()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| FileError::Io(e.to_string()))?;
+        Ok(())
     })
-    .await
-    {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => return file_error(e),
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            return file_error(e);
+        }
         Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "FILE_ERROR",
                 "export task failed",
             );
         }
+    }
+
+    struct TempExport(std::path::PathBuf);
+    impl Drop for TempExport {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let file = match tokio::fs::File::open(&tmp).await {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "FILE_ERROR",
+                "export archive is unavailable",
+            );
+        }
     };
+    let stream =
+        futures_util::stream::try_unfold((file, TempExport(tmp)), |(mut file, guard)| async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = vec![0u8; 64 * 1024];
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                buf.truncate(n);
+                Ok(Some((axum::body::Bytes::from(buf), (file, guard))))
+            }
+        });
     (
         [
             ("content-type", "application/gzip".to_string()),
@@ -719,7 +778,7 @@ pub async fn export_archive(
                 "attachment; filename=\"files-export.tar.gz\"".to_string(),
             ),
         ],
-        bytes,
+        axum::body::Body::from_stream(stream),
     )
         .into_response()
 }
