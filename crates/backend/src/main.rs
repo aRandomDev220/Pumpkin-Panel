@@ -13,6 +13,7 @@ mod metrics_collector;
 // those land it has no non-test caller in the binary.
 #[allow(dead_code)]
 mod op_lock;
+mod ports;
 mod ratelimit;
 mod readiness;
 mod reconcile;

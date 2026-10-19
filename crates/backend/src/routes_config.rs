@@ -676,6 +676,7 @@ mod tests {
     async fn apply_migrations(pool: &SqlitePool) {
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
+            include_str!("../../../migrations/0010_port_reservations.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0003_config_revisions.sql"),
             include_str!("../../../migrations/0004_config_baseline_hash.sql"),

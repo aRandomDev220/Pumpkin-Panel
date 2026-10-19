@@ -62,6 +62,7 @@ async fn test_pool() -> SqlitePool {
         .expect("pragma");
     for file in [
         include_str!("../../../migrations/0001_init.sql"),
+        include_str!("../../../migrations/0010_port_reservations.sql"),
         include_str!("../../../migrations/0002_sessions_audit.sql"),
     ] {
         for stmt in file.split(";\n") {

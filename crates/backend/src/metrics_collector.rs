@@ -235,6 +235,7 @@ mod tests {
             .expect("in-memory pool");
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
+            include_str!("../../../migrations/0010_port_reservations.sql"),
             include_str!("../../../migrations/0006_metrics.sql"),
         ] {
             for stmt in file.split(';') {

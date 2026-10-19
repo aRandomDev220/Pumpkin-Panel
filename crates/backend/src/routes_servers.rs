@@ -184,16 +184,7 @@ async fn fetch_server(pool: &SqlitePool, id: &str) -> Result<Option<ServerDto>, 
 
 /// Ports taken by live servers (game port and derived bedrock port).
 async fn taken_ports(pool: &SqlitePool) -> Result<HashSet<i64>, sqlx::Error> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT game_port FROM servers WHERE deleted_at IS NULL")
-            .fetch_all(pool)
-            .await?;
-    let mut set = HashSet::new();
-    for (p,) in rows {
-        set.insert(p);
-        set.insert(p + 1); // bedrock convention: game_port + 1
-    }
-    Ok(set)
+    Ok(crate::ports::taken(pool).await?.into_iter().collect())
 }
 
 /// Whether an observed runtime state already satisfies a desired state.
@@ -379,7 +370,19 @@ pub async fn create_server(
         }
     };
 
-    // Persist row + settings first (DB constraints are the dedup backstop).
+    // Persist row + settings + port reservations atomically. The reservation
+    // primary key is the concurrency backstop: two creates that pick
+    // overlapping Java/Bedrock pairs cannot both commit.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "failed to persist server",
+            )
+        }
+    };
     let insert = sqlx::query(
         "INSERT INTO servers
             (id, name, slug, runtime_type, image_reference, image_digest,
@@ -395,9 +398,10 @@ pub async fn create_server(
     .bind(body.game_port as i64)
     .bind(&bind_address)
     .bind(&user.id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     if let Err(e) = insert {
+        let _ = tx.rollback().await;
         let msg = e.to_string();
         if msg.contains("UNIQUE constraint failed: servers.game_port") {
             return error(StatusCode::CONFLICT, "PORT_UNAVAILABLE", "game port taken");
@@ -421,18 +425,32 @@ pub async fn create_server(
     .bind(&server_id)
     .bind(memory_limit_bytes as i64)
     .bind(cpu_limit)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     {
+        let _ = tx.rollback().await;
         tracing::warn!(server_id = %server_id, error = %e, "failed to persist server settings");
-        let _ = sqlx::query("DELETE FROM servers WHERE id = ?")
-            .bind(&server_id)
-            .execute(&state.pool)
-            .await;
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",
             "failed to persist server settings",
+        );
+    }
+    if let Err(e) = crate::ports::reserve(&mut tx, &server_id, body.game_port as i64).await {
+        let _ = tx.rollback().await;
+        tracing::warn!(server_id = %server_id, error = %e, "failed to reserve ports");
+        return error(
+            StatusCode::CONFLICT,
+            "PORT_UNAVAILABLE",
+            "game port (or adjacent bedrock port) already allocated",
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(server_id = %server_id, error = %e, "failed to commit server row");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "failed to persist server",
         );
     }
 
@@ -840,12 +858,59 @@ async fn delete_server_inner(
             }
         }
     }
-    let _ = sqlx::query(
-        "UPDATE servers SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DELETE_FAILED",
+                "failed to delete server",
+            ))
+        }
+    };
+    let deleted = sqlx::query(
+        "UPDATE servers SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&server.id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
+    match deleted {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "SERVER_NOT_FOUND",
+                "no such server",
+            ));
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            tracing::warn!(server_id = %server.id, error = %e, "soft delete failed");
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DELETE_FAILED",
+                "failed to delete server",
+            ));
+        }
+    }
+    if let Err(e) = crate::ports::release(&mut tx, &server.id).await {
+        let _ = tx.rollback().await;
+        tracing::warn!(server_id = %server.id, error = %e, "port release failed");
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_FAILED",
+            "failed to release server ports",
+        ));
+    }
+    if tx.commit().await.is_err() {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DELETE_FAILED",
+            "failed to delete server",
+        ));
+    }
     Ok(())
 }
 

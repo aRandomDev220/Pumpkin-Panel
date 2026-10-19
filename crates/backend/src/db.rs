@@ -319,6 +319,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Both the Java port and the derived Bedrock port are reserved, and the
+    /// reservation primary key rejects an adjacent pair. Releasing (as the
+    /// delete path does) makes the pair reusable.
+    #[tokio::test]
+    async fn adjacent_ports_are_reserved_and_released() {
+        let (dir, pool) = migrated_pool().await;
+
+        sqlx::query(
+            "INSERT INTO servers (id, name, slug, game_port) VALUES ('s1','one','one',25565)",
+        )
+        .execute(&pool)
+        .await
+        .expect("first server");
+        sqlx::query(
+            "INSERT INTO servers (id, name, slug, game_port) VALUES ('s2','two','two',25566)",
+        )
+        .execute(&pool)
+        .await
+        .expect("second server");
+
+        let mut tx = pool.begin().await.expect("tx");
+        crate::ports::reserve(&mut tx, "s1", 25565)
+            .await
+            .expect("reserve s1");
+        tx.commit().await.expect("commit");
+
+        let ports: Vec<i64> = sqlx::query_scalar(
+            "SELECT port FROM server_port_reservations WHERE server_id = 's1' ORDER BY port",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("reservations");
+        assert_eq!(ports, vec![25565, 25566]);
+
+        // s2's game port is s1's Bedrock port.
+        let mut tx = pool.begin().await.expect("tx");
+        let err = crate::ports::reserve(&mut tx, "s2", 25566)
+            .await
+            .expect_err("adjacent port must collide");
+        assert!(
+            err.to_string().contains("server_port_reservations"),
+            "unexpected error: {err}"
+        );
+        tx.rollback().await.expect("rollback");
+
+        let mut tx = pool.begin().await.expect("tx");
+        crate::ports::release(&mut tx, "s1").await.expect("release");
+        crate::ports::reserve(&mut tx, "s2", 25566)
+            .await
+            .expect("port is free after release");
+        tx.commit().await.expect("commit");
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The plan's index list must exist after migration.
     #[tokio::test]
     async fn integrity_indexes_present() {

@@ -1020,6 +1020,7 @@ mod tests {
             .unwrap();
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
+            include_str!("../../../migrations/0010_port_reservations.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0009_app_settings.sql"),
         ] {
@@ -1159,6 +1160,7 @@ mod tests {
             .unwrap();
         for file in [
             include_str!("../../../migrations/0001_init.sql"),
+            include_str!("../../../migrations/0010_port_reservations.sql"),
             include_str!("../../../migrations/0002_sessions_audit.sql"),
             include_str!("../../../migrations/0009_app_settings.sql"),
         ] {
