@@ -59,8 +59,9 @@ pub async fn get_task(
     }
 }
 
-/// POST /api/v1/tasks/:id/cancel — cooperative cancellation. Only `queued`
-/// tasks can be withdrawn; a `running` Docker op is never abandoned
+/// POST /api/v1/tasks/:id/cancel — cooperative cancellation. Queued tasks are
+/// withdrawn immediately. Running backup/restore tasks are asked to stop at
+/// their next checkpoint; lifecycle and image operations are never abandoned
 /// mid-write (409 with an explanation).
 pub async fn cancel_task(
     State(state): State<AppState>,
@@ -81,44 +82,82 @@ pub async fn cancel_task(
             )
         }
     };
-    if !matches!(
+    if matches!(
         task.state,
         task_runner::TaskState::Queued | task_runner::TaskState::CancelRequested
     ) {
-        return error(
-            StatusCode::CONFLICT,
-            "TASK_CANCEL_UNSAFE",
-            "task is already running; cancellation is only safe before dispatch",
-        );
+        let updated = sqlx::query(
+            "UPDATE tasks SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state IN ('queued', 'cancel_requested')",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await;
+        return match updated {
+            Ok(r) if r.rows_affected() == 1 => {
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "task.cancel",
+                    "task",
+                    &id,
+                    "ok",
+                    &request_id,
+                    serde_json::json!({ "mode": "withdrawn" }),
+                )
+                .await;
+                Json(serde_json::json!({ "id": id, "state": "cancelled" })).into_response()
+            }
+            _ => error(
+                StatusCode::CONFLICT,
+                "TASK_STATE_CHANGED",
+                "task already claimed",
+            ),
+        };
     }
-    let updated = sqlx::query(
-        "UPDATE tasks SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ? AND state IN ('queued', 'cancel_requested')",
+
+    let cooperative = matches!(task.task_type.as_str(), "backup" | "restore");
+    if matches!(task.state, task_runner::TaskState::Running) && cooperative {
+        let updated = sqlx::query(
+            "UPDATE tasks SET state = 'cancel_requested',
+                    cancel_requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running'",
+        )
+        .bind(&id)
+        .execute(&state.pool)
+        .await;
+        return match updated {
+            Ok(r) if r.rows_affected() == 1 => {
+                audit::record(
+                    &state.pool,
+                    Some(&user.id),
+                    "task.cancel",
+                    "task",
+                    &id,
+                    "ok",
+                    &request_id,
+                    serde_json::json!({ "mode": "requested" }),
+                )
+                .await;
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({ "id": id, "state": "cancel_requested" })),
+                )
+                    .into_response()
+            }
+            _ => error(
+                StatusCode::CONFLICT,
+                "TASK_STATE_CHANGED",
+                "task already finished",
+            ),
+        };
+    }
+
+    error(
+        StatusCode::CONFLICT,
+        "TASK_CANCEL_UNSAFE",
+        "only queued tasks and running backups/restores can be cancelled",
     )
-    .bind(&id)
-    .execute(&state.pool)
-    .await;
-    match updated {
-        Ok(r) if r.rows_affected() == 1 => {
-            audit::record(
-                &state.pool,
-                Some(&user.id),
-                "task.cancel",
-                "task",
-                &id,
-                "ok",
-                &request_id,
-                serde_json::json!({}),
-            )
-            .await;
-            Json(serde_json::json!({ "id": id, "state": "cancelled" })).into_response()
-        }
-        _ => error(
-            StatusCode::CONFLICT,
-            "TASK_STATE_CHANGED",
-            "task already claimed",
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +1382,12 @@ mod tests {
                     crate::auth::require_permission(Permission::SettingsManage),
                 )),
             )
+            .route(
+                "/api/v1/tasks/:id/cancel",
+                post(super::cancel_task).route_layer(middleware::from_fn(
+                    crate::auth::require_permission(Permission::ServerLifecycle),
+                )),
+            )
             .route_layer(middleware::from_fn_with_state(
                 pool,
                 crate::auth::auth_middleware,
@@ -1703,5 +1748,41 @@ mod tests {
         .await
         .unwrap();
         assert!(failed >= 1, "failed delete must audit failed");
+    }
+    #[tokio::test]
+    async fn running_backup_cancel_requests_cooperative_stop() {
+        let fx = admin_fixture().await;
+        sqlx::query(
+            "INSERT INTO tasks (id, type, state) VALUES ('cancel-backup', 'backup', 'running')",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let res = fx
+            .server
+            .post("/api/v1/tasks/cancel-backup/cancel")
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 202, "{}", res.text());
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM tasks WHERE id = 'cancel-backup'")
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cancel_requested");
+
+        // A running lifecycle op is not safe to abandon.
+        sqlx::query(
+            "INSERT INTO tasks (id, type, state) VALUES ('cancel-start', 'start', 'running')",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let res = fx
+            .server
+            .post("/api/v1/tasks/cancel-start/cancel")
+            .authorization_bearer(&fx.token)
+            .await;
+        assert_eq!(res.status_code(), 409, "{}", res.text());
     }
 }

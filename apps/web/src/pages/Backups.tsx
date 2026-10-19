@@ -22,7 +22,7 @@ import type {
   BackupPolicy,
   BackupPreviewResponse,
 } from "../lib/backups";
-import { fetchTask, isTerminalTaskState } from "../lib/servers";
+import { cancelTask, fetchTask, isTerminalTaskState } from "../lib/servers";
 import { saveBlob } from "../lib/files";
 
 const UTC_NOTE = "All schedules run in UTC.";
@@ -187,6 +187,15 @@ export default function BackupsSection({
       return;
     }
     deleteMutation.mutate(id);
+  }
+
+  async function onCancelTask(id: string) {
+    try {
+      await cancelTask(id);
+      setBanner("Cancellation requested.");
+    } catch (err) {
+      setOpError(errMsg(err));
+    }
   }
 
   function onRestoreClick(id: string) {
@@ -357,7 +366,16 @@ export default function BackupsSection({
       {backupTaskQuery.data && backupTaskId && (
         <p className="muted" role="status">
           Backup task {backupTaskQuery.data.id}:{" "}
-          <span className="badge">{backupTaskQuery.data.state}</span>
+          <span className="badge">{backupTaskQuery.data.state}</span>{" "}
+          {!isTerminalTaskState(backupTaskQuery.data.state) &&
+            backupTaskQuery.data.state !== "cancel_requested" && (
+              <button
+                type="button"
+                onClick={() => void onCancelTask(backupTaskQuery.data.id)}
+              >
+                Cancel
+              </button>
+            )}
         </p>
       )}
       {backupTaskQuery.error && (
@@ -462,7 +480,16 @@ export default function BackupsSection({
       {restoreTaskQuery.data && restoreTaskId && (
         <p className="muted" role="status">
           Restore task {restoreTaskQuery.data.id}:{" "}
-          <span className="badge">{restoreTaskQuery.data.state}</span>
+          <span className="badge">{restoreTaskQuery.data.state}</span>{" "}
+          {!isTerminalTaskState(restoreTaskQuery.data.state) &&
+            restoreTaskQuery.data.state !== "cancel_requested" && (
+              <button
+                type="button"
+                onClick={() => void onCancelTask(restoreTaskQuery.data.id)}
+              >
+                Cancel
+              </button>
+            )}
         </p>
       )}
       {restoreTaskQuery.error && (

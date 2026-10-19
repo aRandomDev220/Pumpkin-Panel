@@ -276,7 +276,7 @@ async fn has_verified_backup(pool: &SqlitePool, server_id: &str) -> bool {
 async fn conflicting_task(pool: &SqlitePool, server_id: &str) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM tasks
-          WHERE server_id = ? AND state IN ('queued', 'running')",
+          WHERE server_id = ? AND state IN ('queued', 'running', 'cancel_requested')",
     )
     .bind(server_id)
     .fetch_one(pool)

@@ -794,7 +794,7 @@ async fn schedule_auto_start_servers(pool: &SqlitePool, runner: &task_runner::Ru
         }
         let in_flight: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks
-             WHERE server_id = ? AND state IN ('queued', 'running')",
+             WHERE server_id = ? AND state IN ('queued', 'running', 'cancel_requested')",
         )
         .bind(&server_id)
         .fetch_one(pool)

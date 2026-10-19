@@ -280,6 +280,25 @@ export async function fetchServerTasks(
   return parseJson<ServerTasksResponse>(res, "list server tasks");
 }
 
+/** Ask a queued task to withdraw, or a running backup/restore to stop at its
+ * next safe checkpoint. Lifecycle/image tasks return 409. */
+export async function cancelTask(id: string): Promise<void> {
+  const res = await authFetch(
+    `/api/v1/tasks/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = (await res.json()) as { error_code?: string; message?: string };
+      detail = body.error_code ?? body.message ?? detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`cancel failed (${res.status}): ${detail}`);
+  }
+}
+
 export async function fetchMetricsSummary(): Promise<MetricsSummary> {
   const res = await authFetch("/api/v1/metrics/summary");
   return parseJson<MetricsSummary>(res, "get metrics summary");
