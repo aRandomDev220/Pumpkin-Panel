@@ -686,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(path = %backup_root.display(), error = %e, "cannot create backup dir");
     }
     routes_backup::startup_cleanup(&pool, &backup_root).await;
+    routes_admin::cleanup_temp_snapshots();
     // Single-node scheduler: one loop per manager process (no second replica
     // may run against the same DB — see spec §19.2). A panic restarts the
     // iteration instead of silently disabling every schedule for the process

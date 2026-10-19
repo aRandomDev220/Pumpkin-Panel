@@ -24,12 +24,16 @@ Trust boundaries (§5.3 of plan):
   for streamed file/archive uploads. Upload handlers enforce their own running
   byte cap.
 - SQLite separate from world dirs (`/data/*.db` vs `/data/servers/*`).
-- Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` by default;
-  `PUMPKIN_INSECURE_COOKIES=1` is an explicit local-HTTP development override.
+- Session cookies are `HttpOnly` and `SameSite=Lax`; `Secure` is enabled by
+  default. `PUMPKIN_INSECURE_COOKIES=1` is an explicit local-HTTP override —
+  keep it unset whenever TLS terminates at a reverse proxy.
 - Unsafe cookie-authenticated mutations require the readable CSRF cookie to be
   echoed in `X-CSRF-Token`; bearer-token mutations remain supported for API use.
-- Reverse-proxy browser origins must be explicitly listed in
-  `PUMPKIN_ALLOWED_ORIGINS`; arbitrary `Origin` values are never trusted.
+- The API is same-origin only: there is no CORS layer and cross-origin API
+  access is not supported. `PUMPKIN_ALLOWED_ORIGINS` only relaxes the
+  login/setup same-origin check for explicitly listed origins. Host-header
+  validation is not implemented; deploy behind a reverse proxy that pins the
+  public host.
 - Login and setup use IP and username token-bucket limits, dummy Argon2 work for
   unknown users, bounded usernames/passwords, and an atomic one-shot setup flag.
 - Security headers cover CSP, frame denial, MIME sniffing, referrer policy,
@@ -75,9 +79,9 @@ Trust boundaries (§5.3 of plan):
 
 ## Evidence
 
-- `make test`: 224 passed, 3 ignored; formatting, Clippy, backend tests, and
-  frontend build all passed.
-- `docker build -f deploy/Dockerfile -t pumpkin-manager:phase8 .`: passed with
+- `make test`: 255 passed, 3 ignored; formatting, Clippy across all targets,
+  backend tests, and the frontend build all passed.
+- `docker build -f deploy/Dockerfile -t pumpkin-manager:0.1.0 .`: passed with
   pinned base-image digests.
 - `npm --prefix apps/web audit --audit-level=high --offline`: 0 vulnerabilities.
 - Secret-pattern scan of tracked source found no credentials, private keys, or

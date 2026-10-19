@@ -110,7 +110,7 @@ Current:  pumpkin/mc:1.21 <code>sha256:9f2c…</code>   Previous: pumpkin/mc:1.2
 
 Preview warnings (text list, always words first):
 [!] No digest pinned — tag may drift between pulls.
-[!] No verified backup found — update will take an automatic pre-update backup.
+[!] No verified backup found — the update is refused until you create one.
 [Update to this image]   (409 → inline: "No verified backup. [Create a backup first → #backups]")
 
 Update task abc123: [succeeded] 42% — pulling image…

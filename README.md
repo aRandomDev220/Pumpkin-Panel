@@ -102,6 +102,11 @@ Non-secret defaults live in `deploy/.env` (see `deploy/.env.example`):
 | `PUMPKIN_MANAGER_DATABASE_URL` | `sqlite:<root>/…` | Manager database |
 | `PUMPKIN_RUNTIME_USER` | `100:101` | Non-root child container UID/GID |
 | `PUMPKIN_MANAGER_LOG_LEVEL` | `info` | Structured JSON log level |
+| `PUMPKIN_MANAGER_METRICS_INTERVAL_SECONDS` | `30` | Metrics sampling interval (min 10s) |
+| `PUMPKIN_MANAGER_SESSION_TTL_MINUTES` | `720` | Session lifetime |
+| `PUMPKIN_INSECURE_COOKIES` | `1` in Compose | Omit `Secure`/HSTS for plain HTTP only |
+| `PUMPKIN_ALLOWED_ORIGINS` | unset | Extra same-origin auth origins (no CORS) |
+| `PUMPKIN_BACKUP_CONCURRENCY` | `2` | Concurrent backup/restore workers |
 
 Secrets are created at first-run setup (owner password) — never shipped or committed.
 

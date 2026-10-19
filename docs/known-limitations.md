@@ -12,11 +12,12 @@
 - Manager database restore is staged and requires a restart.
 - The verified Pumpkin compatibility target is Linux/amd64 and the digest in
   `docs/compatibility/pumpkin-runtime.md`; ARM64 is not yet live-tested.
-- RCON, arbitrary console commands, player management, TPS, plugin install, and
-  hot reload are not advertised because they are not verified capabilities.
+- RCON, arbitrary console commands, player management, live TPS metrics,
+  plugin install, and hot reload are not advertised because they are not
+  verified capabilities. The config editor exposes the TPS setting only.
 - The tested Pumpkin image exposes a TCP Minecraft health signal rather than an
   HTTP health endpoint; readiness uses the Minecraft status protocol.
 - Mutable Pumpkin tags are allowlisted but should not be used for production;
   pin a digest and review the update preview warnings.
-- Live Docker/Pumpkin integration tests are environment-dependent and are
-  ignored when Docker or the test Pumpkin endpoint is unavailable.
+- Docker-dependent Rust tests are `#[ignore]`d, and the Playwright suite
+  requires Docker plus the Pumpkin image.

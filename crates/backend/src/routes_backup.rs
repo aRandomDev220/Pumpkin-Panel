@@ -1443,6 +1443,24 @@ async fn execute_restore_inner(
 
     // Swap: current data aside, staged tree in. Recovery is deleted on
     // success and KEPT (with its path reported) on failure.
+    // Mark the server while the destructive swap is in flight: if the process
+    // dies here, operators can see that prior data may be parked in
+    // `.recovery-*` instead of silently starting a fresh world. Remember the
+    // prior observed state so a successful restore does not leave "unknown".
+    let previous_observed: Option<String> =
+        sqlx::query_scalar("SELECT observed_state FROM servers WHERE id = ?")
+            .bind(&server.id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    let _ = sqlx::query(
+        "UPDATE servers SET observed_state = 'unknown', last_error = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind("restore_incomplete: prior data may be parked in a .recovery-* directory")
+    .bind(&server.id)
+    .execute(pool)
+    .await;
     let recovery = server_root.join(format!(".recovery-{}", nanos_now()));
     let staging_swap = staging.clone();
     let data_swap = data_dir.clone();
@@ -1471,10 +1489,23 @@ async fn execute_restore_inner(
         if had_data {
             let _ = std::fs::remove_dir_all(&recovery_swap);
         }
+        if let Some(parent) = data_swap.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     })
     .await
     .map_err(|_| BackupError::Failed("restore swap task failed".into()))??;
+    let _ = sqlx::query(
+        "UPDATE servers SET observed_state = COALESCE(?, observed_state),
+                last_error = NULL WHERE id = ?",
+    )
+    .bind(previous_observed.as_deref())
+    .bind(&server.id)
+    .execute(pool)
+    .await;
     audit::record(
         pool,
         actor,

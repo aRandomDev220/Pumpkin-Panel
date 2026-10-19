@@ -23,8 +23,9 @@ Browser ── HTTP/JSON + cookies/CSRF ──> Axum API ──> SQLite
   rollback operations so the UI can recover after a refresh or restart.
 - **Runtime adapter** builds Docker specs from validated domain models. Client
   requests never submit arbitrary Docker JSON.
-- **Per-server operation locks** prevent conflicting lifecycle, file, backup,
-  restore, and update operations.
+- **Per-server operation locks** serialize conflicting lifecycle, backup,
+  restore, config, and update operations; task workers share the same locks
+  as HTTP handlers. File mutations rely on task-busy checks, not the op lock.
 - **Readiness** is separate from Docker container existence: a server is online
   only after the container is running and Minecraft status ping succeeds.
 
@@ -54,5 +55,7 @@ Browser ── HTTP/JSON + cookies/CSRF ──> Axum API ──> SQLite
 
 The packaged image contains the API and built frontend. `deploy/docker-compose.yml`
 mounts `/var/run/docker.sock` for backend-only child-container management and a
-named `/data` volume for persistent state. Put TLS and external access control
+host bind mount at `${PUMPKIN_MANAGER_DATA_ROOT:-/data}`. The path must be
+identical on both sides of the mount so child containers can bind-mount
+server data. Put TLS and external access control
 in front of the manager; the application intentionally does not terminate TLS.

@@ -23,7 +23,7 @@ tokens remain supported for non-browser API clients.
 | Method | Route | Purpose |
 |---|---|---|
 | GET/POST | `/servers` | List or create servers. |
-| GET/PATCH/DELETE | `/servers/:id` | Read, update, or delete a server. |
+| GET/DELETE | `/servers/:id` | Read or delete a server. |
 | GET | `/servers/:id/settings` | Read bounded memory/CPU limits and boot policy. |
 | PATCH | `/servers/:id/settings` | Update memory/CPU limits or opt-in boot auto-start. Resource changes report `restart_required` and apply on the next container recreate. |
 | POST | `/servers/:id/start`, `/stop`, `/restart` | Queue lifecycle work. |
@@ -33,14 +33,17 @@ tokens remain supported for non-browser API clients.
 | POST | `/servers/:id/update/preview` | Validate an image update without mutation. |
 | POST | `/servers/:id/update` | Queue a protected image update. |
 | POST | `/servers/:id/rollback` | Queue image rollback with data-format warning. |
+| GET/POST | `/servers/:id/scheduled-tasks` | List or create scheduled restarts. |
+| DELETE | `/scheduled-tasks/:id` | Delete a scheduled restart. |
+| POST | `/admin/reconcile` | Report DB/Docker drift without mutating. |
 
 ## Configuration, files, backups, and monitoring
 
 The API provides version-aware config read/validate/save/revisions/revert,
 sandboxed file CRUD/upload/import/export/download, verified backup and restore
 tasks, backup policies, metrics history/summary, alerts, capabilities, and
-scheduled tasks. See route registration in `crates/backend/src/main.rs` for the
-complete authoritative list.
+scheduled tasks, and update preview/rollback. See route registration in
+`crates/backend/src/main.rs` for the complete authoritative list.
 
 ## Administration
 

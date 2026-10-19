@@ -13,7 +13,6 @@
 ```sh
 git fetch --tags
 git checkout <release-tag>
-docker compose -f deploy/docker-compose.yml pull
 docker compose -f deploy/docker-compose.yml up -d --build
 curl http://127.0.0.1:8080/api/v1/health/ready
 ```

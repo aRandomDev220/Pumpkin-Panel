@@ -1023,6 +1023,20 @@ fn utc_stamp() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
+/// Remove manager-DB snapshots left behind by a crashed download/restore.
+/// Best-effort; the manager is single-node, so boot means no live snapshot.
+pub fn cleanup_temp_snapshots() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("pm-manager-backup-") || name.starts_with("pm-manager-restore-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Escape a path for interpolation into `VACUUM INTO '<path>'`
 /// (SQLite accepts no bound parameter there).
 fn vacuum_into_sql(path: &std::path::Path) -> String {
@@ -1066,6 +1080,13 @@ pub async fn backup_database(State(state): State<AppState>, user: AuthUser) -> R
             "INTERNAL",
             "failed to snapshot database",
         );
+    }
+    // `VACUUM INTO` inherits the process umask; the snapshot contains
+    // password/session hashes and the audit trail, so restrict it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600));
     }
     let bytes = match std::fs::read(&snapshot) {
         Ok(b) => b,

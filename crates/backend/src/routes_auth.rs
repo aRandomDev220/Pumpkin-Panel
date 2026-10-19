@@ -389,20 +389,8 @@ pub async fn login(
     let user_id: String = row.get("id");
     let stored_hash: String = row.get("password_hash");
     let is_active: i64 = row.get("is_active");
-    if is_active == 0 {
-        audit_auth(
-            &app.pool,
-            Some(&user_id),
-            "auth.login",
-            &username,
-            "failed",
-            &request_id,
-            peer.as_ref(),
-            Some("account_disabled"),
-        )
-        .await;
-        return error(StatusCode::FORBIDDEN, "ACCOUNT_DISABLED");
-    }
+    // Verify first: a disabled account must cost the same Argon2 work and
+    // return the same generic response as a wrong password.
     if !auth::verify_password(&body.password, &stored_hash).unwrap_or(false) {
         audit_auth(
             &app.pool,
@@ -413,6 +401,20 @@ pub async fn login(
             &request_id,
             peer.as_ref(),
             Some("invalid_credentials"),
+        )
+        .await;
+        return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");
+    }
+    if is_active == 0 {
+        audit_auth(
+            &app.pool,
+            Some(&user_id),
+            "auth.login",
+            &username,
+            "failed",
+            &request_id,
+            peer.as_ref(),
+            Some("account_disabled"),
         )
         .await;
         return error(StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS");

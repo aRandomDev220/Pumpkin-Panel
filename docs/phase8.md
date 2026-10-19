@@ -18,16 +18,19 @@ artifacts.
 
 | Check | Result |
 |---|---|
-| `make test` | Passed: 224 tests, 3 ignored; fmt, Clippy, backend tests, web build. |
+| `make test` | Passed: 255 tests, 3 ignored; fmt, Clippy across all targets, backend tests, web build. |
 | npm offline audit | Passed: 0 vulnerabilities. |
 | Docker image build | Passed with pinned base-image digests. |
-| Clean Docker install | Passed: fresh named volume, live/ready health, first-owner setup, and `/auth/me`. |
+| Clean Docker install | Passed: fresh bind mount, live/ready health, first-owner setup, and `/auth/me`. |
 | Browser E2E | Passed: 6 Playwright tests covering setup, login, create, online, stop, and delete. |
 | Manager DB recovery | Passed in the release image: download, staged multipart restore, restart, ready, setup remains complete. |
 | Migration preservation | Covered by `db::tests::migration_0008_preserves_existing_rows`. |
 | Backup/restore/recovery | Covered by backend tests and Phase 7 live staged-restore evidence. |
 | Update/rollback | Covered by backend tests and Phase 7 live E2E evidence. |
 | HTTP baseline | 100 local health requests: p50 1.198 ms, p95 1.748 ms; details in `docs/performance.md`. |
+
+> Phase 8 evidence predates migrations 0010-0011. Re-run the install,
+> upgrade, backup/restore, and interrupted-recovery checks before tagging.
 
 ## Release checklist
 
