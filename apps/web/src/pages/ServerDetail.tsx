@@ -989,7 +989,11 @@ export default function ServerDetail() {
         {taskQuery.data && <dl role="status"><dt>Task</dt><dd>{taskQuery.data.id}</dd><dt>Kind</dt><dd>{taskQuery.data.kind}</dd><dt>State</dt><dd><span className="badge">{stateLabel(taskQuery.data.state)}</span></dd>{taskQuery.data.error && <><dt>Error</dt><dd className="err">{taskQuery.data.error}</dd></>}</dl>}
       </details>
       <div id="backups" className="workspace-section">
-        <BackupsSection serverId={s.id} observedState={s.observed_state} />
+        <BackupsSection
+          serverId={s.id}
+          observedState={s.observed_state}
+          desiredState={s.desired_state}
+        />
       </div>
       <ScheduledRestartsSection serverId={s.id} />
       <div className="workspace-section"><UpdateSection serverId={s.id} server={s} /></div>

@@ -30,6 +30,7 @@ const UTC_NOTE = "All schedules run in UTC.";
 interface BackupsSectionProps {
   serverId: string;
   observedState?: string;
+  desiredState?: string;
 }
 
 function errMsg(err: unknown): string {
@@ -39,12 +40,19 @@ function errMsg(err: unknown): string {
 export default function BackupsSection({
   serverId,
   observedState,
+  desiredState,
 }: BackupsSectionProps) {
   const { can } = useAuth();
   const canBackup = can("server.backup.create");
   const canRestore = can("server.backup.restore");
   const qc = useQueryClient();
-  const stopped = (observedState ?? "").toLowerCase() === "stopped";
+  const observed = (observedState ?? "").toLowerCase();
+  const alreadyStopped =
+    observed === "stopped" || observed === "exited" || observed === "created";
+  const restoreBlocked =
+    (desiredState ?? "stopped") === "running" ||
+    observed === "running" ||
+    observed === "starting";
 
   const [consistency, setConsistency] = useState<BackupConsistency>("stopped");
   const [backupTaskId, setBackupTaskId] = useState<string | null>(null);
@@ -356,6 +364,12 @@ export default function BackupsSection({
           them.
         </p>
       )}
+      {consistency === "stopped" && !alreadyStopped && (
+        <p className="warn" role="note">
+          This backup stops the world for the duration (players are
+          disconnected), then starts it again.
+        </p>
+      )}
       {consistency === "live" && (
         <p className="warn" role="note">
           Live backups capture a running server and may be inconsistent — files
@@ -439,9 +453,9 @@ export default function BackupsSection({
                     </button>
                     <button
                       type="button"
-                      disabled={!stopped || restoreBusy || !canRestore}
+                      disabled={restoreBlocked || restoreBusy || !canRestore}
                       title={
-                        stopped
+                        !restoreBlocked
                           ? restoreArm === b.id
                             ? "Click again, then confirm the dialog, to restore"
                             : "Restore (double-confirmed)"
@@ -459,15 +473,17 @@ export default function BackupsSection({
         </table>
         </div>
       )}
-      {!stopped && (
+      {restoreBlocked && (
         <p className="muted" role="note">
-          Restore is disabled while the server is not stopped (observed:{" "}
+          Restore is disabled while the server is running (observed:{" "}
           {observedState ?? "unknown"}). Stop the server to enable restore.
         </p>
       )}
       <p className="muted" role="note">
-        Restoring replaces current server data. A protected pre-restore backup
-        is created automatically before restoring.
+        Restoring replaces current server data.{" "}
+        {preRestore
+          ? "A protected pre-restore backup is created first."
+          : "No pre-restore backup will be created."}
       </p>
       <label className="row">
         <input

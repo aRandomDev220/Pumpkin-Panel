@@ -45,6 +45,10 @@ export default function Servers(): React.JSX.Element {
       setImageDigest(RECOMMENDED_DIGEST);
       setCustomImage(false);
       setFormError(null);
+      // A second server must not reuse the first server's reserved pair.
+      const used = serversQuery.data?.servers.map((server) => server.game_port) ?? [];
+      const next = used.length === 0 ? 25565 : Math.max(...used) + 2;
+      setGamePort(String(next <= 65534 ? next : 25565));
     },
     onError: (err) => setFormError(err instanceof Error ? err.message : "Create failed."),
   });
@@ -113,8 +117,17 @@ export default function Servers(): React.JSX.Element {
                   <label><input type="checkbox" checked={retainData} onChange={(event) => setRetainData(event.target.checked)} /> retain data</label>
                   <button type="submit" disabled={deleteMutation.isPending}>Confirm delete</button>
                   <button className="button-secondary" type="button" onClick={() => setDeleteTarget(null)}>Cancel</button>
-                  {deleteMutation.isError && <span className="err">Delete failed.</span>}
-                </form> : canDelete ? <button className="button-danger" type="button" onClick={() => setDeleteTarget(server.id)}>Delete</button> : null}
+                  {deleteMutation.isError && (
+                    <span className="err">
+                      {deleteMutation.error instanceof Error
+                        ? deleteMutation.error.message
+                        : "Delete failed."}
+                    </span>
+                  )}
+                </form> : canDelete ? <button className="button-danger" type="button" onClick={() => {
+                    setRetainData(true);
+                    setDeleteTarget(server.id);
+                  }}>Delete</button> : null}
               </div>
             </li>;
           })}

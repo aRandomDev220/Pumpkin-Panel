@@ -135,12 +135,24 @@ export async function fetchTask(id: string): Promise<TaskStatus> {
 }
 
 export function validateCreateServer(input: CreateServerInput): string | null {
-  if (!input.name.trim()) return "Name is required.";
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(input.name.trim())) {
-    return "Name must start alphanumeric and contain only letters, numbers, - and _ .";
+  const name = input.name.trim();
+  if (!name) return "Name is required.";
+  if (name.length > 64) return "Name must be 1-64 characters.";
+  // Mirrors the backend: any display name is accepted, but the derived
+  // slug must be 3-48 lowercase letters/numbers/dashes.
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!/^[a-z0-9-]{3,48}$/.test(slug)) {
+    return "Name must produce a 3-48 character slug using letters/numbers.";
   }
-  if (!Number.isInteger(input.game_port) || input.game_port < 1 || input.game_port > 65535) {
-    return "game_port must be an integer 1–65535.";
+  if (
+    !Number.isInteger(input.game_port) ||
+    input.game_port < 25565 ||
+    input.game_port > 65534
+  ) {
+    return "Port must be an integer 25565–65534.";
   }
   if (!input.image_reference.trim()) return "image_reference is required.";
   return null;
