@@ -1,5 +1,9 @@
-use axum::{http::StatusCode, Json};
+use std::time::Duration;
+
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
+
+use crate::AppState;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -19,33 +23,62 @@ pub async fn liveness() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-#[derive(Clone)]
-pub struct ReadinessState {
-    pub db_ok: bool,
-    pub docker_ok: bool,
+/// Readiness probes the database and Docker on every call. A boot-time
+/// snapshot is not enough: a manager that loses either dependency must stop
+/// reporting itself ready.
+pub async fn readiness(State(app): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    let db_ok = tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&app.pool),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+
+    let docker_ok = match &app.adapter {
+        Some(adapter) => tokio::time::timeout(Duration::from_secs(1), adapter.ping())
+            .await
+            .is_ok_and(|result| result.is_ok()),
+        None => false,
+    };
+
+    readiness_response(db_ok, docker_ok)
 }
 
-pub async fn readiness(
-    axum::extract::State(state): axum::extract::State<ReadinessState>,
-) -> (StatusCode, Json<HealthResponse>) {
-    let code = if state.db_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    // Docker outage must NOT fail liveness, only degrade readiness.
-    let docker = if state.docker_ok {
-        "reachable"
-    } else {
-        "degraded"
-    };
+fn readiness_response(db_ok: bool, docker_ok: bool) -> (StatusCode, Json<HealthResponse>) {
+    let ready = db_ok && docker_ok;
     (
-        code,
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
         Json(HealthResponse {
-            status: if state.db_ok { "ready" } else { "not-ready" },
+            status: if ready { "ready" } else { "not-ready" },
             version: env!("CARGO_PKG_VERSION"),
-            database: if state.db_ok { "ok" } else { "error" },
-            docker,
+            database: if db_ok { "ok" } else { "error" },
+            docker: if docker_ok { "reachable" } else { "degraded" },
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_requires_database_and_docker() {
+        assert_eq!(readiness_response(true, true).0, StatusCode::OK);
+        assert_eq!(
+            readiness_response(false, true).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            readiness_response(true, false).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            readiness_response(false, false).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

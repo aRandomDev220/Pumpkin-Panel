@@ -745,6 +745,15 @@ impl DockerAdapter {
         Ok(configured.map(str::to_owned))
     }
 
+    /// Daemon liveness probe used by `/health/ready`.
+    pub async fn ping(&self) -> Result<(), RuntimeError> {
+        self.docker
+            .ping()
+            .await
+            .map_err(RuntimeError::from_bollard)?;
+        Ok(())
+    }
+
     /// Docker container name for a server slug. Always prefixed so manager
     /// containers are recognisable in `docker ps`.
     #[must_use]

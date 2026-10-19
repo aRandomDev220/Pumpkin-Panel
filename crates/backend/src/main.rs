@@ -47,7 +47,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
-use sqlx::SqlitePool;
+use sqlx::{Connection as _, SqlitePool};
 use tokio::sync::Mutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -301,18 +301,6 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
-            "/api/v1/admin/database/backup",
-            get(routes_admin::backup_database).route_layer(middleware::from_fn(
-                auth::require_permission(Permission::SettingsManage),
-            )),
-        )
-        .route(
-            "/api/v1/admin/database/restore",
-            post(routes_admin::restore_database).route_layer(middleware::from_fn(
-                auth::require_permission(Permission::SettingsManage),
-            )),
-        )
-        .route(
             "/api/v1/servers/:id/backups",
             get(routes_backup::list_backups).route_layer(middleware::from_fn(
                 auth::require_permission(Permission::ServerRead),
@@ -475,6 +463,18 @@ pub fn build_router(state: AppState) -> Router {
                 auth::require_permission(Permission::ServerFilesWrite),
             )),
         )
+        .route(
+            "/api/v1/admin/database/backup",
+            get(routes_admin::backup_database).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::SettingsManage),
+            )),
+        )
+        .route(
+            "/api/v1/admin/database/restore",
+            post(routes_admin::restore_database).route_layer(middleware::from_fn(
+                auth::require_permission(Permission::SettingsManage),
+            )),
+        )
         .route_layer(middleware::from_fn_with_state(pool, auth::auth_middleware))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024));
@@ -488,18 +488,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(routes_auth::login))
         .layer(RequestBodyLimitLayer::new(64 * 1024));
 
-    // Readiness reflects boot-time checks; Docker loss at runtime degrades
-    // per-endpoint (503), never the process liveness probe.
-    let readiness = health::ReadinessState {
-        db_ok: true,
-        docker_ok: state.adapter.is_some(),
-    };
+    // `/live` is process-only. `/ready` probes the database and Docker on
+    // every call so orchestration sees a manager that lost either.
     Router::new()
         .route("/api/v1/health/live", get(health::liveness))
-        .route(
-            "/api/v1/health/ready",
-            get(health::readiness).with_state(readiness),
-        )
+        .route("/api/v1/health/ready", get(health::readiness))
         .merge(public_auth)
         .merge(protected)
         .merge(protected_uploads)
@@ -587,12 +580,31 @@ async fn main() -> anyhow::Result<()> {
         let pending = routes_admin::pending_restore_path(&db_file);
         if pending.is_file() {
             let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-            let aside = db_file.with_extension(format!("pre-restore-{stamp}.db"));
+            let aside = PathBuf::from(format!("{}.pre-restore-{stamp}", db_file.display()));
             if db_file.is_file() {
+                // Fold committed WAL frames into the main file, then remove
+                // the sidecars. Renaming only the main file would let the old
+                // WAL replay into the restored database.
+                if let Ok(mut conn) = sqlx::SqliteConnection::connect(&settings.database_url).await
+                {
+                    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                        .execute(&mut conn)
+                        .await;
+                    let _ = conn.close().await;
+                }
                 std::fs::rename(&db_file, &aside)?;
+                for suffix in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", db_file.display()));
+                }
                 tracing::warn!(aside = %aside.display(), "manager DB replaced aside");
             }
             std::fs::rename(&pending, &db_file)?;
+            if let Some(parent) = db_file.parent() {
+                #[cfg(unix)]
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
             tracing::warn!("staged manager DB restore applied; re-validating on boot");
         }
     }
