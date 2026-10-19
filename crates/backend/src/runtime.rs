@@ -865,6 +865,16 @@ impl DockerAdapter {
     }
 }
 
+/// Docker-CLI CPU formula over two samples.
+#[must_use]
+fn cpu_percent_from_deltas(cpu_delta: u64, sys_delta: u64, cpus: f64) -> f64 {
+    if sys_delta == 0 {
+        0.0
+    } else {
+        cpu_delta as f64 / sys_delta as f64 * cpus * 100.0
+    }
+}
+
 /// Whether a container status means it should be stopped before removal.
 fn is_running_status(status: &str) -> bool {
     matches!(status, "running" | "restarting")
@@ -1109,57 +1119,69 @@ impl RuntimeAdapter for DockerAdapter {
         async move {
             use futures_util::TryStreamExt;
 
+            // CPU must be a delta between two samples: a one-shot sample has
+            // an empty `precpu_stats` and yields a lifetime average.
             let options = StatsOptions {
-                stream: false,
-                one_shot: true,
+                stream: true,
+                one_shot: false,
             };
             let mut stream = docker.stats(&container_id, Some(options));
-            let sample = stream
-                .try_next()
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.try_next())
                 .await
+                .map_err(|_| RuntimeError::InvalidConfiguration("stats sample timed out".into()))?
                 .map_err(RuntimeError::from_bollard)?
                 .ok_or_else(|| {
                     RuntimeError::InvalidConfiguration(format!("no stats for {container_id}"))
                 })?;
+            let second = tokio::time::timeout(std::time::Duration::from_secs(5), stream.try_next())
+                .await
+                .map_err(|_| RuntimeError::InvalidConfiguration("stats sample timed out".into()))?
+                .map_err(RuntimeError::from_bollard)?
+                .ok_or_else(|| {
+                    RuntimeError::InvalidConfiguration(format!("no stats for {container_id}"))
+                })?;
+            drop(stream);
 
-            // Docker-CLI-style CPU estimate. One-shot samples carry an
-            // empty `precpu_stats`, in which case we report 0.0 rather
-            // than lie.
-            let cpu_delta = sample
-                .cpu_stats
+            let second_cpu = &second.cpu_stats;
+            let first_cpu = &first.cpu_stats;
+            let cpu_delta = second_cpu
                 .cpu_usage
                 .total_usage
-                .saturating_sub(sample.precpu_stats.cpu_usage.total_usage)
-                as f64;
-            let sys_delta = sample
-                .cpu_stats
+                .saturating_sub(first_cpu.cpu_usage.total_usage);
+            let sys_delta = second_cpu
                 .system_cpu_usage
                 .unwrap_or(0)
-                .saturating_sub(sample.precpu_stats.system_cpu_usage.unwrap_or(0))
-                as f64;
-            let cpus = sample
-                .cpu_stats
+                .saturating_sub(first_cpu.system_cpu_usage.unwrap_or(0));
+            let cpus = second_cpu
                 .online_cpus
-                .map(|c| c as f64)
+                .map(|count| count as f64)
                 .or_else(|| {
-                    sample
-                        .cpu_stats
+                    second_cpu
                         .cpu_usage
                         .percpu_usage
                         .as_ref()
-                        .map(|p| p.len() as f64)
+                        .map(|per_cpu| per_cpu.len() as f64)
                 })
                 .unwrap_or(1.0);
-            let cpu_percent = if sys_delta > 0.0 {
-                cpu_delta / sys_delta * cpus * 100.0
-            } else {
-                0.0
-            };
+            let cpu_percent = cpu_percent_from_deltas(cpu_delta, sys_delta, cpus);
 
+            let memory = &second.memory_stats;
+            // cgroup usage includes page cache; Docker subtracts the inactive
+            // file cache so the gauge reflects working-set memory.
+            let cache = memory
+                .stats
+                .as_ref()
+                .map(|stats| match stats {
+                    bollard::container::MemoryStatsStats::V1(v1) => v1.total_inactive_file,
+                    bollard::container::MemoryStatsStats::V2(v2) => v2.inactive_file,
+                })
+                .unwrap_or(0);
+            let usage = memory.usage.unwrap_or(0);
+            let limit = memory.limit.unwrap_or(0);
             Ok(RuntimeStats {
                 cpu_percent,
-                memory_bytes: sample.memory_stats.usage.unwrap_or(0),
-                memory_limit: sample.memory_stats.limit.unwrap_or(0),
+                memory_bytes: usage.saturating_sub(cache),
+                memory_limit: limit,
             })
         }
     }
@@ -1864,5 +1886,11 @@ mod tests {
                 e.code()
             );
         }
+    }
+    #[test]
+    fn cpu_percent_is_delta_based() {
+        assert!((cpu_percent_from_deltas(50, 100, 1.0) - 50.0).abs() < 1e-9);
+        assert_eq!(cpu_percent_from_deltas(0, 0, 1.0), 0.0);
+        assert!((cpu_percent_from_deltas(100, 100, 2.0) - 200.0).abs() < 1e-9);
     }
 }

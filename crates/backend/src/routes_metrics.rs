@@ -121,6 +121,7 @@ struct AlertServerRow {
     id: String,
     name: String,
     image_reference: String,
+    image_digest: String,
     created_at: String,
 }
 
@@ -134,7 +135,7 @@ pub async fn list_alerts(State(state): State<AppState>, _user: AuthUser) -> Resp
         alerts.push(alert);
     }
     let servers = sqlx::query_as::<_, AlertServerRow>(
-        "SELECT id, name, image_reference, created_at
+        "SELECT id, name, image_reference, image_digest, created_at
          FROM servers WHERE deleted_at IS NULL ORDER BY created_at DESC",
     )
     .fetch_all(&state.pool)
@@ -143,7 +144,7 @@ pub async fn list_alerts(State(state): State<AppState>, _user: AuthUser) -> Resp
     let crash_cutoff = utc_cutoff(3600);
     let old_cutoff = utc_cutoff(7 * 24 * 3600);
     for server in servers {
-        if !server.image_reference.contains("@sha256:") {
+        if server.image_digest.is_empty() && !server.image_reference.contains("@sha256:") {
             alerts.push(serde_json::json!({
                 "severity": "info",
                 "kind": "unverified-image",
@@ -736,7 +737,20 @@ mod tests {
             &now,
         )
         .await;
-        let pinned = seed_server(&pool, "pinned", 25575, PINNED_IMAGE, &now).await;
+        let pinned = seed_server(
+            &pool,
+            "pinned",
+            25575,
+            "ghcr.io/pumpkin-mc/pumpkin:master",
+            &now,
+        )
+        .await;
+        sqlx::query("UPDATE servers SET image_digest = ? WHERE id = ?")
+            .bind("sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+            .bind(&pinned)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let body = server
             .get("/api/v1/alerts")

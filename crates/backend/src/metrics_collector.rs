@@ -8,12 +8,12 @@
 use sqlx::SqlitePool;
 
 use crate::readiness::{ping_java, probe_host};
-use crate::runtime::RuntimeAdapter;
+use crate::runtime::{RuntimeAdapter, RuntimeError};
 
 /// Samples older than this are pruned (whichever bound bites first).
 pub const SAMPLE_RETENTION_DAYS: i64 = 7;
-/// Global cap on `metrics_samples` rows (newest rows survive).
-pub const SAMPLE_ROW_CAP: i64 = 50_000;
+/// Per-server cap on `metrics_samples` (one row/minute for seven days).
+pub const SAMPLE_PER_SERVER_CAP: i64 = SAMPLE_RETENTION_DAYS * 24 * 60;
 
 /// Cap on rows returned by [`server_samples`].
 const HISTORY_LIMIT: i64 = 1000;
@@ -80,12 +80,25 @@ async fn sample_one<A: RuntimeAdapter>(
     bind_address: &str,
 ) {
     // (state, cpu, mem_used, mem_limit, restart_count, players, latency)
-    let row: SamplePoint = match (adapter, container_id.is_empty()) {
-        (Some(a), false) => match a.inspect(container_id).await {
+    let row: SamplePoint = if container_id.is_empty() {
+        // Never materialised: keep the last observed state.
+        let state = if observed_state.is_empty() {
+            "unknown".to_string()
+        } else {
+            observed_state.to_string()
+        };
+        (state, None, None, None, -1, None, None)
+    } else {
+        let Some(adapter) = adapter else {
+            // No daemon to ask: record nothing rather than fabricating
+            // "missing". The gap is truthful and the UI shows it as such.
+            return;
+        };
+        match adapter.inspect(container_id).await {
             Ok(snap) => {
                 let state = normalize_state(&snap.status);
                 if state == "running" {
-                    let (cpu, mem_used, mem_limit) = match a.stats(container_id).await {
+                    let (cpu, mem_used, mem_limit) = match adapter.stats(container_id).await {
                         Ok(s) => (
                             Some(s.cpu_percent),
                             Some(s.memory_bytes as i64),
@@ -107,21 +120,13 @@ async fn sample_one<A: RuntimeAdapter>(
                     (state, None, None, None, snap.restart_count, None, None)
                 }
             }
-            // Container gone — or daemon unreachable mid-probe. Either
-            // way the manager cannot observe it: `missing`, all NULLs.
-            Err(_) => ("missing".to_string(), None, None, None, -1, None, None),
-        },
-        _ if container_id.is_empty() => {
-            // Never materialised: keep the last observed state.
-            let state = if observed_state.is_empty() {
-                "unknown".to_string()
-            } else {
-                observed_state.to_string()
-            };
-            (state, None, None, None, -1, None, None)
+            Err(RuntimeError::NotFound(_)) => {
+                ("missing".to_string(), None, None, None, -1, None, None)
+            }
+            // Daemon unreachable mid-probe: skip this sample rather than
+            // pretending the container was deleted.
+            Err(_) => return,
         }
-        // No daemon to ask, but a container id exists: unreachable.
-        _ => ("missing".to_string(), None, None, None, -1, None, None),
     };
     let (state, cpu, mem_used, mem_limit, restart_count, players, latency) = row;
     let _ = sqlx::query(
@@ -163,7 +168,7 @@ async fn probe_players(bind_address: &str, game_port: i64) -> (Option<i64>, Opti
 }
 
 /// Delete samples older than [`SAMPLE_RETENTION_DAYS`], then enforce the
-/// [`SAMPLE_ROW_CAP`] global cap (newest rows survive).
+/// per-server [`SAMPLE_PER_SERVER_CAP`] (each server keeps its own window).
 pub async fn prune_samples(pool: &SqlitePool) {
     let _ = sqlx::query(
         "DELETE FROM metrics_samples \
@@ -172,13 +177,25 @@ pub async fn prune_samples(pool: &SqlitePool) {
     .bind(format!("-{SAMPLE_RETENTION_DAYS} days"))
     .execute(pool)
     .await;
-    // Global cap: newest SAMPLE_ROW_CAP rows survive, oldest go first.
-    let _ = sqlx::query(&format!(
-        "DELETE FROM metrics_samples WHERE id NOT IN \
-         (SELECT id FROM metrics_samples ORDER BY sampled_at DESC, rowid DESC LIMIT {SAMPLE_ROW_CAP})"
-    ))
-    .execute(pool)
-    .await;
+    // One chatty server must not evict another server's history.
+    let servers: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT server_id FROM metrics_samples")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    for (server_id,) in servers {
+        let _ = sqlx::query(
+            "DELETE FROM metrics_samples
+             WHERE server_id = ? AND id NOT IN (
+                 SELECT id FROM metrics_samples WHERE server_id = ?
+                 ORDER BY sampled_at DESC, rowid DESC LIMIT ?
+             )",
+        )
+        .bind(&server_id)
+        .bind(&server_id)
+        .bind(SAMPLE_PER_SERVER_CAP)
+        .execute(pool)
+        .await;
+    }
 }
 
 /// Newest-first history for one server since `since` (inclusive),
@@ -292,12 +309,84 @@ mod tests {
         let pool = test_pool().await;
         seed_server(&pool, "dead-1", "ghost-container-id", 25565, "running").await;
 
-        // Daemon gone (no adapter): one row, NULL metrics, truthful state.
+        // Daemon gone (no adapter): no fabricated observation. History gets a
+        // truthful gap instead of a fake "missing" sample.
         sample_all::<DockerAdapter>(&pool, None).await;
         let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z")
             .await
             .expect("history reads succeed");
-        assert_eq!(rows.len(), 1, "exactly one row per sample_all call");
+        assert_eq!(rows.len(), 0, "no daemon means no observation");
+        // A container the daemon reports as NotFound is genuinely missing.
+        struct Missing;
+        #[allow(clippy::manual_async_fn)]
+        impl RuntimeAdapter for Missing {
+            fn inspect(
+                &self,
+                _container_id: &str,
+            ) -> impl std::future::Future<
+                Output = Result<crate::runtime::RuntimeSnapshot, crate::runtime::RuntimeError>,
+            > + Send {
+                async { Err(crate::runtime::RuntimeError::NotFound("gone".to_string())) }
+            }
+            fn create(
+                &self,
+                _spec: &crate::runtime::ValidatedServerSpec,
+            ) -> impl std::future::Future<
+                Output = Result<crate::runtime::RuntimeHandle, crate::runtime::RuntimeError>,
+            > + Send {
+                async { panic!("must not run") }
+            }
+            fn start(
+                &self,
+                _container_id: &str,
+            ) -> impl std::future::Future<Output = Result<(), crate::runtime::RuntimeError>> + Send
+            {
+                async { panic!("must not run") }
+            }
+            fn stop(
+                &self,
+                _container_id: &str,
+                _timeout_secs: u32,
+            ) -> impl std::future::Future<Output = Result<(), crate::runtime::RuntimeError>> + Send
+            {
+                async { panic!("must not run") }
+            }
+            fn restart(
+                &self,
+                _container_id: &str,
+            ) -> impl std::future::Future<Output = Result<(), crate::runtime::RuntimeError>> + Send
+            {
+                async { panic!("must not run") }
+            }
+            fn remove(
+                &self,
+                _container_id: &str,
+            ) -> impl std::future::Future<Output = Result<(), crate::runtime::RuntimeError>> + Send
+            {
+                async { panic!("must not run") }
+            }
+            fn logs(
+                &self,
+                _container_id: &str,
+                _tail: usize,
+            ) -> impl std::future::Future<Output = Result<Vec<String>, crate::runtime::RuntimeError>>
+                   + Send {
+                async { panic!("must not run") }
+            }
+            fn stats(
+                &self,
+                _container_id: &str,
+            ) -> impl std::future::Future<
+                Output = Result<crate::runtime::RuntimeStats, crate::runtime::RuntimeError>,
+            > + Send {
+                async { panic!("must not run") }
+            }
+        }
+        sample_all(&pool, Some(&Missing)).await;
+        let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z")
+            .await
+            .expect("history reads succeed");
+        assert_eq!(rows.len(), 1, "a missing container records one row");
         assert_eq!(rows[0].state, "missing");
         assert!(
             rows[0].cpu_percent.is_none()
@@ -308,9 +397,8 @@ mod tests {
             rows[0]
         );
 
-        // Daemon unreachable (inspect fails): same NULLs + missing.
-        // A stub adapter proves this without any socket: no daemon call
-        // can succeed, and none is attempted beyond `inspect`.
+        // Daemon unreachable (inspect fails with a non-NotFound error) is
+        // covered by the skip above; this stub proves NotFound -> missing.
         struct Unreachable;
         #[allow(clippy::manual_async_fn)] // trait declares `-> impl Future`
         impl RuntimeAdapter for Unreachable {
@@ -384,7 +472,7 @@ mod tests {
         let rows = server_samples(&pool, "dead-1", "1970-01-01T00:00:00.000Z")
             .await
             .expect("history reads succeed");
-        assert_eq!(rows.len(), 2, "exactly one row per server per call");
+        assert_eq!(rows.len(), 2, "one missing row per NotFound probe");
         for r in &rows {
             assert_eq!(r.state, "missing");
             assert!(
@@ -500,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn restart_count_minus_one_when_unknown() {
         let pool = test_pool().await;
-        seed_server(&pool, "rs-1", "ghost-container-id", 25568, "running").await;
+        seed_server(&pool, "rs-1", "", 25568, "created").await;
         sample_all::<DockerAdapter>(&pool, None).await;
         let rc: i64 = sqlx::query_scalar(
             "SELECT restart_count FROM metrics_samples WHERE server_id = 'rs-1'",
