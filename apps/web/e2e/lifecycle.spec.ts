@@ -85,7 +85,7 @@ test.describe.serial("full user journey", () => {
       page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().endsWith("/api/v1/auth/setup"),
       ),
-      page.getByRole("button", { name: "Create admin", exact: true }).click(),
+      page.getByRole("button", { name: "Create owner account", exact: true }).click(),
     ]);
     expect(setupResp.ok()).toBe(true);
     await expect(page).toHaveURL(/\/servers$/);
@@ -109,11 +109,11 @@ test.describe.serial("full user journey", () => {
 
     await page.getByLabel("Username", { exact: true }).fill(ADMIN);
     await page.getByLabel("Password", { exact: true }).fill("wrong-password");
-    await page.getByRole("button", { name: "Login", exact: true }).click();
-    await expect(page.getByText(/401/)).toBeVisible();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect(page.getByText(/invalid username or password/i)).toBeVisible();
 
     await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
-    await page.getByRole("button", { name: "Login", exact: true }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(page).toHaveURL(/\/servers$/);
     session = await readSession(page);
   });
@@ -121,16 +121,30 @@ test.describe.serial("full user journey", () => {
   test("(c) create server appears in list", async ({ page }) => {
     await seedSession(page, session);
     await page.goto("/servers");
-    await page.getByLabel("Name", { exact: true }).fill(SERVER_NAME);
-    await page.getByLabel("Game port", { exact: true }).fill(String(GAME_PORT));
+    await expect(
+      page.getByRole("heading", { level: 1, name: "Servers" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "New server" }).click();
+    const dialog = page.getByRole("dialog", { name: "New server" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByLabel("Name", { exact: true }).fill(SERVER_NAME);
+    await dialog
+      .getByLabel("Game port", { exact: true })
+      .fill(String(GAME_PORT));
     const [createResp] = await Promise.all([
       page.waitForResponse(
         (r) => r.request().method() === "POST" && r.url().endsWith("/api/v1/servers"),
       ),
-      page.getByRole("button", { name: "Create", exact: true }).click(),
+      dialog
+        .getByRole("button", { name: "Create server", exact: true })
+        .click(),
     ]);
     expect(createResp.status()).toBe(201);
+    await expect(dialog).toBeHidden();
     await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
+    await expect(
+      page.getByRole("searchbox", { name: "Search servers" }),
+    ).toBeVisible();
 
     const { status, json } = await api<{ servers: Array<{ id: string; name: string }> }>(
       E2E_BASE_URL,
@@ -148,16 +162,46 @@ test.describe.serial("full user journey", () => {
     await chownLeaf(join(backend.dataDir, serverId));
   });
 
+  test("(c2) dashboard shows the fleet summary", async ({ page }) => {
+    await seedSession(page, session);
+    await page.goto("/");
+    await expect(
+      page.getByRole("heading", { level: 1, name: "Dashboard" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Attention" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Host capacity" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Your servers" }),
+    ).toBeVisible();
+    await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Start", exact: true }),
+    ).toBeVisible();
+  });
+
   test("(d) start reaches online", async ({ page }) => {
     await seedSession(page, session);
     await page.goto(`/servers/${serverId}`);
+    await expect(
+      page.getByRole("heading", { level: 1, name: SERVER_NAME }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("link", { name: "Console", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("link", { name: "Backups", exact: true }),
+    ).toBeVisible();
     const [startResp] = await Promise.all([
       page.waitForResponse(
         (r) =>
           r.request().method() === "POST" &&
           r.url().endsWith(`/api/v1/servers/${serverId}/start`),
       ),
-      page.getByRole("button", { name: "start", exact: true }).click(),
+      page.getByRole("button", { name: "Start", exact: true }).click(),
     ]);
     expect(startResp.status()).toBe(202);
     const startBody = (await startResp.json()) as { task_id: string };
@@ -167,19 +211,26 @@ test.describe.serial("full user journey", () => {
       const status = await waitForReadiness(E2E_BASE_URL, serverId, session, "online", 60_000);
       expect(status.readiness?.state).toBe("online");
     });
-    await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
+    await expect(page.getByText(/Start complete/)).toBeVisible({ timeout: 30_000 });
   });
 
   test("(e) stop reaches stopped", async ({ page }) => {
     await seedSession(page, session);
     await page.goto(`/servers/${serverId}`);
+    await page.getByRole("button", { name: "Stop", exact: true }).click();
+    const stopDialog = page.getByRole("dialog", {
+      name: `Stop ${SERVER_NAME}?`,
+    });
+    await expect(stopDialog).toBeVisible();
     const [stopResp] = await Promise.all([
       page.waitForResponse(
         (r) =>
           r.request().method() === "POST" &&
           r.url().endsWith(`/api/v1/servers/${serverId}/stop`),
       ),
-      page.getByRole("button", { name: "stop", exact: true }).click(),
+      stopDialog
+        .getByRole("button", { name: "Stop server", exact: true })
+        .click(),
     ]);
     expect(stopResp.status()).toBe(202);
     const stopBody = (await stopResp.json()) as { task_id: string };
@@ -189,24 +240,59 @@ test.describe.serial("full user journey", () => {
       const status = await waitForReadiness(E2E_BASE_URL, serverId, session, "stopped", 60_000);
       expect(status.readiness?.state).toBe("stopped");
     });
-    await expect(page.getByRole("status")).toContainText("succeeded", { timeout: 30_000 });
+    await expect(page.getByText(/Stop complete/)).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("(e2) server workspace tabs route correctly", async ({ page }) => {
+    await seedSession(page, session);
+    await page.goto(`/servers/${serverId}`);
+    await expect(
+      page.getByRole("heading", { level: 1, name: SERVER_NAME }),
+    ).toBeVisible();
+    const tabs = page.getByRole("navigation", {
+      name: "Server sections",
+    });
+    for (const tab of ["Console", "Files", "Config", "Backups", "Settings"]) {
+      await expect(
+        tabs.getByRole("link", { name: tab, exact: true }),
+      ).toBeVisible();
+    }
+
+    await tabs.getByRole("link", { name: "Backups", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Backups", exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Run full backup", exact: true }),
+    ).toBeVisible();
+
+    await tabs.getByRole("link", { name: "Settings", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Update image", exact: true }),
+    ).toBeVisible();
+
+    await tabs.getByRole("link", { name: "Console", exact: true }).click();
+    await expect(page.getByRole("log")).toBeVisible();
   });
 
   test("(f) delete with retain removes it from the list", async ({ page }) => {
     await seedSession(page, session);
     await page.goto("/servers");
-    await expect(page.getByRole("link", { name: SERVER_NAME })).toBeVisible();
-    await page
-      .locator("li", { hasText: SERVER_NAME })
-      .getByRole("button", { name: "Delete…" })
+    const card = page.locator("article.server-card", { hasText: SERVER_NAME });
+    await expect(card).toBeVisible();
+    await card
+      .getByRole("button", { name: `Actions for ${SERVER_NAME}` })
       .click();
-    await expect(page.getByLabel("retain data")).toBeChecked();
+    await page.getByRole("menuitem", { name: "Delete server" }).click();
+    const dialog = page.getByRole("dialog", { name: "Delete server" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByLabel("Keep world data")).toBeChecked();
     const [delResp] = await Promise.all([
       page.waitForResponse(
         (r) =>
           r.request().method() === "DELETE" && r.url().includes("/api/v1/servers/"),
       ),
-      page.getByRole("button", { name: "Confirm delete" }).click(),
+      dialog.getByRole("button", { name: "Delete server" }).click(),
     ]);
     expect(delResp.status()).toBe(204);
     await expect(page.getByRole("link", { name: SERVER_NAME })).toHaveCount(0);

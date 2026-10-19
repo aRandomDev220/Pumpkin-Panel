@@ -1,17 +1,57 @@
 :root {
-  --canvas: #f2f4f1;
-  --paper: #ffffff;
-  --ink: #1b2528;
-  --muted: #6c7b78;
-  --muted-strong: #4f5f5c;
-  --line: #d8e0dc;
-  --line-strong: #bdcbc5;
-  --charcoal: #222d31;
-  --signal: #4a7478;
-  --signal-strong: #345c60;
-  --focus: #a8663d;
-  --success: #47765e;
-  --warning: #96722e;
-  --danger: #a3574f;
-  --shadow: 0 14px 35px rgba(27, 37, 40, .12);
+  /* Core palette — extracted from pumpkinmc.org */
+  --ink: #0d0d0d;
+  --surface: #1a1a1a;
+  --surface-hover: #232323;
+  --fg: #f0f0f0;
+  --muted: #999999;
+  --pumpkin: #ff6b2c;
+  --pumpkin-deep: #e2551b;
+  --success: #00c853;
+  --danger: #ff4757;
+  --warning: #ffd93d;
+
+  /* Lines */
+  --line: rgba(240, 240, 240, 0.15);
+  --line-strong: rgba(240, 240, 240, 0.3);
+  --focus: var(--pumpkin);
+  --overlay: rgba(0, 0, 0, 0.72);
+
+  /* Elevation — hard offset, never blurred */
+  --shadow-sm: 3px 3px 0 var(--pumpkin);
+  --shadow: 4px 4px 0 var(--pumpkin);
+  --shadow-lg: 6px 6px 0 var(--pumpkin);
+  --shadow-fg: 4px 4px 0 var(--fg);
+  --shadow-danger: 4px 4px 0 var(--danger);
+  --shadow-dark: 3px 3px 0 rgba(0, 0, 0, 0.65);
+
+  /* Geometry — the site is square */
+  --radius: 0;
+
+  /* Spacing */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+  --s-16: 64px;
+
+  /* Type */
+  --font-sans: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --text-label: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-body: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+
+  /* Shell */
+  --sidebar-width: 264px;
+  --topbar-height: 64px;
+  --content-max: 1480px;
 }

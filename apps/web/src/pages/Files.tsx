@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { useOutletContext, useParams } from "react-router-dom";
+import type { ServerOutletContext } from "../components/server/ServerLayout";
 import {
   createDirectory,
   deleteEntry,
@@ -16,7 +17,7 @@ import {
   saveBlob,
   uploadFile,
 } from "../lib/files";
-import { getServer } from "../lib/servers";
+import { formatBytes } from "../lib/format";
 
 function displayPath(path: string): string {
   return path === "" ? "/" : `/${path}`;
@@ -34,21 +35,10 @@ function crumbs(path: string): Array<{ label: string; path: string }> {
   return out;
 }
 
-function formatSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "n/a";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KiB", "MiB", "GiB", "TiB"];
-  let v = bytes / 1024;
-  let u = 0;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u += 1;
-  }
-  return `${v.toFixed(1)} ${units[u]}`;
-}
 
 export default function Files() {
   const { id } = useParams<{ id: string }>();
+  const { server } = useOutletContext<ServerOutletContext>();
   const qc = useQueryClient();
   const [path, setPath] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -59,14 +49,7 @@ export default function Files() {
   const [renameTarget, setRenameTarget] = useState("");
   const [renameSource, setRenameSource] = useState<string | null>(null);
 
-  const serverId = id ?? "";
-
-  const serverQuery = useQuery({
-    queryKey: ["servers", id],
-    queryFn: () => getServer(serverId),
-    enabled: !!id,
-    retry: 1,
-  });
+  const serverId = server.id;
 
   const filesQuery = useQuery({
     queryKey: ["servers", id, "files", path],
@@ -112,10 +95,8 @@ export default function Files() {
     onError: (err) => setError(err instanceof Error ? err.message : "delete failed."),
   });
 
-  if (!id) return <p className="err">Missing server id.</p>;
-
-  const desiredState = serverQuery.data?.desired_state;
-  const importBlocked = desiredState !== undefined && desiredState !== "stopped";
+  const desiredState = server.desired_state;
+  const importBlocked = desiredState !== "stopped";
 
   async function onDownload(entryPath: string, filename: string) {
     setError(null);
@@ -192,10 +173,9 @@ export default function Files() {
 
   return (
     <section>
-      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Servers / {serverQuery.data?.name ?? "server"}</Link> <span className="muted">/ Files</span></p>
-      <div className="page-heading">
-        <div><div className="eyebrow">Server files</div><h2>Files</h2><p>Browse the server data directory, move files safely, and import or export archives.</p></div>
-        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/config`}><button className="button-secondary" type="button">Open config</button></Link></div>
+      <div className="section-heading">
+        <h2>Files</h2>
+        <span className="muted">Server data directory</span>
       </div>
       <div className="files-toolbar"><span className="muted" title="Relative path">Current path <code>{displayPath(path)}</code></span><div className="row"><button type="button" onClick={() => void onExport()}>Export current folder</button><label title={importBlocked ? "Stop the server before importing" : "Import a tar.gz archive"}>Import archive<input type="file" accept=".tar.gz,.tgz,application/gzip" onChange={(e) => void onImport(e)} disabled={importBlocked || importing} /></label></div></div>
 
@@ -262,7 +242,7 @@ export default function Files() {
                     )}
                   </td>
                   <td>{entry.type}</td>
-                  <td>{dir ? "—" : formatSize(entry.size)}</td>
+                  <td>{dir ? "—" : formatBytes(entry.size)}</td>
                   <td>{entry.mtime}</td>
                   <td>
                     <div className="row">
@@ -349,13 +329,14 @@ export default function Files() {
 
       <div className="section-heading"><h3>Import / export</h3><span className="muted">Archive the current path</span></div>
       <p className="muted">
-        server desired_state:{" "}
-        {serverQuery.isLoading ? "loading…" : (desiredState ?? "unknown")}
+        Server state: <strong>{desiredState}</strong>
       </p>
-      <div className="row">{importing && <span className="muted">Importing…</span>}</div>
+      <div className="row">
+        {importing && <span className="muted">Importing…</span>}
+      </div>
       {importBlocked && (
         <p className="warn" role="note">
-          Import is disabled while the server desired_state is “{desiredState}”. Stop the
+          Import is disabled while the server is {desiredState}. Stop the
           server before importing an archive.
         </p>
       )}

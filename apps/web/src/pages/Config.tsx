@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import {
   ConfigConflictError,
   ConfigValidationError,
@@ -249,10 +249,9 @@ export default function Config() {
 
   return (
     <section>
-      <p className="server-breadcrumb"><Link to={`/servers/${encodeURIComponent(id)}`}>Server workspace</Link> <span className="muted">/ Config</span></p>
-      <div className="page-heading">
-        <div><div className="eyebrow">Server configuration</div><h2>Config</h2><p>Use guided settings for common changes or edit the complete TOML when you need control over every key.</p></div>
-        <div className="heading-actions"><Link to={`/servers/${encodeURIComponent(id)}/files`}><button className="button-secondary" type="button">Open files</button></Link></div>
+      <div className="section-heading">
+        <h2>Config</h2>
+        <span className="muted">Guided settings and raw TOML</span>
       </div>
 
       {configQuery.isLoading && <p>Loading config…</p>}

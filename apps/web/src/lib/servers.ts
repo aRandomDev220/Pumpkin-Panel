@@ -15,6 +15,9 @@ export interface ServerSummary {
 export interface ServerDetail extends ServerSummary {
   container_id?: string | null;
   last_error?: string | null;
+  image_digest?: string | null;
+  previous_image_reference?: string | null;
+  previous_image_digest?: string | null;
 }
 
 export interface TaskStatus {
@@ -22,7 +25,10 @@ export interface TaskStatus {
   kind: string;
   state: string;
   server_id?: string | null;
+  progress_percent?: number | null;
+  message?: string | null;
   error?: string | null;
+  error_code?: string | null;
   created_at?: string;
   updated_at?: string;
 }

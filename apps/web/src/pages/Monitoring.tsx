@@ -66,7 +66,7 @@ export function MetricHistoryBars({
               style={{
                 width: 8,
                 height: BAR_TRACK_HEIGHT,
-                border: "1px dashed #3a4a42",
+                border: "1px dashed var(--line-strong)",
                 borderRadius: 2,
                 boxSizing: "border-box",
               }}
@@ -87,7 +87,7 @@ export function MetricHistoryBars({
               height: BAR_TRACK_HEIGHT,
               display: "inline-flex",
               alignItems: "flex-end",
-              background: "#141c19",
+              background: "var(--ink)",
               borderRadius: 2,
             }}
           >
@@ -96,7 +96,7 @@ export function MetricHistoryBars({
                 display: "block",
                 width: "100%",
                 height: `${height}%`,
-                background: "#7dd8a8",
+                background: "var(--pumpkin)",
                 borderRadius: 2,
               }}
             />
@@ -161,7 +161,7 @@ export function PlayersHistoryLine({
       style={{
         width: "100%",
         height,
-        background: "#141c19",
+        background: "var(--ink)",
         borderRadius: 4,
         display: "block",
       }}
@@ -171,7 +171,7 @@ export function PlayersHistoryLine({
           key={i}
           points={seg.map((p) => `${p.x},${p.y}`).join(" ")}
           fill="none"
-          stroke="#7dd8a8"
+          className="chart-line-players"
           strokeWidth={1.5}
           vectorEffect="non-scaling-stroke"
         />

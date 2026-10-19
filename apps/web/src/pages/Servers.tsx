@@ -1,126 +1,302 @@
 import { useState } from "react";
-import type { FormEvent } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
-import { createServer, deleteServer, digestWarning, listServers, validateCreateServer } from "../lib/servers";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import Button from "../components/ui/Button";
+import ConfirmDialog from "../components/ui/ConfirmDialog";
+import EmptyState from "../components/ui/EmptyState";
+import ErrorState from "../components/ui/ErrorState";
+import { Input } from "../components/ui/Field";
+import PageHeader from "../components/ui/PageHeader";
+import { SkeletonCard } from "../components/ui/Skeleton";
+import { useToast } from "../components/ui/toast-context";
+import CreateServerDialog from "../components/servers/CreateServerDialog";
+import ServerCard from "../components/servers/ServerCard";
+import { usePageTitle } from "../hooks/usePageTitle";
+import { humanizeError } from "../lib/errors";
+import {
+  deleteServer,
+  fetchMetricsSummary,
+  fetchStatus,
+  listServers,
+} from "../lib/servers";
+import type {
+  ServerMetric,
+  ServerStatus,
+  ServerSummary,
+} from "../lib/servers";
 
-const RECOMMENDED_IMAGE = "ghcr.io/pumpkin-mc/pumpkin:master";
-const RECOMMENDED_DIGEST = "sha256:675adcf4f351ed8656385346bf514584b0bb34826f06b553cd16094196d79099";
+type StatusFilter = "all" | "online" | "stopped" | "attention";
+
+const FILTERS: Array<{ value: StatusFilter; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "online", label: "Online" },
+  { value: "stopped", label: "Stopped" },
+  { value: "attention", label: "Needs attention" },
+];
 
 export default function Servers(): React.JSX.Element {
-  const qc = useQueryClient();
-  const serversQuery = useQuery({ queryKey: ["servers"], queryFn: listServers });
-  const [name, setName] = useState("");
-  const [gamePort, setGamePort] = useState("25565");
-  const [imageReference, setImageReference] = useState(RECOMMENDED_IMAGE);
-  const [imageDigest, setImageDigest] = useState(RECOMMENDED_DIGEST);
-  const [customImage, setCustomImage] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [retainData, setRetainData] = useState(true);
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  usePageTitle("Servers");
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [deleteTarget, setDeleteTarget] =
+    useState<ServerSummary | null>(null);
+  const [keepData, setKeepData] = useState(true);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
-  const createMutation = useMutation({
-    mutationFn: createServer,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["servers"] });
-      setName("");
-       setImageReference(RECOMMENDED_IMAGE);
-       setImageDigest(RECOMMENDED_DIGEST);
-       setCustomImage(false);
-      setFormError(null);
-    },
-    onError: (err) => setFormError(err instanceof Error ? err.message : "Create failed."),
+  const serversQuery = useQuery({
+    queryKey: ["servers"],
+    queryFn: listServers,
   });
-  const deleteMutation = useMutation({
-    mutationFn: ({ id, retain }: { id: string; retain: boolean }) => deleteServer(id, retain),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["servers"] });
-      setDeleteTarget(null);
-    },
+  const metricsQuery = useQuery({
+    queryKey: ["metrics", "summary"],
+    queryFn: fetchMetricsSummary,
+    retry: 1,
   });
-
-  function onCreate(event: FormEvent): void {
-    event.preventDefault();
-    const port = Number(gamePort);
-    const validation = validateCreateServer({ name: name.trim(), game_port: port, image_reference: imageReference.trim() });
-    if (validation) {
-      setFormError(validation);
-      return;
-    }
-    setFormError(null);
-    createMutation.mutate({
-      name: name.trim(),
-      game_port: port,
-      image_reference: imageReference.trim(),
-      image_digest: imageDigest.trim() || undefined,
-    });
-  }
 
   const servers = serversQuery.data?.servers ?? [];
-  const warning = digestWarning(imageReference);
+
+  const statusQueries = useQueries({
+    queries: servers.map((server) => ({
+      queryKey: ["servers", server.id, "status"],
+      queryFn: () => fetchStatus(server.id),
+      retry: 1,
+      staleTime: 10_000,
+    })),
+  });
+
+  const statusById = new Map<string, ServerStatus | undefined>();
+  const statusFailed = new Set<string>();
+  const indexById = new Map<string, number>();
+  servers.forEach((server, index) => {
+    indexById.set(server.id, index);
+    statusById.set(server.id, statusQueries[index]?.data);
+    if (statusQueries[index]?.isError) statusFailed.add(server.id);
+  });
+
+  const metricById = new Map<string, ServerMetric>(
+    (metricsQuery.data?.servers ?? []).map((metric) => [
+      metric.server_id,
+      metric,
+    ]),
+  );
+
+  const deleteMutation = useMutation({
+    mutationFn: ({ id, retain }: { id: string; retain: boolean }) =>
+      deleteServer(id, retain),
+    onSuccess: (_data, variables) => {
+      const name = servers.find(
+        (server) => server.id === variables.id,
+      )?.name;
+      void queryClient.invalidateQueries({ queryKey: ["servers"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["metrics", "summary"],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      toast.success(
+        name !== undefined ? `Server “${name}” deleted` : "Server deleted",
+      );
+      setDeleteTarget(null);
+      setDeleteError(null);
+    },
+    onError: (error) => {
+      setDeleteError(humanizeError(error));
+    },
+  });
+
+  const needle = search.trim().toLowerCase();
+  const filtered = servers.filter((server) => {
+    const status = statusById.get(server.id);
+    const readiness = status?.readiness?.state;
+    const observed = readiness ?? server.observed_state;
+
+    if (filter === "online" && observed !== "online") return false;
+    if (filter === "stopped" && observed !== "stopped") return false;
+    if (filter === "attention") {
+      const needsAttention =
+        statusFailed.has(server.id) ||
+        status?.docker_available === false ||
+        status?.container === null ||
+        server.desired_state !== server.observed_state ||
+        readiness === "unhealthy";
+      if (!needsAttention) return false;
+    }
+
+    if (needle === "") return true;
+    return `${server.name} ${server.game_port} ${server.image_reference}`
+      .toLowerCase()
+      .includes(needle);
+  });
 
   return (
     <section>
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow">Workspace</div>
-          <h2>Servers</h2>
-          <p>Register, operate, and inspect every Pumpkin world from one focused workspace.</p>
+      <PageHeader
+        title="Servers"
+        description="Create, operate, and inspect every Pumpkin world from one place."
+        actions={
+          <Button onClick={() => setCreateOpen(true)}>New server</Button>
+        }
+      />
+
+      {serversQuery.isLoading && (
+        <div className="server-grid">
+          {Array.from({ length: 4 }, (_, index) => (
+            <SkeletonCard key={index} />
+          ))}
         </div>
-        <div className="heading-actions"><a href="#create-server"><button type="button">Create server</button></a></div>
-      </div>
+      )}
 
-      {serversQuery.isLoading && <div className="panel"><p className="muted">Loading servers…</p></div>}
-      {serversQuery.error && <div className="panel"><p className="err" role="alert">Failed to load servers. Refresh to try again.</p></div>}
-      {!serversQuery.isLoading && !serversQuery.error && servers.length === 0 && <div className="empty-state"><h3>No servers yet.</h3><p>Your first server will appear here with live readiness, player, and resource information.</p><a href="#create-server"><button type="button">Create the first server</button></a></div>}
+      {serversQuery.error && (
+        <ErrorState
+          message="Could not load your servers."
+          technicalDetails={
+            serversQuery.error instanceof Error
+              ? serversQuery.error.message
+              : undefined
+          }
+          onRetry={() => void serversQuery.refetch()}
+        />
+      )}
 
-      {servers.length > 0 && <>
-        <div className="section-heading"><h3>Registered servers</h3><span className="muted">{servers.length} total</span></div>
-        <ul className="server-list">
-          {servers.map((server) => {
-            const running = server.observed_state === "running";
-            const drifted = server.desired_state !== server.observed_state;
-            return <li className="server-list-item" key={server.id}>
-              <div className="server-list-main" aria-label={`${server.name} server`}>
-                <Link className="server-name" to={`/servers/${encodeURIComponent(server.id)}`}>{server.name}</Link>
-                <div className="server-meta">Port {server.game_port} · image <code>{server.image_reference}</code></div>
-                <div className="server-badges"><span className={running ? "badge badge-ok" : "badge"}>{running ? "Running" : server.observed_state}</span><span className={drifted ? "badge badge-err" : "badge"}>{drifted ? "State drift" : `Desired ${server.desired_state}`}</span></div>
+      {!serversQuery.isLoading &&
+        !serversQuery.error &&
+        servers.length === 0 && (
+          <EmptyState
+            title="No servers yet"
+            description="Your first server will appear here with live readiness, players, resources, and backups."
+            action={
+              <Button onClick={() => setCreateOpen(true)}>
+                Create your first server
+              </Button>
+            }
+          />
+        )}
+
+      {!serversQuery.isLoading &&
+        !serversQuery.error &&
+        servers.length > 0 && (
+          <>
+            <div className="fleet-toolbar">
+              <div className="toolbar-search">
+                <Input
+                  type="search"
+                  aria-label="Search servers"
+                  placeholder="Search by name, port, or image"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                />
               </div>
-              <div className="server-list-actions">
-                <Link className="section-link" to={`/servers/${encodeURIComponent(server.id)}`}>Open server</Link>
-                {deleteTarget === server.id ? <form onSubmit={(event) => { event.preventDefault(); deleteMutation.mutate({ id: server.id, retain: retainData }); }}>
-                  <label><input type="checkbox" checked={retainData} onChange={(event) => setRetainData(event.target.checked)} /> retain data</label>
-                  <button type="submit" disabled={deleteMutation.isPending}>Confirm delete</button>
-                  <button className="button-secondary" type="button" onClick={() => setDeleteTarget(null)}>Cancel</button>
-                  {deleteMutation.isError && <span className="err">Delete failed.</span>}
-                </form> : <button className="button-danger" type="button" onClick={() => setDeleteTarget(server.id)}>Delete…</button>}
+              <div
+                className="filter-group"
+                role="group"
+                aria-label="Filter servers by status"
+              >
+                {FILTERS.map((item) => (
+                  <Button
+                    key={item.value}
+                    size="sm"
+                    variant={
+                      filter === item.value ? "primary" : "secondary"
+                    }
+                    aria-pressed={filter === item.value}
+                    onClick={() => setFilter(item.value)}
+                  >
+                    {item.label}
+                  </Button>
+                ))}
               </div>
-            </li>;
-          })}
-        </ul>
-      </>}
+              <span className="muted toolbar-count">
+                {filtered.length} of {servers.length}
+              </span>
+            </div>
 
-      <div className="panel create-panel" id="create-server">
-        <h3>Create a server</h3>
-         <p>Choose a server version below. The recommended build is already pinned and ready to use.</p>
-         <form onSubmit={onCreate}>
-           <div className="form-grid">
-             <label>Name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="survival-1" required /></label>
-             <label>Game port<input value={gamePort} onChange={(event) => setGamePort(event.target.value)} inputMode="numeric" placeholder="25565" required /></label>
-             <label>Server version
-               <select value={customImage ? "custom" : "recommended"} onChange={(event) => setCustomImage(event.target.value === "custom")}>
-                 <option value="recommended">Recommended Pumpkin build</option>
-                 <option value="custom">Custom image (advanced)</option>
-               </select>
-             </label>
-           </div>
-           {!customImage && <p className="subtle-note">Uses the tested Pumpkin build for Linux/amd64. You can change the image later from the server update screen.</p>}
-           {customImage && <label className="advanced-field">Image reference (advanced)<input value={imageReference} onChange={(event) => { setImageReference(event.target.value); setImageDigest(""); }} placeholder="ghcr.io/pumpkin-mc/pumpkin:tag" required /><small>Only allowlisted Pumpkin images are accepted. Use a digest for reproducible updates.</small></label>}
-           {warning && <p className="warn" role="note">{warning}</p>}
-          {formError && <p className="err" role="alert">{formError}</p>}
-          <div className="form-actions"><button type="submit" disabled={createMutation.isPending}>{createMutation.isPending ? "Creating…" : "Create"}</button></div>
-        </form>
-      </div>
+            {filtered.length === 0 ? (
+              <EmptyState
+                title="No servers match"
+                description="Try a different search or status filter."
+                action={
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      setSearch("");
+                      setFilter("all");
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                }
+              />
+            ) : (
+              <div className="server-grid">
+                {filtered.map((server) => {
+                  const index = indexById.get(server.id) ?? 0;
+                  return (
+                    <ServerCard
+                      key={server.id}
+                      server={server}
+                      status={statusById.get(server.id)}
+                      statusLoading={statusQueries[index]?.isLoading}
+                      metric={metricById.get(server.id)}
+                      onDelete={(target) => {
+                        setDeleteTarget(target);
+                        setKeepData(true);
+                        setDeleteError(null);
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+
+      <CreateServerDialog
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onClose={() => {
+          if (deleteMutation.isPending) return;
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        onConfirm={() => {
+          if (deleteTarget !== null) {
+            deleteMutation.mutate({
+              id: deleteTarget.id,
+              retain: keepData,
+            });
+          }
+        }}
+        title="Delete server"
+        description={
+          deleteTarget !== null
+            ? `Remove “${deleteTarget.name}” and its container from the panel.`
+            : undefined
+        }
+        confirmLabel="Delete server"
+        busy={deleteMutation.isPending}
+        checkbox={{
+          label: "Keep world data",
+          hint: "Leave checked to keep the world files on disk.",
+          checked: keepData,
+          onChange: setKeepData,
+        }}
+      >
+        {deleteError !== null && (
+          <p className="err" role="alert">
+            {deleteError}
+          </p>
+        )}
+      </ConfirmDialog>
     </section>
   );
 }
