@@ -24,6 +24,12 @@ import type { MetricsRange } from "../lib/monitoring";
 import { ServerHistoryPanels } from "./Monitoring";
 import BackupsSection from "./Backups";
 import {
+  createScheduledRestart,
+  deleteScheduledRestart,
+  listScheduledRestarts,
+} from "../lib/schedules";
+import type { ScheduledRestart } from "../lib/schedules";
+import {
   AdminApiError,
   errMsg,
   previousImageOf,
@@ -476,6 +482,166 @@ function readinessClass(state: string): string {
   return "badge";
 }
 
+function ScheduledRestartsSection({
+  serverId,
+}: {
+  serverId: string;
+}): React.JSX.Element {
+  const qc = useQueryClient();
+  const { can } = useAuth();
+  const canManage = can("server.lifecycle");
+  const [schedule, setSchedule] = useState("0 4 * * *");
+  const [timezone, setTimezone] = useState("UTC");
+  const [enabled, setEnabled] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const query = useQuery({
+    queryKey: ["servers", serverId, "scheduled-restarts"],
+    queryFn: () => listScheduledRestarts(serverId),
+    retry: 1,
+  });
+  const create = useMutation({
+    mutationFn: () =>
+      createScheduledRestart(serverId, {
+        schedule: schedule.trim(),
+        timezone: timezone.trim(),
+        enabled,
+      }),
+    onSuccess: () => {
+      setError(null);
+      setNotice("Restart scheduled.");
+      qc.invalidateQueries({
+        queryKey: ["servers", serverId, "scheduled-restarts"],
+      });
+    },
+    onError: (err) =>
+      setError(
+        err instanceof Error ? err.message : "Failed to schedule restart.",
+      ),
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => deleteScheduledRestart(id),
+    onSuccess: () => {
+      setError(null);
+      setNotice("Scheduled restart removed.");
+      qc.invalidateQueries({
+        queryKey: ["servers", serverId, "scheduled-restarts"],
+      });
+    },
+    onError: (err) =>
+      setError(
+        err instanceof Error ? err.message : "Failed to delete schedule.",
+      ),
+  });
+
+  function onCreate(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    setNotice(null);
+    if (schedule.trim() === "") {
+      setError("Schedule is required.");
+      return;
+    }
+    create.mutate();
+  }
+
+  return (
+    <section className="workspace-section" id="restarts">
+      <div className="section-heading">
+        <h3>Scheduled restarts</h3>
+        <span className="muted">5-field cron · UTC unless set</span>
+      </div>
+      <p className="muted">
+        Restarts are queued through the task runner; a busy server is retried,
+        never double-run.
+      </p>
+      {error && <p className="err" role="alert">{error}</p>}
+      {notice && <p className="muted" role="status">{notice}</p>}
+      {query.isLoading && <p className="muted">Loading schedules…</p>}
+      {query.error && (
+        <p className="err" role="alert">Failed to load schedules.</p>
+      )}
+      {query.data && query.data.length === 0 && (
+        <p className="muted">No scheduled restarts.</p>
+      )}
+      {query.data && query.data.length > 0 && (
+        <ul className="row-list">
+          {query.data.map((task: ScheduledRestart) => (
+            <li key={task.id} className="row">
+              <code>{task.schedule}</code>
+              <span className="muted">{task.timezone}</span>
+              <span className="badge">
+                {task.enabled ? "enabled" : "disabled"}
+              </span>
+              <span className="muted">
+                next: {task.next_run_at ?? "—"}
+              </span>
+              {canManage && (
+                <button
+                  type="button"
+                  disabled={remove.isPending}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        `Delete restart schedule ${task.schedule}?`,
+                      )
+                    ) {
+                      remove.mutate(task.id);
+                    }
+                  }}
+                >
+                  Delete
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={onCreate}>
+        <div className="row">
+          <label>
+            Cron schedule{" "}
+            <input
+              value={schedule}
+              onChange={(event) => setSchedule(event.target.value)}
+              placeholder="0 4 * * *"
+              disabled={!canManage}
+              required
+            />
+          </label>
+          <label>
+            Timezone{" "}
+            <input
+              value={timezone}
+              onChange={(event) => setTimezone(event.target.value)}
+              placeholder="UTC"
+              disabled={!canManage}
+            />
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => setEnabled(event.target.checked)}
+              disabled={!canManage}
+            />{" "}
+            Enabled
+          </label>
+          <button type="submit" disabled={!canManage || create.isPending}>
+            {create.isPending ? "Scheduling…" : "Add restart"}
+          </button>
+        </div>
+      </form>
+      {!canManage && (
+        <p className="muted">
+          Your role cannot manage scheduled restarts.
+        </p>
+      )}
+    </section>
+  );
+}
+
 export default function ServerDetail() {
   const { id } = useParams<{ id: string }>();
   const { can } = useAuth();
@@ -680,6 +846,7 @@ export default function ServerDetail() {
         <Link to={`/servers/${encodeURIComponent(s.id)}/config`}>Configuration</Link>
         <Link to={`/servers/${encodeURIComponent(s.id)}/files`}>Files</Link>
         <a href="#backups">Backups</a>
+        <a href="#restarts">Restarts</a>
         <a href="#metrics">Metrics</a>
       </nav>
       {opFeedback && (
@@ -809,6 +976,7 @@ export default function ServerDetail() {
       <div id="backups" className="workspace-section">
         <BackupsSection serverId={s.id} observedState={s.observed_state} />
       </div>
+      <ScheduledRestartsSection serverId={s.id} />
       <div className="workspace-section"><UpdateSection serverId={s.id} server={s} /></div>
     </section>
   );
