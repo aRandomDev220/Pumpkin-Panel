@@ -2053,43 +2053,43 @@ mod tests {
                 )),
             )
             .route(
-                "/api/v1/tasks/:id",
+                "/api/v1/tasks/{id}",
                 get(crate::routes_admin::get_task).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerRead),
                 )),
             )
             .route(
-                "/api/v1/servers/:id/backups",
+                "/api/v1/servers/{id}/backups",
                 post(create_backup).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerBackupCreate),
                 )),
             )
             .route(
-                "/api/v1/servers/:id/backups",
+                "/api/v1/servers/{id}/backups",
                 get(list_backups).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerRead),
                 )),
             )
             .route(
-                "/api/v1/backups/:id",
+                "/api/v1/backups/{id}",
                 get(get_backup).route_layer(middleware::from_fn(crate::auth::require_permission(
                     Permission::ServerRead,
                 ))),
             )
             .route(
-                "/api/v1/backups/:id/download",
+                "/api/v1/backups/{id}/download",
                 get(download_backup).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerRead),
                 )),
             )
             .route(
-                "/api/v1/backups/:id",
+                "/api/v1/backups/{id}",
                 delete(delete_backup).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerBackupCreate),
                 )),
             )
             .route(
-                "/api/v1/backups/:id/restore",
+                "/api/v1/backups/{id}/restore",
                 post(restore_backup).route_layer(middleware::from_fn(
                     crate::auth::require_permission(Permission::ServerBackupRestore),
                 )),
