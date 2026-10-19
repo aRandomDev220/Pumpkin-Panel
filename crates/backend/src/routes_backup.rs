@@ -2139,79 +2139,6 @@ mod tests {
         pool
     }
 
-    /// Mirror of the production wiring the controller will add to
-    /// `build_router`: identical paths + permission gates.
-    fn test_router(state: AppState) -> axum::Router {
-        use crate::auth::Permission;
-        use axum::{
-            middleware,
-            routing::{delete, get, post},
-        };
-
-        let pool = state.pool.clone();
-        let public = axum::Router::new()
-            .route(
-                "/api/v1/auth/setup-status",
-                get(crate::routes_auth::setup_status),
-            )
-            .route("/api/v1/auth/setup", post(crate::routes_auth::setup))
-            .route("/api/v1/auth/login", post(crate::routes_auth::login));
-        let protected = axum::Router::new()
-            .route(
-                "/api/v1/servers",
-                post(crate::routes_servers::create_server).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerCreate),
-                )),
-            )
-            .route(
-                "/api/v1/tasks/:id",
-                get(crate::routes_admin::get_task).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerRead),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/backups",
-                post(create_backup).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerBackupCreate),
-                )),
-            )
-            .route(
-                "/api/v1/servers/:id/backups",
-                get(list_backups).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerRead),
-                )),
-            )
-            .route(
-                "/api/v1/backups/:id",
-                get(get_backup).route_layer(middleware::from_fn(crate::auth::require_permission(
-                    Permission::ServerRead,
-                ))),
-            )
-            .route(
-                "/api/v1/backups/:id/download",
-                get(download_backup).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerRead),
-                )),
-            )
-            .route(
-                "/api/v1/backups/:id",
-                delete(delete_backup).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerBackupCreate),
-                )),
-            )
-            .route(
-                "/api/v1/backups/:id/restore",
-                post(restore_backup).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerBackupRestore),
-                )),
-            )
-            .route_layer(middleware::from_fn_with_state(
-                pool,
-                crate::auth::auth_middleware,
-            ));
-        public.merge(protected).with_state(state)
-    }
-
     struct Fixture {
         server: TestServer,
         pool: SqlitePool,
@@ -2232,7 +2159,7 @@ mod tests {
         // via the `PUMPKIN_MANAGER_BACKUP_DIR` env heuristic (deleted with I1).
         let mut state = AppState::for_tests(pool.clone(), server_root.clone());
         state.backup_dir = backup_dir.clone();
-        let server = TestServer::new(test_router(state.clone())).unwrap();
+        let server = TestServer::new(crate::build_router(state.clone())).unwrap();
         let res = server
             .post("/api/v1/auth/setup")
             .json(&json!({"username": "owner", "password": "supersecret1"}))
@@ -2656,7 +2583,7 @@ mod tests {
         std::fs::write(&blocker, b"not a dir").unwrap();
         let mut bad = fx.state.clone();
         bad.backup_dir = blocker;
-        let bad_server = TestServer::new(test_router(bad)).unwrap();
+        let bad_server = TestServer::new(crate::build_router(bad)).unwrap();
 
         let res = bad_server
             .post(&format!("/api/v1/backups/{backup_id}/restore"))
@@ -3059,7 +2986,7 @@ mod tests {
         std::fs::write(&blocker, b"not a dir").unwrap();
         let mut bad = fx.state.clone();
         bad.backup_dir = blocker;
-        let bad_server = TestServer::new(test_router(bad)).unwrap();
+        let bad_server = TestServer::new(crate::build_router(bad)).unwrap();
         let res = bad_server
             .post(&format!("/api/v1/servers/{id}/backups"))
             .authorization_bearer(&fx.token)

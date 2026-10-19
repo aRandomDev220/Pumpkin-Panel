@@ -145,7 +145,10 @@ pub async fn setup(
     // Rate-limit first: junk payloads must consume a token too.
     if let Err(retry) = check_rate_limit(
         &app,
-        &[client_key(peer.as_ref()), user_key("setup", &body.username)],
+        &[
+            client_key(peer.as_ref(), &headers, app.trust_proxy),
+            user_key("setup", &body.username),
+        ],
     ) {
         audit_auth(
             &app.pool,
@@ -275,7 +278,7 @@ pub async fn setup(
             };
             session_response(
                 app.session_ttl_secs,
-                cookie_secure(app.secure_cookies, &headers),
+                cookie_secure(app.secure_cookies, app.trust_proxy, &headers),
                 &token,
                 user,
             )
@@ -313,7 +316,10 @@ pub async fn login(
     // Rate-limit first: junk payloads must consume a token too.
     if let Err(retry) = check_rate_limit(
         &app,
-        &[client_key(peer.as_ref()), user_key("login", &body.username)],
+        &[
+            client_key(peer.as_ref(), &headers, app.trust_proxy),
+            user_key("login", &body.username),
+        ],
     ) {
         audit_auth(
             &app.pool,
@@ -456,7 +462,7 @@ pub async fn login(
             };
             session_response(
                 app.session_ttl_secs,
-                cookie_secure(app.secure_cookies, &headers),
+                cookie_secure(app.secure_cookies, app.trust_proxy, &headers),
                 &token,
                 user,
             )
@@ -494,7 +500,7 @@ pub async fn logout(State(app): State<crate::AppState>, headers: HeaderMap) -> R
         None,
     )
     .await;
-    clear_session_cookies(cookie_secure(app.secure_cookies, &headers))
+    clear_session_cookies(cookie_secure(app.secure_cookies, app.trust_proxy, &headers))
 }
 
 /// GET /api/v1/auth/me — returns the authenticated user.
@@ -726,27 +732,21 @@ fn build_cookie(name: &str, value: &str, max_age: i64, secure: bool, http_only: 
 /// and HTTP to this process. The browser supplies Origin/Referer on these
 /// mutations, so use that signal without trusting arbitrary forwarded headers.
 /// The configured secure default remains the fallback for non-browser clients.
-fn cookie_secure(configured_secure: bool, headers: &HeaderMap) -> bool {
+fn cookie_secure(configured_secure: bool, trust_proxy: bool, headers: &HeaderMap) -> bool {
     if !configured_secure {
         return false;
     }
-    let source = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(header::REFERER)
-                .and_then(|value| value.to_str().ok())
-        });
-    match source {
-        Some(value) if value.starts_with("http://") => false,
-        Some(value) if value.starts_with("https://") => true,
-        _ => headers
+    // Never derive the flag from client-controlled Origin/Referer. Only a
+    // trusted reverse proxy may downgrade it via X-Forwarded-Proto.
+    if trust_proxy {
+        if let Some(proto) = headers
             .get("x-forwarded-proto")
             .and_then(|value| value.to_str().ok())
-            .map(|value| value.eq_ignore_ascii_case("https"))
-            .unwrap_or(configured_secure),
+        {
+            return proto.eq_ignore_ascii_case("https");
+        }
     }
+    true
 }
 
 fn clear_cookie(name: &str, secure: bool, http_only: bool) -> String {
@@ -811,7 +811,21 @@ fn origin_authority(url: &str) -> Option<&str> {
 /// mint a new bucket for every login attempt. When the manager sits behind a
 /// proxy without a trusted-proxy configuration, all forwarded requests share
 /// the fallback bucket rather than bypassing the limiter.
-fn client_key(peer: Option<&SocketAddr>) -> String {
+fn client_key(peer: Option<&SocketAddr>, headers: &HeaderMap, trust_proxy: bool) -> String {
+    // Only a trusted proxy may supply the client address. Without that,
+    // forwarded headers are attacker-controlled and must be ignored.
+    if trust_proxy {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some(first) = forwarded.split(',').next().map(str::trim) {
+                if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+                    return format!("ip:{ip}");
+                }
+            }
+        }
+    }
     match peer {
         Some(addr) => format!("ip:{}", addr.ip()),
         None => "ip:global".to_string(),
@@ -899,23 +913,15 @@ mod cookie_tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
-    fn browser_http_origin_disables_secure_cookie_for_lan_install() {
+    fn client_origin_cannot_downgrade_secure_cookie() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "origin",
             HeaderValue::from_static("http://192.168.1.41:8080"),
         );
-        assert!(!cookie_secure(true, &headers));
-    }
-
-    #[test]
-    fn browser_https_origin_keeps_secure_cookie() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "origin",
-            HeaderValue::from_static("https://panel.example.test"),
-        );
-        assert!(cookie_secure(true, &headers));
+        // Only PUMPKIN_INSECURE_COOKIES or a trusted proxy may drop Secure.
+        assert!(cookie_secure(true, false, &headers));
+        assert!(!cookie_secure(false, false, &headers));
     }
 }
 
@@ -927,8 +933,24 @@ mod tests {
     fn rate_limit_key_ignores_ephemeral_port() {
         let first: SocketAddr = "203.0.113.9:1000".parse().unwrap();
         let second: SocketAddr = "203.0.113.9:2000".parse().unwrap();
-        assert_eq!(client_key(Some(&first)), "ip:203.0.113.9");
-        assert_eq!(client_key(Some(&first)), client_key(Some(&second)));
-        assert_eq!(client_key(None), "ip:global");
+        let empty = HeaderMap::new();
+        assert_eq!(client_key(Some(&first), &empty, false), "ip:203.0.113.9");
+        assert_eq!(
+            client_key(Some(&first), &empty, false),
+            client_key(Some(&second), &empty, false)
+        );
+        assert_eq!(client_key(None, &empty, false), "ip:global");
+    }
+
+    #[test]
+    fn proxy_headers_are_trusted_only_when_configured() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7, 10.0.0.1".parse().unwrap());
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(client_key(None, &headers, false), "ip:global");
+        assert_eq!(client_key(None, &headers, true), "ip:198.51.100.7");
+        assert!(cookie_secure(true, false, &headers));
+        assert!(!cookie_secure(true, true, &headers));
+        assert!(!cookie_secure(false, false, &headers));
     }
 }

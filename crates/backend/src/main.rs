@@ -76,6 +76,10 @@ pub struct AppState {
     pub secure_cookies: bool,
     /// In-process brute-force limiter for `/auth/login` and `/auth/setup`.
     pub rate_limiter: Arc<std::sync::Mutex<ratelimit::RateLimiter>>,
+    /// Trust `X-Forwarded-Proto` / `X-Forwarded-For` from the transport peer.
+    pub trust_proxy: bool,
+    /// Optional Host allowlist (prevents DNS-rebinding against first-run setup).
+    pub allowed_hosts: Vec<String>,
 }
 
 impl AppState {
@@ -91,6 +95,8 @@ impl AppState {
             session_ttl_secs: 12 * 60 * 60,
             secure_cookies: true,
             rate_limiter: new_rate_limiter(),
+            trust_proxy: false,
+            allowed_hosts: Vec::new(),
         }
     }
 
@@ -504,6 +510,7 @@ pub fn build_router(state: AppState) -> Router {
         // (index.html, JS, CSS) without security headers.
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(state.clone(), validate_host))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
@@ -514,6 +521,35 @@ pub fn build_router(state: AppState) -> Router {
 /// Adds baseline security headers to every response (including the SPA
 /// fallback). HSTS is only emitted when cookies are secure (i.e. not in the
 /// explicit local-HTTP development mode).
+/// Reject requests whose Host is not in `PUMPKIN_ALLOWED_HOSTS`. Disabled
+/// when the list is empty (documented default for same-host/LAN installs).
+async fn validate_host(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !state.allowed_hosts.is_empty() {
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+        let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+        if !state.allowed_hosts.iter().any(|allowed| allowed == &host) {
+            return (
+                axum::http::StatusCode::MISDIRECTED_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error_code": "INVALID_HOST",
+                    "message": "request host is not allowed",
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 async fn security_headers(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::http::Request<axum::body::Body>,
@@ -744,6 +780,28 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     let insecure_cookies = std::env::var("PUMPKIN_INSECURE_COOKIES").as_deref() == Ok("1");
+    let trust_proxy = std::env::var("PUMPKIN_TRUST_PROXY").as_deref() == Ok("1");
+    if trust_proxy {
+        tracing::warn!("PUMPKIN_TRUST_PROXY=1: X-Forwarded-* headers are trusted");
+    }
+    let allowed_hosts: Vec<String> = std::env::var("PUMPKIN_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|raw| {
+            let value = raw.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let without_scheme = value
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(value);
+            let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+            let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+            let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+            (!host.is_empty()).then_some(host)
+        })
+        .collect();
     if insecure_cookies {
         tracing::warn!(
             "PUMPKIN_INSECURE_COOKIES=1: session cookies omit Secure and HSTS is disabled; \
@@ -761,6 +819,8 @@ async fn main() -> anyhow::Result<()> {
         session_ttl_secs: settings.session_ttl_secs(),
         secure_cookies: !insecure_cookies,
         rate_limiter: new_rate_limiter(),
+        trust_proxy,
+        allowed_hosts,
     };
     let docker_ok = state.adapter.is_some();
     tracing::info!(

@@ -107,6 +107,8 @@ Non-secret defaults live in `deploy/.env` (see `deploy/.env.example`):
 | `PUMPKIN_INSECURE_COOKIES` | `1` in Compose | Omit `Secure`/HSTS for plain HTTP only |
 | `PUMPKIN_ALLOWED_ORIGINS` | unset | Extra same-origin auth origins (no CORS) |
 | `PUMPKIN_BACKUP_CONCURRENCY` | `2` | Concurrent backup/restore workers |
+| `PUMPKIN_TRUST_PROXY` | unset | Trust `X-Forwarded-*` from the proxy peer |
+| `PUMPKIN_ALLOWED_HOSTS` | unset | Comma-separated Host allowlist (rebinding guard) |
 
 Secrets are created at first-run setup (owner password) — never shipped or committed.
 

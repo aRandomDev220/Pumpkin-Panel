@@ -26,14 +26,16 @@ Trust boundaries (§5.3 of plan):
 - SQLite separate from world dirs (`/data/*.db` vs `/data/servers/*`).
 - Session cookies are `HttpOnly` and `SameSite=Lax`; `Secure` is enabled by
   default. `PUMPKIN_INSECURE_COOKIES=1` is an explicit local-HTTP override —
-  keep it unset whenever TLS terminates at a reverse proxy.
+  keep it unset whenever TLS terminates at a reverse proxy, and set
+  `PUMPKIN_TRUST_PROXY=1` so `X-Forwarded-Proto` can be trusted.
 - Unsafe cookie-authenticated mutations require the readable CSRF cookie to be
   echoed in `X-CSRF-Token`; bearer-token mutations remain supported for API use.
 - The API is same-origin only: there is no CORS layer and cross-origin API
   access is not supported. `PUMPKIN_ALLOWED_ORIGINS` only relaxes the
-  login/setup same-origin check for explicitly listed origins. Host-header
-  validation is not implemented; deploy behind a reverse proxy that pins the
-  public host.
+  login/setup same-origin check for explicitly listed origins. Set
+  `PUMPKIN_ALLOWED_HOSTS` to pin the public host(s); when unset, Host
+  validation is disabled. Set `PUMPKIN_TRUST_PROXY=1` only behind a proxy you
+  control so `X-Forwarded-*` is honored.
 - Login and setup use IP and username token-bucket limits, dummy Argon2 work for
   unknown users, bounded usernames/passwords, and an atomic one-shot setup flag.
 - Security headers cover CSP, frame denial, MIME sniffing, referrer policy,

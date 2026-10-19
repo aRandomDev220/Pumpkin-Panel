@@ -1455,62 +1455,6 @@ mod tests {
         pool
     }
 
-    /// Mirror of the production wiring the controller will add to
-    /// `build_router`: identical paths + permission gates.
-    fn task2_router(state: AppState) -> axum::Router {
-        use crate::auth::Permission;
-        use axum::{
-            middleware,
-            routing::{delete, get, post},
-        };
-        let pool = state.pool.clone();
-        let public = axum::Router::new()
-            .route("/api/v1/auth/setup", post(crate::routes_auth::setup))
-            .route("/api/v1/auth/login", post(crate::routes_auth::login));
-        let protected = axum::Router::new()
-            .route(
-                "/api/v1/users",
-                post(super::create_user).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::UsersManage),
-                )),
-            )
-            .route(
-                "/api/v1/users/:id",
-                delete(super::delete_user).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::UsersManage),
-                )),
-            )
-            .route(
-                "/api/v1/admin/database/backup",
-                get(super::backup_database).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::SettingsManage),
-                )),
-            )
-            .route(
-                "/api/v1/admin/database/restore",
-                post(super::restore_database).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::SettingsManage),
-                )),
-            )
-            .route(
-                "/api/v1/tasks/:id/cancel",
-                post(super::cancel_task).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::ServerLifecycle),
-                )),
-            )
-            .route(
-                "/api/v1/users/:id/reset-password",
-                post(super::reset_user_password).route_layer(middleware::from_fn(
-                    crate::auth::require_permission(Permission::UsersManage),
-                )),
-            )
-            .route_layer(middleware::from_fn_with_state(
-                pool,
-                crate::auth::auth_middleware,
-            ));
-        public.merge(protected).with_state(state)
-    }
-
     struct AdminFixture {
         server: TestServer,
         pool: sqlx::SqlitePool,
@@ -1534,7 +1478,7 @@ mod tests {
         let root = dir.join("srvroot");
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::for_tests(pool.clone(), root);
-        let server = TestServer::new(task2_router(state)).unwrap();
+        let server = TestServer::new(crate::build_router(state)).unwrap();
         let res = server
             .post("/api/v1/auth/setup")
             .json(&json!({"username": "owner", "password": "supersecret1"}))
